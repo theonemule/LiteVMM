@@ -1,5 +1,23 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # TinyVisor's single, idempotent installer for Alpine and Debian-family hosts.
+# This POSIX shell prelude exists so a stock Alpine image can start the installer
+# before Bash itself has been installed. It re-executes this same file in Bash.
+if [ "${VMAPI_INSTALL_BASH:-}" != 1 ]; then
+  [ "$#" -eq 0 ] || { echo 'Usage: sudo ./install.sh' >&2; exit 2; }
+  [ "$(id -u)" -eq 0 ] || { echo 'Run with: sudo ./install.sh' >&2; exit 1; }
+  if ! command -v bash >/dev/null 2>&1; then
+    [ -r /etc/os-release ] || { echo 'Unsupported host: /etc/os-release is missing' >&2; exit 1; }
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case ${ID:-} in
+      alpine) apk update && apk add --no-cache bash ;;
+      debian|ubuntu|linuxmint|pop) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash ;;
+      *) echo "Unsupported operating system: ${PRETTY_NAME:-${ID:-unknown}}" >&2; exit 1 ;;
+    esac
+  fi
+  exec env VMAPI_INSTALL_BASH=1 bash "$0" "$@"
+fi
+
 set -Eeuo pipefail
 umask 022
 

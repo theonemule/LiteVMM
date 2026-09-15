@@ -5,6 +5,8 @@
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 bash -n "$ROOT/install.sh"
+head -n 1 "$ROOT/install.sh" | grep -Fxq '#!/bin/sh'
+grep -Fq 'VMAPI_INSTALL_BASH=1 bash "$0" "$@"' "$ROOT/install.sh"
 grep -Fq 'detect_platform' "$ROOT/install.sh"
 grep -Fq 'GOST_VERSION=3.2.6' "$ROOT/install.sh"
 grep -Fq 'lighttpd -tt -f /etc/lighttpd/lighttpd.conf' "$ROOT/install.sh"
