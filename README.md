@@ -411,6 +411,30 @@ netctl interfaces
 netctl bridges
 ```
 
+### Persistent DHCP bridge for nested Hyper-V
+
+Create the bridge with `eth0` as its explicit persisted member and select DHCP
+for the **bridge**. VM TAP devices are runtime ports added by QEMU when a VM is
+running; they are not saved bridge members and are not displayed as selectable
+host interfaces.
+
+VMAPI saves this definition under `/etc/vmapi/bridges` and restores it before
+VM autostart on Alpine and Debian. Re-running `install.sh` preserves existing
+bridge definitions. A guest installed from an Alpine ISO should choose DHCP for
+its own `eth0` during `setup-alpine`; that guest configuration then survives
+its reboot and installation.
+
+If the TinyVisor host is itself a Hyper-V VM, the parent Hyper-V host must
+allow the nested QEMU guest MAC addresses:
+
+```powershell
+Set-VMNetworkAdapter -VMName "alpine1" -MacAddressSpoofing On
+```
+
+This is an outer-host setting and persists when the nested Alpine guest is
+reinstalled. Without it, the Linux bridge can forward DHCP broadcasts but the
+Hyper-V switch discards replies for the nested guest MAC.
+
 Docker networking is intentionally separate and is managed through `docker-netctl` / the Docker daemon.
 
 ## GOST TAP Layer-2 overlay over Lighttpd

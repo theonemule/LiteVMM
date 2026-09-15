@@ -215,6 +215,21 @@ finalize() {
   esac
 }
 
+report_nested_hyperv_requirement() {
+  local driver
+  for driver in /sys/class/net/*/device/driver; do
+    [[ -e $driver ]] || continue
+    [[ $(readlink -f "$driver") == */hv_netvsc ]] || continue
+    cat <<'MESSAGE'
+Nested Hyper-V uplink detected. A bridged TinyVisor guest needs MAC address
+spoofing enabled on this VM's adapter at the parent Hyper-V host:
+  Set-VMNetworkAdapter -VMName <TinyVisor-VM> -MacAddressSpoofing On
+This parent-host setting survives Alpine guest reinstallation.
+MESSAGE
+    return
+  done
+}
+
 detect_platform
 ensure_admin_user
 install_packages
@@ -231,4 +246,5 @@ install_common_files
 write_sudoers
 case $PLATFORM in alpine) configure_alpine;; debian) configure_debian;; esac
 finalize
+report_nested_hyperv_requirement
 echo "TinyVisor installed on $PLATFORM. Open the management UI on port 8080."
