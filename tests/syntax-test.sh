@@ -4,16 +4,17 @@
 # Run directly with Bash; a non-zero exit status identifies the failed assertion.
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-bash -n "$ROOT/apply-alpine-runtime.sh"
-grep -Fq 'lighttpd/vmapi.conf' "$ROOT/apply-alpine-runtime.sh"
-grep -Fq 'lighttpd -tt -f /etc/lighttpd/lighttpd.conf' "$ROOT/apply-alpine-runtime.sh"
+bash -n "$ROOT/install.sh"
+grep -Fq 'detect_platform' "$ROOT/install.sh"
+grep -Fq 'GOST_VERSION=3.2.6' "$ROOT/install.sh"
+grep -Fq 'lighttpd -tt -f /etc/lighttpd/lighttpd.conf' "$ROOT/install.sh"
 grep -Fq 'peer-api(?:/|$)' "$ROOT/lighttpd/vmapi.conf"
 grep -Fq 'overlay(?:/|$)' "$ROOT/lighttpd/vmapi.conf"
 # Runtime updates must not replace the sudo policy with one that omits the
 # paired-host control plane.  The console loads this at startup on every view.
-grep -Fq '/usr/local/bin/peerctl identity' "$ROOT/apply-alpine-runtime.sh"
-grep -Fq '/usr/local/bin/peerctl list' "$ROOT/apply-alpine-runtime.sh"
-grep -Fq '/usr/local/bin/vmctl delete *' "$ROOT/apply-alpine-runtime.sh"
+grep -Fq '/usr/local/bin/peerctl identity' "$ROOT/install.sh"
+grep -Fq '/usr/local/bin/peerctl list' "$ROOT/install.sh"
+grep -Fq '/usr/local/bin/vmctl delete *' "$ROOT/install.sh"
 grep -Fq 'run_cmd vm_delete_cmd "$name"' "$ROOT/cgi/api.cgi"
 find "$ROOT" -type f \( -name '*.sh' -o -name 'vmctl' -o -name 'imagectl' -o -name 'netctl' -o -name 'overlayctl' -o -name 'dockerctl' -o -name 'dockerexecctl' -o -name 'docker-imagectl' -o -name 'docker-netctl' -o -name 'docker-volumectl' -o -name 'metricsctl' -o -name 'consolectl' -o -name 'vmapi-console-gc' -o -name '*.cgi' \) -print0 |
   while IFS= read -r -d '' f; do bash -n "$f"; done

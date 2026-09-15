@@ -10,20 +10,13 @@ Use a Linux host with hardware virtualization available for VMs. Docker features
 
 ## 2. Install
 
-Debian/Ubuntu-style hosts:
+Alpine, Debian, Ubuntu, and Debian derivatives all use the same installer:
 
 ```bash
-sudo ./bootstrap-debian.sh --admin YOUR_LOGIN --bridge br0
+sudo ./install.sh
 ```
 
-Alpine hosts (run as root):
-
-```bash
-VMAPI_HTTP_USER=YOUR_LOGIN VMAPI_HTTP_PASSWORD='change-me' \
-  ./bootstrap-alpine.sh --admin YOUR_LOGIN --bridge br0
-```
-
-`--admin` adds the named local account to `vmapi-admin`. `--bridge` allows an existing Linux bridge through QEMU's bridge helper; omit it when bridged VMs are not required.
+The installer detects the platform and installs the required packages, CA certificates, GOST v3, web server, service definitions, and VMAPI runtime. It uses the account that invoked `sudo` as the local administrator. On Alpine it prompts for the HTTP Basic password on a new installation; supply `VMAPI_HTTP_USER` and `VMAPI_HTTP_PASSWORD` only for noninteractive automation.
 
 ## 3. Connect
 

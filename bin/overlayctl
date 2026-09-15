@@ -7,7 +7,7 @@ RUN=${VMAPI_OVERLAY_RUN:-/run/vmapi-overlay}
 PEERS=${VMAPI_PEER_ROOT:-/var/lib/vmapi/peers}
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
 NETCTL=${VMAPI_NETCTL:-/usr/local/bin/netctl}
-GOST=${VMAPI_GOST:-/usr/bin/gost}
+GOST=${VMAPI_GOST:-$(command -v gost 2>/dev/null || printf '%s' /usr/bin/gost)}
 WEB_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
 PASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
 SERVICE=${VMAPI_RC_SERVICE:-rc-service}
@@ -228,7 +228,12 @@ run() {
     while :; do sleep 60 & wait $!; done
   fi
 }
-restart_service() { "$SERVICE" vmapi-overlay restart 8>&- >&2; }
+restart_service() {
+  if [[ -n ${VMAPI_RC_SERVICE:-} ]]; then "$SERVICE" vmapi-overlay restart 8>&- >&2
+  elif command -v rc-service >/dev/null 2>&1; then rc-service vmapi-overlay restart 8>&- >&2
+  elif command -v systemctl >/dev/null 2>&1; then systemctl restart vmapi-overlay.service
+  else die 'No supported service manager is available for vmapi-overlay'; fi
+}
 wait_ready() {
   local name=$1
   for _ in {1..100}; do
