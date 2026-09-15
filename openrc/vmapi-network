@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+# Restores only standard bridges explicitly persisted through VMAPI.
+name="VMAPI bridge restore"
+description="Restore persisted VMAPI Linux bridges"
+command=/usr/local/bin/netctl
+command_args="restore"
+
+depend() {
+  need localmount
+  after networking
+  before vmapi-autostart vmapi-overlay
+}

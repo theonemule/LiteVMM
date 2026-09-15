@@ -3,6 +3,7 @@
 # Called by the CGI API or service units; environment variables may override paths for tests.
 # Validate externally supplied values before passing them to host virtualization or container tools.
 set -Eeuo pipefail
+BRIDGE_CONFIG_ROOT=${VMAPI_BRIDGE_CONFIG_ROOT:-/etc/vmapi/bridges}
 valid_bridge() { [[ ${1:-} =~ ^[A-Za-z0-9_.:-]{1,31}$ ]] || { echo "Invalid bridge name: ${1:-}" >&2; exit 2; }; }
 valid_iface() { [[ ${1:-} =~ ^[A-Za-z0-9_.:-]{1,31}$ ]] || { echo "Invalid interface name: ${1:-}" >&2; exit 2; }; }
 valid_addr() { [[ ${1:-} =~ ^[0-9A-Fa-f:.]+/[0-9]{1,3}$ ]] || { echo "Invalid address CIDR: ${1:-}" >&2; exit 2; }; }
@@ -15,6 +16,33 @@ ensure_qemu_bridge_allowed() {
   grep -Fxq "allow $br" /etc/qemu/bridge.conf || echo "allow $br" >> /etc/qemu/bridge.conf
   getent group qemu >/dev/null && chown root:qemu /etc/qemu/bridge.conf
   chmod 0640 /etc/qemu/bridge.conf
+}
+bridge_config() { printf '%s/%s.conf' "$BRIDGE_CONFIG_ROOT" "$1"; }
+bridge_is_persisted() { [[ -f $(bridge_config "$1") ]]; }
+write_bridge_config() {
+  local name=$1 mode=$2 address=$3 gateway=$4; shift 4
+  local tmp
+  install -d -m 0750 "$BRIDGE_CONFIG_ROOT"
+  tmp=$(mktemp "$BRIDGE_CONFIG_ROOT/.bridge.XXXXXX")
+  printf 'SCHEMA=1\nBRIDGE=%q\nMODE=%q\nADDRESS=%q\nGATEWAY=%q\nMEMBERS_LIST=%q\n' \
+    "$name" "$mode" "$address" "$gateway" "$*" > "$tmp"
+  chmod 0640 "$tmp"
+  mv -f -- "$tmp" "$(bridge_config "$name")"
+}
+load_bridge_config() {
+  local file=$1
+  SCHEMA='' BRIDGE='' MODE='' ADDRESS='' GATEWAY='' MEMBERS_LIST=''
+  # Only this privileged controller writes bridge definitions.
+  # shellcheck source=/dev/null
+  source "$file"
+  [[ $SCHEMA == 1 ]] || { echo "Unsupported bridge definition in $file" >&2; return 1; }
+  valid_bridge "$BRIDGE"
+  [[ $MODE == manual || $MODE == static || $MODE == dhcp ]] || { echo "Invalid bridge mode in $file" >&2; return 1; }
+  [[ -z $ADDRESS || $MODE == static ]] || { echo "Unexpected bridge address in $file" >&2; return 1; }
+  [[ -z $ADDRESS ]] || valid_addr "$ADDRESS"
+  [[ -z $GATEWAY ]] || valid_gateway "$GATEWAY"
+  read -r -a MEMBERS <<< "$MEMBERS_LIST"
+  local member; for member in "${MEMBERS[@]}"; do valid_iface "$member"; done
 }
 bridge_members() {
   local br=$1 iface master
@@ -53,26 +81,6 @@ ensure_bridge_route() {
     ip route replace default via "$gateway" dev "$name" 2>/dev/null || true
   }
 }
-ensure_persistence_include() {
-  local interfaces=/etc/network/interfaces
-  [[ -f $interfaces ]] || : > "$interfaces"
-  grep -Eq '^[[:space:]]*(source|source-directory)[[:space:]]+' "$interfaces" 2>/dev/null || printf '\nsource-directory /etc/network/interfaces.d\n' >> "$interfaces"
-}
-write_persist_config() {
-  local name=$1 mode=$2 address=$3 gateway=$4; shift 4; local members=("$@") file
-  [[ -d /etc/network/interfaces.d ]] || { echo 'Persistent bridge config skipped: /etc/network/interfaces.d is missing' >&2; return 0; }
-  ensure_persistence_include
-  file="/etc/network/interfaces.d/vmapi-$name"
-  {
-    printf 'auto %s\n' "$name"
-    printf 'iface %s inet %s\n' "$name" "$mode"
-    [[ $mode == static && -n $address ]] && printf '    address %s\n' "$address"
-    [[ -n $gateway ]] && printf '    gateway %s\n' "$gateway"
-    printf '    bridge-ports%s\n' "$(printf ' %s' "${members[@]}")"
-    for member in "${members[@]}"; do printf '\nallow-hotplug %s\niface %s inet manual\n' "$member" "$member"; done
-  } > "$file"
-  chmod 0644 "$file"
-}
 case ${1:-} in
   bridges)
     shopt -s nullglob
@@ -91,7 +99,7 @@ case ${1:-} in
     printf '","members":['; first=true
     while IFS= read -r member; do [[ -n $member ]] || continue; $first || printf ','; first=false; printf '"%s"' "$(json_escape "$member")"; done < <(bridge_members "$name")
     printf '],"persist":'
-    [[ -f /etc/network/interfaces.d/vmapi-$name ]] && printf 'true' || printf 'false'
+    bridge_is_persisted "$name" && printf 'true' || printf 'false'
     printf '}\n';;
   bridge-create)
     name=${2:?bridge name required}; shift 2; valid_bridge "$name"
@@ -109,6 +117,7 @@ case ${1:-} in
       [[ -n $gateway ]] || gateway=$(default_gateway_for "${members[0]}")
       if [[ $mode == static && -z $address ]]; then address=$(first_global_address_for "${members[0]}"); fi
     fi
+    [[ $mode != dhcp ]] || gateway=''
     ip link show "$name" >/dev/null 2>&1 || ip link add name "$name" type bridge
     ip link set dev "$name" up
     for iface in "${members[@]}"; do clear_iface_network "$iface"; ip link set dev "$iface" master "$name"; ip link set dev "$iface" up; done
@@ -116,7 +125,7 @@ case ${1:-} in
     ensure_bridge_route "$name" "$gateway"
     ensure_qemu_bridge_allowed "$name"
     if [[ $mode == dhcp ]] && command -v udhcpc >/dev/null 2>&1; then udhcpc -n -q -i "$name" >/dev/null 2>&1 || true; fi
-    $persist && write_persist_config "$name" "$mode" "$address" "$gateway" "${members[@]}"
+    $persist && write_bridge_config "$name" "$mode" "$address" "$gateway" "${members[@]}"
     printf '%s\n' "$name";;
   bridge-update)
     name=${2:?bridge name required}; shift 2; valid_bridge "$name"
@@ -137,6 +146,7 @@ case ${1:-} in
       if ! $gateway_set; then gateway=$(default_gateway_for "${members[0]}"); gateway_set=true; fi
       if [[ $mode == static && -z $address ]]; then address=$(first_global_address_for "${members[0]}"); address_set=true; fi
     fi
+    if $mode_set && [[ $mode == dhcp ]]; then gateway=''; gateway_set=true; fi
     ip link set dev "$name" up
     if $address_set; then
       while IFS= read -r old; do [[ -n $old ]] && ip address del "$old" dev "$name" 2>/dev/null || true; done < <(ip -o addr show dev "$name" scope global 2>/dev/null | awk '{print $4}')
@@ -160,10 +170,25 @@ case ${1:-} in
       $gateway_set || gateway=$(ip route show default dev "$name" 2>/dev/null | awk 'NR==1 {print $3}')
       if ! $members_set; then mapfile -t members < <(bridge_members "$name"); fi
       [[ $mode == dhcp ]] && gateway=''
-      write_persist_config "$name" "$mode" "$address" "$gateway" "${members[@]}"
+      write_bridge_config "$name" "$mode" "$address" "$gateway" "${members[@]}"
     fi
-    $no_persist && rm -f -- "/etc/network/interfaces.d/vmapi-$name"
+    $no_persist && rm -f -- "$(bridge_config "$name")"
     printf '%s\n' "$name";;
+  restore)
+    shopt -s nullglob
+    for file in "$BRIDGE_CONFIG_ROOT"/*.conf; do
+      load_bridge_config "$file"
+      args=(bridge-create "$BRIDGE")
+      case $MODE in
+        static) args+=(--address "$ADDRESS");;
+        dhcp) args+=(--dhcp);;
+        manual) args+=(--manual);;
+      esac
+      [[ -z $GATEWAY ]] || args+=(--gateway "$GATEWAY")
+      for member in "${MEMBERS[@]}"; do args+=(--member "$member"); done
+      "$0" "${args[@]}"
+    done
+    shopt -u nullglob;;
   bridge-delete)
     name=${2:?bridge name required}; shift 2; valid_bridge "$name"
     ip link show "$name" >/dev/null 2>&1 || exit 0
@@ -175,6 +200,6 @@ case ${1:-} in
     done
     ip link set dev "$name" down || true
     ip link delete dev "$name" type bridge
-    rm -f -- "/etc/network/interfaces.d/vmapi-$name";;
-  *) echo 'Usage: netctl bridges | interfaces | bridge-info NAME | bridge-create NAME [--address CIDR|--dhcp|--manual] [--gateway IP] [--member IFACE] [--persist] | bridge-update NAME [--address CIDR|--dhcp|--manual] [--gateway IP] [--member IFACE] [--clear-members] [--persist|--no-persist] | bridge-delete NAME' >&2; exit 2;;
+    rm -f -- "$(bridge_config "$name")";;
+  *) echo 'Usage: netctl bridges | interfaces | bridge-info NAME | bridge-create NAME [--address CIDR|--dhcp|--manual] [--gateway IP] [--member IFACE] [--persist] | bridge-update NAME [--address CIDR|--dhcp|--manual] [--gateway IP] [--member IFACE] [--clear-members] [--persist|--no-persist] | restore | bridge-delete NAME' >&2; exit 2;;
 esac

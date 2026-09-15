@@ -10,6 +10,9 @@ grep -Fq 'VMAPI_INSTALL_BASH=1 bash "$0" "$@"' "$ROOT/install.sh"
 grep -Fq 'detect_platform' "$ROOT/install.sh"
 grep -Fq 'GOST_VERSION=3.2.6' "$ROOT/install.sh"
 grep -Fq 'lighttpd -tt -f /etc/lighttpd/lighttpd.conf' "$ROOT/install.sh"
+grep -Fq 'vmapi-network.service' "$ROOT/install.sh"
+grep -Fq 'command_args="restore"' "$ROOT/openrc/vmapi-network"
+grep -Fq 'netctl restore' "$ROOT/systemd/vmapi-network.service"
 grep -Fq 'peer-api(?:/|$)' "$ROOT/lighttpd/vmapi.conf"
 grep -Fq 'overlay(?:/|$)' "$ROOT/lighttpd/vmapi.conf"
 # Runtime updates must not replace the sudo policy with one that omits the
@@ -17,6 +20,8 @@ grep -Fq 'overlay(?:/|$)' "$ROOT/lighttpd/vmapi.conf"
 grep -Fq '/usr/local/bin/peerctl identity' "$ROOT/install.sh"
 grep -Fq '/usr/local/bin/peerctl list' "$ROOT/install.sh"
 grep -Fq '/usr/local/bin/vmctl delete *' "$ROOT/install.sh"
+grep -Fq 'BRIDGE_CONFIG_ROOT' "$ROOT/bin/netctl"
+grep -Fq 'restore)' "$ROOT/bin/netctl"
 grep -Fq 'run_cmd vm_delete_cmd "$name"' "$ROOT/cgi/api.cgi"
 find "$ROOT" -type f \( -name '*.sh' -o -name 'vmctl' -o -name 'imagectl' -o -name 'netctl' -o -name 'overlayctl' -o -name 'dockerctl' -o -name 'dockerexecctl' -o -name 'docker-imagectl' -o -name 'docker-netctl' -o -name 'docker-volumectl' -o -name 'metricsctl' -o -name 'consolectl' -o -name 'vmapi-console-gc' -o -name '*.cgi' \) -print0 |
   while IFS= read -r -d '' f; do bash -n "$f"; done

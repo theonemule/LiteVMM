@@ -160,7 +160,8 @@ configure_alpine() {
   install -m 0755 "$BASE/openrc/ttyd-vmapi" /etc/init.d/ttyd-vmapi
   install -m 0755 "$BASE/openrc/ttyd-host-vmapi" /etc/init.d/ttyd-host-vmapi
   install -m 0755 "$BASE/openrc/vmapi-overlay" /etc/init.d/vmapi-overlay
-  sed -i 's/\r$//' /etc/init.d/fcgiwrap-vmapi /etc/init.d/vmapi-autostart /etc/init.d/vmapi-console-gc /etc/init.d/websockify-vmapi /etc/init.d/ttyd-vmapi /etc/init.d/ttyd-host-vmapi /etc/init.d/vmapi-overlay
+  install -m 0755 "$BASE/openrc/vmapi-network" /etc/init.d/vmapi-network
+  sed -i 's/\r$//' /etc/init.d/fcgiwrap-vmapi /etc/init.d/vmapi-autostart /etc/init.d/vmapi-console-gc /etc/init.d/websockify-vmapi /etc/init.d/ttyd-vmapi /etc/init.d/ttyd-host-vmapi /etc/init.d/vmapi-overlay /etc/init.d/vmapi-network
   install -d -m 0755 /etc/lighttpd/conf.d /run/vmapi/consoles /run/vmapi/docker-exec
   chown vmapi:vmapi /run/vmapi /run/vmapi/consoles /run/vmapi/docker-exec
   : > /run/vmapi/console.tokens; chmod 0640 /run/vmapi/console.tokens; chown vmapi:vmapi /run/vmapi/console.tokens
@@ -182,7 +183,7 @@ configure_alpine() {
   sed -i -E 's|^[#[:space:]]*server\.port[[:space:]]*=.*|server.port = 8080|' /etc/lighttpd/lighttpd.conf
   grep -Eq '^[[:space:]]*include_shell[[:space:]]+"cat /etc/lighttpd/conf.d/\*\.conf"' /etc/lighttpd/lighttpd.conf || printf '\ninclude_shell "cat /etc/lighttpd/conf.d/*.conf"\n' >> /etc/lighttpd/lighttpd.conf
   rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
-  for svc in fcgiwrap-vmapi vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay lighttpd; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+  for svc in fcgiwrap-vmapi vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay lighttpd; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
   rc-service fcgiwrap-vmapi restart; rc-service websockify-vmapi restart; rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart
 }
 
@@ -191,6 +192,7 @@ configure_debian() {
   install -m 0644 "$BASE/systemd/fcgiwrap-vmapi.service" /etc/systemd/system/fcgiwrap-vmapi.service
   install -m 0644 "$BASE/systemd/vmapi-autostart.service" /etc/systemd/system/vmapi-autostart.service
   install -m 0644 "$BASE/systemd/vmapi-overlay.service" /etc/systemd/system/vmapi-overlay.service
+  install -m 0644 "$BASE/systemd/vmapi-network.service" /etc/systemd/system/vmapi-network.service
   install -m 0644 "$BASE/pam/nginx-vmapi" /etc/pam.d/nginx-vmapi
   install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
   install -m 0644 "$BASE/nginx/vmapi.conf" /etc/nginx/sites-available/vmapi
@@ -199,6 +201,7 @@ configure_debian() {
   systemctl enable --now docker.service 2>/dev/null || true
   systemctl enable --now fcgiwrap-vmapi.socket
   systemctl try-restart fcgiwrap-vmapi.service >/dev/null 2>&1 || true
+  systemctl enable --now vmapi-network.service
   systemctl enable vmapi-autostart.service
   nginx -t && systemctl reload nginx
 }

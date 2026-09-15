@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore persisted VMAPI Linux bridges
+After=network-online.target
+Wants=network-online.target
+Before=vmapi-autostart.service vmapi-overlay.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netctl restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
