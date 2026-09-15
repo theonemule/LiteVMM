@@ -17,6 +17,13 @@ done
 [[ $EUID -eq 0 ]] || { echo 'Run install.sh as root' >&2; exit 1; }
 BASE=$(cd "$(dirname "$0")" && pwd)
 
+ensure_tun() {
+  modprobe tun 2>/dev/null || true
+  install -d -m 0755 /dev/net
+  [[ -c /dev/net/tun ]] || mknod /dev/net/tun c 10 200
+  chmod 0666 /dev/net/tun
+}
+
 getent group kvm >/dev/null || groupadd --system kvm
 getent group vmapi-admin >/dev/null || groupadd --system vmapi-admin
 getent group docker >/dev/null || groupadd --system docker
@@ -31,34 +38,26 @@ install -d -m 0755 /etc/vmapi /usr/local/lib/vmapi /usr/local/bin /usr/lib/vmapi
 install -d -o root -g vmapi -m 0750 /etc/vmapi/overlays
 install -d -o vmapi -g vmapi -m 0750 /var/lib/vmapi /var/lib/vmapi/vms /var/lib/vmapi/disks /var/lib/vmapi/isos /var/lib/vmapi/backup-jobs
 install -d -o vmapi -g vmapi -m 0750 /var/log/vmapi/backups
+install -d -m 0700 /var/lib/vmapi/peers /etc/vmapi/identity
+ensure_tun
 install -m 0644 "$BASE/etc/vmapi.conf" /etc/vmapi/vmapi.conf
 install -m 0644 "$BASE/lib/common.sh" /usr/local/lib/vmapi/common.sh
-install -m 0755 "$BASE/bin/vmctl" /usr/local/bin/vmctl
-install -m 0755 "$BASE/bin/imagectl" /usr/local/bin/imagectl
-install -m 0755 "$BASE/bin/netctl" /usr/local/bin/netctl
-install -m 0755 "$BASE/bin/dockerctl" /usr/local/bin/dockerctl
-install -m 0755 "$BASE/bin/dockercompoectl" /usr/local/bin/dockercompoectl
-install -m 0755 "$BASE/bin/docker-imagectl" /usr/local/bin/docker-imagectl
-install -m 0755 "$BASE/bin/docker-netctl" /usr/local/bin/docker-netctl
-install -m 0755 "$BASE/bin/docker-volumectl" /usr/local/bin/docker-volumectl
-install -m 0755 "$BASE/bin/metricsctl" /usr/local/bin/metricsctl
-install -m 0755 "$BASE/bin/peerctl" /usr/local/bin/peerctl
-install -m 0755 "$BASE/bin/vmbackupctl" /usr/local/bin/vmbackupctl
-install -m 0755 "$BASE/bin/filectl" /usr/local/bin/filectl
-install -m 0755 "$BASE/bin/storagectl" /usr/local/bin/storagectl
-install -m 0755 "$BASE/bin/overlayctl" /usr/local/bin/overlayctl
-install -m 0755 "$BASE/bin/vmapi-autostart" /usr/local/bin/vmapi-autostart
-install -m 0755 "$BASE/bin/vmapi-stopall" /usr/local/bin/vmapi-stopall
+for tool in vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl metricsctl consolectl peerctl vmbackupctl filectl storagectl overlayctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
+  install -m 0755 "$BASE/bin/$tool" "/usr/local/bin/$tool"
+done
 install -m 0755 "$BASE/tests/api-regression-curl.sh" /usr/local/bin/vmapi-api-regression
 install -m 0755 "$BASE/tests/overlay-pair-curl.sh" /usr/local/bin/vmapi-overlay-pair-test
 install -m 0755 "$BASE/tests/backup-pair-curl.sh" /usr/local/bin/vmapi-backup-pair-test
 install -m 0755 "$BASE/cgi/api.cgi" /usr/lib/vmapi/cgi/api.cgi
+install -m 0755 "$BASE/cgi/peer-api.cgi" /usr/lib/vmapi/cgi/peer-api.cgi
 
 # Static Bootstrap single-page management console. No Node/build runtime is required.
 install -d -m 0755 /usr/share/vmapi/www /usr/share/vmapi/www/vendor/bootstrap
 install -m 0644 "$BASE/www/index.html" /usr/share/vmapi/www/index.html
 install -m 0644 "$BASE/www/app.css" /usr/share/vmapi/www/app.css
 install -m 0644 "$BASE/www/app.js" /usr/share/vmapi/www/app.js
+install -m 0644 "$BASE/www/console.html" /usr/share/vmapi/www/console.html
+install -m 0644 "$BASE/www/console.js" /usr/share/vmapi/www/console.js
 install -m 0644 "$BASE/www/files.html" /usr/share/vmapi/www/files.html
 install -m 0644 "$BASE/www/files.js" /usr/share/vmapi/www/files.js
 install -m 0644 "$BASE/www/vendor/bootstrap/bootstrap.min.css" /usr/share/vmapi/www/vendor/bootstrap/bootstrap.min.css
@@ -121,7 +120,7 @@ vmapi ALL=(root) NOPASSWD: /usr/local/bin/storagectl status, /usr/local/bin/stor
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/logctl *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmctl delete *
-vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl orphans, /usr/local/bin/overlayctl cleanup-orphan *
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl identity, /usr/local/bin/peerctl request, /usr/local/bin/peerctl request *, /usr/local/bin/peerctl pending, /usr/local/bin/peerctl cancel-pending, /usr/local/bin/peerctl accept *, /usr/local/bin/peerctl complete *, /usr/local/bin/peerctl list, /usr/local/bin/peerctl set-url *, /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl authorize-user *, /usr/local/bin/peerctl cors-origin *, /usr/local/bin/peerctl proxy *, /usr/local/bin/peerctl migrate *, /usr/local/bin/peerctl revoke *
 SUDOERS
 chmod 0440 /etc/sudoers.d/vmapi-overlay
@@ -152,6 +151,10 @@ systemctl try-restart fcgiwrap-vmapi.service >/dev/null 2>&1 || true
 systemctl enable vmapi-autostart.service
 if $ENABLE_NGINX && command -v nginx >/dev/null 2>&1; then nginx -t && systemctl reload nginx || true; fi
 
+/usr/local/bin/peerctl sync-auth
+/usr/local/bin/overlayctl migrate-config
+systemctl enable --now vmapi-overlay.service
+
 echo 'VMAPI installed.'
 echo 'Docker API: enabled through the local Docker daemon'
 echo 'Config root: /var/lib/vmapi/vms'
@@ -161,5 +164,3 @@ echo 'ISO root:    /var/lib/vmapi/isos'
 [[ -n $BRIDGE ]] && echo "Allowed QEMU bridge: $BRIDGE"
 echo 'Web console: http://127.0.0.1:8080/'
 echo 'API root:    http://127.0.0.1:8080/api/'
-
-/usr/local/bin/peerctl sync-auth
