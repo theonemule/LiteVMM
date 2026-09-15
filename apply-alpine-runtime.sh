@@ -132,11 +132,11 @@ rc-update add vmapi-overlay default >/dev/null 2>&1 || true
 # Migrate the existing pairing credentials without exchanging new bundles.
 /usr/local/bin/peerctl sync-auth
 update_lighttpd_config
-if find /etc/vmapi/overlays -maxdepth 1 -type f -name '*.conf' ! -exec grep -qx 'SCHEMA=2' {} \; | grep -q .; then
-  echo 'Legacy overlay definitions were left stopped. Run "overlayctl reset" on each endpoint, then recreate the hub and spoke overlays.' >&2
-else
-  /usr/local/bin/overlayctl render
-  /usr/local/bin/overlayctl restart-service
+if ! /usr/local/bin/overlayctl migrate-config; then
+  echo 'Overlay configuration migration failed. Reset obsolete routed overlays on each endpoint, then recreate the hub and spoke overlays.' >&2
+  exit 1
 fi
+/usr/local/bin/overlayctl render
+/usr/local/bin/overlayctl restart-service
 
 echo 'VMAPI Alpine runtime files updated.'

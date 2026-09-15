@@ -52,7 +52,7 @@ fi
 apk update
 apk add --no-cache \
   bash coreutils findutils gawk grep sed shadow util-linux \
-  iproute2 iptables nftables socat curl openssl sudo kmod gost \
+  iproute2 iputils iptables nftables socat curl openssl sudo kmod gost tcpdump \
   qemu-img qemu-system-x86_64 ovmf \
   docker docker-openrc docker-cli-compose \
   fcgiwrap spawn-fcgi \
@@ -89,7 +89,7 @@ install -d -m 0750 /etc/sudoers.d
 cat > /etc/sudoers.d/vmapi-netctl <<'SUDOERS'
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/netctl bridge-create *, /usr/local/bin/netctl bridge-update *, /usr/local/bin/netctl bridge-delete *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/consolectl start *, /usr/local/bin/consolectl info *, /usr/local/bin/consolectl touch *, /usr/local/bin/consolectl stop *, /usr/local/bin/consolectl gc
-vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl identity, /usr/local/bin/peerctl request, /usr/local/bin/peerctl request *, /usr/local/bin/peerctl pending, /usr/local/bin/peerctl cancel-pending, /usr/local/bin/peerctl accept *, /usr/local/bin/peerctl complete *, /usr/local/bin/peerctl list, /usr/local/bin/peerctl set-url *, /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl authorize-user *, /usr/local/bin/peerctl cors-origin *, /usr/local/bin/peerctl proxy *, /usr/local/bin/peerctl migrate *, /usr/local/bin/peerctl revoke *
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl identity, /usr/local/bin/peerctl request, /usr/local/bin/peerctl request *, /usr/local/bin/peerctl pending, /usr/local/bin/peerctl cancel-pending, /usr/local/bin/peerctl accept *, /usr/local/bin/peerctl complete *, /usr/local/bin/peerctl list, /usr/local/bin/peerctl set-url *, /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl authorize-user *, /usr/local/bin/peerctl cors-origin *, /usr/local/bin/peerctl proxy *, /usr/local/bin/peerctl migrate *, /usr/local/bin/peerctl revoke *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl create *, /usr/local/bin/vmbackupctl start *, /usr/local/bin/vmbackupctl job *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl delete *, /usr/local/bin/vmbackupctl schedule *, /usr/local/bin/vmbackupctl unschedule *, /usr/local/bin/vmbackupctl schedules
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl receive *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl list *, /usr/local/bin/filectl upload *, /usr/local/bin/filectl download *, /usr/local/bin/filectl mkdir *, /usr/local/bin/filectl move *, /usr/local/bin/filectl delete *, /usr/local/bin/filectl archive *
@@ -223,6 +223,7 @@ if $ENABLE_LIGHTTPD; then
   restart_lighttpd
 fi
 rc-service vmapi-console-gc restart
+/usr/local/bin/overlayctl migrate-config
 /usr/local/bin/overlayctl render
 rc-update add vmapi-overlay default
 rc-service vmapi-overlay restart
