@@ -2,11 +2,15 @@
 # Restores only standard bridges explicitly persisted through VMAPI.
 name="VMAPI bridge restore"
 description="Restore persisted VMAPI Linux bridges"
-command=/usr/local/bin/netctl
-command_args="restore"
 
 depend() {
   need localmount
   after networking
   before vmapi-autostart vmapi-overlay
+}
+
+start() {
+  ebegin "Restoring persisted VMAPI Linux bridges"
+  /usr/local/bin/netctl restore
+  eend $?
 }

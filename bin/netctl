@@ -41,8 +41,13 @@ load_bridge_config() {
   [[ -z $ADDRESS || $MODE == static ]] || { echo "Unexpected bridge address in $file" >&2; return 1; }
   [[ -z $ADDRESS ]] || valid_addr "$ADDRESS"
   [[ -z $GATEWAY ]] || valid_gateway "$GATEWAY"
-  read -r -a MEMBERS <<< "$MEMBERS_LIST"
-  local member; for member in "${MEMBERS[@]}"; do valid_iface "$member"; done
+  local raw_members member
+  read -r -a raw_members <<< "$MEMBERS_LIST"
+  MEMBERS=()
+  for member in "${raw_members[@]}"; do
+    valid_iface "$member"
+    is_vm_bridge_port "$member" || MEMBERS+=("$member")
+  done
 }
 bridge_members() {
   local br=$1 iface master
@@ -51,6 +56,18 @@ bridge_members() {
     master=$(basename "$(readlink -f "$iface/bridge" 2>/dev/null || true)")
     [[ $master == "$br" ]] && basename "$(dirname "$iface")"
   done | sort
+}
+is_vm_bridge_port() { [[ $1 =~ ^(tap[0-9]+|vnet[0-9]+)$ ]]; }
+configured_bridge_members() {
+  local br=$1 member
+  if bridge_is_persisted "$br"; then
+    load_bridge_config "$(bridge_config "$br")"
+    printf '%s\n' "${MEMBERS[@]}"
+    return
+  fi
+  while IFS= read -r member; do
+    is_vm_bridge_port "$member" || printf '%s\n' "$member"
+  done < <(bridge_members "$br")
 }
 clear_iface_network() {
   local iface=$1
@@ -97,6 +114,8 @@ case ${1:-} in
     printf '],"gateway":"'
     ip route show default dev "$name" 2>/dev/null | awk 'NR==1 {printf $3}'
     printf '","members":['; first=true
+    while IFS= read -r member; do [[ -n $member ]] || continue; $first || printf ','; first=false; printf '"%s"' "$(json_escape "$member")"; done < <(configured_bridge_members "$name")
+    printf '],"ports":['; first=true
     while IFS= read -r member; do [[ -n $member ]] || continue; $first || printf ','; first=false; printf '"%s"' "$(json_escape "$member")"; done < <(bridge_members "$name")
     printf '],"persist":'
     bridge_is_persisted "$name" && printf 'true' || printf 'false'
@@ -157,7 +176,7 @@ case ${1:-} in
     fi
     if $mode_set && [[ $mode == dhcp ]] && command -v udhcpc >/dev/null 2>&1; then udhcpc -n -q -i "$name" >/dev/null 2>&1 || true; fi
     if $members_set; then
-      while IFS= read -r member; do ip link set dev "$member" nomaster || true; done < <(bridge_members "$name")
+      while IFS= read -r member; do ip link set dev "$member" nomaster || true; done < <(configured_bridge_members "$name")
       for iface in "${members[@]}"; do clear_iface_network "$iface"; ip link set dev "$iface" master "$name"; ip link set dev "$iface" up; done
     fi
     if $gateway_set; then
@@ -168,7 +187,7 @@ case ${1:-} in
     if $persist; then
       if ! $mode_set; then mode=static; address=$(ip -o addr show dev "$name" scope global 2>/dev/null | awk 'NR==1 {print $4}'); [[ -n $address ]] || mode=manual; fi
       $gateway_set || gateway=$(ip route show default dev "$name" 2>/dev/null | awk 'NR==1 {print $3}')
-      if ! $members_set; then mapfile -t members < <(bridge_members "$name"); fi
+      if ! $members_set; then mapfile -t members < <(configured_bridge_members "$name"); fi
       [[ $mode == dhcp ]] && gateway=''
       write_bridge_config "$name" "$mode" "$address" "$gateway" "${members[@]}"
     fi

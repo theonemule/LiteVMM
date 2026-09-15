@@ -825,7 +825,7 @@
   const bridgeWarning = `<div class="alert alert-warning small mb-3"><strong>This can disrupt connectivity.</strong><div class="mt-1">Changing bridge members, addresses, or the default gateway can disconnect this host from the network. Do not attach the active management interface unless you have another way back in.</div></div>`;
   function bridgeMemberOptions(host, selected = []) {
     const selectedSet = new Set(selected || []);
-    return (host.interfaces || []).filter(i => !['lo','docker0'].includes(i)).map(i=>`<option value="${esc(i)}" ${selectedSet.has(i)?'selected':''}>${esc(i)}</option>`).join('');
+    return (host.interfaces || []).filter(i => !['lo','docker0'].includes(i) && !/^(tap|vnet)\d+$/.test(i)).map(i=>`<option value="${esc(i)}" ${selectedSet.has(i)?'selected':''}>${esc(i)}</option>`).join('');
   }
   function bridgeFormBody(host, bridge = null) {
     const members = bridge?.members || [];
