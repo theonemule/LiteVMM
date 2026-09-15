@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+STATE_DIR=${VMAPI_HOST_EXEC_STATE_DIR:-/run/vmapi/host-exec}
+TTL=${VMAPI_HOST_EXEC_TTL:-900}
+die(){ echo "ERROR: $*" >&2; exit 1; }
+now(){ date +%s; }
+init(){ install -d -m 0700 "$STATE_DIR"; }
+token(){ tr -d '-' </proc/sys/kernel/random/uuid; }
+file(){ printf '%s/%s.env\n' "$STATE_DIR" "$1"; }
+start(){ init; local t; t=$(token); printf 'TOKEN=%q\nUPDATED=%q\n' "$t" "$(now)" >"$(file host)"; chmod 0600 "$(file host)"; printf '{"token":"%s","url":"/host/terminal/?arg=%s","ttl_seconds":%s}\n' "$t" "$t" "$TTL"; }
+attach(){ init; local t=${1:?token required}; [[ $t =~ ^[a-f0-9]{32}$ ]] || die 'Invalid terminal token'; [[ -r $(file host) ]] || die 'Terminal session not found'; source "$(file host)"; [[ $TOKEN == "$t" && $UPDATED =~ ^[0-9]+$ && $((UPDATED+TTL)) -ge $(now) ]] || die 'Terminal token expired'; printf 'TOKEN=%q\nUPDATED=%q\n' "$TOKEN" "$(now)" >"$(file host)"; exec /bin/sh -l; }
+stop(){ rm -f "$(file host)"; }
+case ${1:-} in start) start;; attach) shift; attach "$@";; stop) stop;; *) die 'Usage: hostexecctl start|attach TOKEN|stop';; esac

@@ -1,0 +1,20 @@
+# systemd FastCGI worker paired with fcgiwrap-vmapi.socket. Runs CGI handlers as the restricted vmapi account.
+[Unit]
+Description=VMAPI fcgiwrap service
+Requires=fcgiwrap-vmapi.socket
+After=network.target docker.service
+
+[Service]
+ExecStart=/usr/sbin/fcgiwrap -f
+User=vmapi
+Group=vmapi
+KillMode=process
+SupplementaryGroups=kvm docker
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/vmapi
+ReadOnlyPaths=/etc/vmapi /usr/local/lib/vmapi /usr/local/bin /usr/lib/vmapi
+
+[Install]
+WantedBy=multi-user.target

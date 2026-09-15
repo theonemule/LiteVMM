@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+# Purpose: OpenRC service definition for a VMAPI runtime component.
+# The web server provides public access; this service owns only the local runtime process.
+supervisor=supervise-daemon
+name="VMAPI host terminal"
+command=/usr/bin/ttyd
+command_args="--interface 127.0.0.1 --port 7682 --writable --url-arg --base-path /host/terminal --client-option titleFixed=VMAPI-Host /usr/local/bin/hostexecctl attach"
+pidfile=/run/ttyd-host-vmapi.pid
+output_log=/var/log/ttyd-host-vmapi.log
+error_log=/var/log/ttyd-host-vmapi.log
+depend(){ need localmount; after net; }
+start_pre(){ checkpath -d -m 0700 /run/vmapi/host-exec; }

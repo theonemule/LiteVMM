@@ -1,0 +1,97 @@
+<!doctype html>
+<!-- TinyVisor's primary single-page administration console. app.js renders the selected route into this static shell. -->
+<html lang="en" data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>TinyVisor Console</title>
+  <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div id="app-shell" class="d-flex min-vh-100">
+    <aside class="sidebar d-none d-lg-flex flex-column p-3">
+      <a class="brand d-flex align-items-center gap-3 text-decoration-none" href="#dashboard" data-route="dashboard">
+        <span class="brand-mark">V</span>
+          <span><strong>TinyVisor</strong><small class="d-block">Minimalist hypervisor</small></span>
+      </a>
+      <nav class="nav nav-pills flex-column gap-1 mt-4" id="sideNav">
+        <a class="nav-link active" href="#dashboard" data-route="dashboard">Overview</a>
+        <a class="nav-link" href="#vms" data-route="vms">Virtual machines</a>
+        <a class="nav-link" href="#containers" data-route="containers">Containers</a>
+        <a class="nav-link" href="#networks" data-route="networks">Networks</a>
+        <a class="nav-link" href="#cluster" data-route="cluster">Cluster</a>
+      </nav>
+      <div class="mt-auto pt-4 small text-secondary-emphasis">
+        <div class="d-flex align-items-center gap-2 mb-2">
+          <span id="connectionDot" class="status-dot bg-secondary"></span>
+          <span id="connectionText">Connecting…</span>
+        </div>
+        <div id="authUser" class="text-truncate">HTTP Basic authentication</div>
+      </div>
+    </aside>
+
+    <main class="flex-grow-1 min-w-0">
+      <header class="topbar border-bottom px-3 px-md-4 d-flex align-items-center gap-3 sticky-top">
+        <button class="btn btn-sm btn-outline-secondary d-lg-none" data-bs-toggle="offcanvas" data-bs-target="#mobileNav" aria-label="Open navigation">Menu</button>
+        <div>
+          <div id="pageEyebrow" class="small text-uppercase text-secondary fw-semibold">TinyVisor</div>
+          <h1 id="pageTitle" class="h5 mb-0">Overview</h1>
+        </div>
+        <div class="host-switcher ms-md-auto">
+          <div id="activeHostIndicator" class="host-indicator text-truncate" data-remote="Local">Local host</div>
+          <select id="hostSelector" class="form-select form-select-sm" aria-label="Active host">
+            <option value="">Local host (Local)</option>
+          </select>
+        </div>
+        <div class="ms-auto d-flex gap-2">
+          <button id="themeToggle" class="btn btn-sm btn-outline-secondary" type="button">Theme</button>
+          <button id="refreshBtn" class="btn btn-sm btn-dark" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section id="view" class="content-wrap p-3 p-md-4"></section>
+    </main>
+  </div>
+
+  <div class="offcanvas offcanvas-start" tabindex="-1" id="mobileNav">
+    <div class="offcanvas-header">
+        <div><strong>TinyVisor</strong><div class="small text-secondary">Minimalist hypervisor</div></div>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas"></button>
+    </div>
+    <div class="offcanvas-body">
+      <nav class="nav nav-pills flex-column gap-1" id="mobileNavLinks">
+        <a class="nav-link active" href="#dashboard" data-route="dashboard" data-bs-dismiss="offcanvas">Overview</a>
+        <a class="nav-link" href="#vms" data-route="vms" data-bs-dismiss="offcanvas">Virtual machines</a>
+        <a class="nav-link" href="#containers" data-route="containers" data-bs-dismiss="offcanvas">Containers</a>
+        <a class="nav-link" href="#networks" data-route="networks" data-bs-dismiss="offcanvas">Networks</a>
+        <a class="nav-link" href="#cluster" data-route="cluster" data-bs-dismiss="offcanvas">Cluster</a>
+      </nav>
+    </div>
+  </div>
+
+  <div class="modal fade" id="formModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div><div id="modalEyebrow" class="small text-uppercase text-secondary fw-semibold"></div><h2 id="modalTitle" class="modal-title fs-5"></h2></div>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div id="modalBody" class="modal-body"></div>
+        <div id="modalFooter" class="modal-footer"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container position-fixed bottom-0 end-0 p-3">
+    <div id="appToast" class="toast" role="status" aria-live="polite">
+  <div class="toast-header"><strong id="toastTitle" class="me-auto">TinyVisor</strong><button type="button" class="btn-close" data-bs-dismiss="toast"></button></div>
+      <div id="toastBody" class="toast-body"></div>
+    </div>
+  </div>
+
+  <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

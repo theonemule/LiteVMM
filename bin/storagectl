@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Purpose: Safely inspect and relocate VMAPI's independent storage roots.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+CONFIG_FILE=${VMAPI_CONFIG:-/etc/vmapi/vmapi.conf}
+
+usage() { printf '%s\n' 'storagectl status | relocate config|disks|isos ABSOLUTE_PATH'; }
+valid_root() {
+  local path=${1:-}
+  [[ $path == /* && $path != / && $path != *$'\n'* && $path != *$'\r'* ]] || die 'Storage location must be an absolute path other than /'
+}
+require_all_stopped() {
+  local conf name
+  shopt -s nullglob
+  for conf in "$VM_ROOT"/*/vm.conf; do
+    name=$(basename "$(dirname "$conf")")
+    [[ $(vm_state "$name") == stopped ]] || die "Stop VM $name before relocating storage"
+  done
+  shopt -u nullglob
+}
+set_root_config() {
+  local key=$1 value=$2 tmp
+  [[ -f $CONFIG_FILE ]] || die "VMAPI configuration not found: $CONFIG_FILE"
+  tmp=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")
+  awk -v k="$key" -v v="$value" '
+    BEGIN { done=0 }
+    index($0,k"=")==1 { if(!done) { print k"="v; done=1 }; next }
+    { print }
+    END { if(!done) print k"="v }
+  ' "$CONFIG_FILE" > "$tmp"
+  chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || chmod 0640 "$tmp"
+  mv -f -- "$tmp" "$CONFIG_FILE"
+}
+cmd_status() {
+  printf '{"config_path":"%s","disk_path":"%s","iso_path":"%s"}\n' \
+    "$(json_escape "$VM_ROOT")" "$(json_escape "$DISK_ROOT")" "$(json_escape "$ISO_ROOT")"
+}
+cmd_relocate() {
+  local kind=${1:?storage kind required} target=${2:?destination required} source key parent
+  valid_root "$target"
+  case "$kind" in
+    config) source=$VM_ROOT; key=VM_ROOT;;
+    disks) source=$DISK_ROOT; key=DISK_ROOT;;
+    isos) source=$ISO_ROOT; key=ISO_ROOT;;
+    *) die 'Storage kind must be config, disks, or isos';;
+  esac
+  valid_root "$source"
+  [[ $target != "$source" ]] || { set_root_config "$key" "$target"; cmd_status; return; }
+  [[ $target != "$source"/* ]] || die 'Storage destination cannot be inside its current location'
+  parent=$(dirname "$target")
+  [[ -d $parent ]] || die "Destination parent does not exist: $parent"
+  [[ ! -e $target ]] || die "Destination already exists: $target"
+  require_all_stopped
+  install -d -m 0750 "$(dirname "$source")"
+  [[ -e $source ]] || install -d -o vmapi -g vmapi -m 0750 "$source"
+  mv -- "$source" "$target"
+  if ! set_root_config "$key" "$target"; then
+    mv -- "$target" "$source" 2>/dev/null || true
+    die 'Storage move was rolled back because the VMAPI configuration could not be updated'
+  fi
+  cmd_status
+}
+
+case "${1:-help}" in
+  status) cmd_status;;
+  relocate) shift; cmd_relocate "$@";;
+  help|-h|--help) usage;;
+  *) usage >&2; die "Unknown command: ${1:-}";;
+esac

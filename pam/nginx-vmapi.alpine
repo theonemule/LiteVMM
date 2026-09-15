@@ -1,0 +1,5 @@
+# Only local users in vmapi-admin may authenticate to the API.
+auth requisite pam_succeed_if.so user ingroup vmapi-admin
+auth include base-auth
+account requisite pam_succeed_if.so user ingroup vmapi-admin
+account include base-account

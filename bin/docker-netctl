@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+need_cmd "$DOCKER_BIN"
+valid_name() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "Invalid Docker network name: ${1:-}"; }
+valid_value() { [[ -n ${1:-} && ${#1} -le 512 ]] || die 'Invalid value'; validate_no_newline "$1"; }
+case ${1:-} in
+  list) "$DOCKER_BIN" network ls --format '{{.Name}}\t{{.Driver}}\t{{.Scope}}\t{{.ID}}';;
+  list-json) "$DOCKER_BIN" network ls --format '{{json .}}';;
+  inspect) name=${2:?}; valid_name "$name"; "$DOCKER_BIN" network inspect "$name";;
+  create)
+    name=${2:?}; shift 2; valid_name "$name"; args=(network create); driver=bridge
+    while (($#)); do case "$1" in
+      --driver) driver=${2:?}; valid_value "$driver"; shift 2;;
+      --subnet) valid_value "${2:?}"; args+=(--subnet "$2"); shift 2;;
+      --gateway) valid_value "${2:?}"; args+=(--gateway "$2"); shift 2;;
+      --internal) args+=(--internal); shift;;
+      --ipv6) args+=(--ipv6); shift;;
+      --label) valid_value "${2:?}"; args+=(--label "$2"); shift 2;;
+      --opt) valid_value "${2:?}"; args+=(--opt "$2"); shift 2;;
+      *) die "Unknown option: $1";;
+    esac; done
+    args+=(--driver "$driver" "$name"); "$DOCKER_BIN" "${args[@]}";;
+  remove|delete) name=${2:?}; valid_name "$name"; "$DOCKER_BIN" network rm "$name";;
+  *) echo 'Usage: docker-netctl list | inspect NAME | create NAME [options] | remove NAME' >&2; exit 2;;
+esac

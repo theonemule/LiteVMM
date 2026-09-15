@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+# Purpose: OpenRC service definition for a VMAPI runtime component.
+# The web server provides public access; this service owns only the local runtime process.
+supervisor=supervise-daemon
+name="VMAPI ttyd broker"
+description="Token-routed ttyd broker for Docker exec terminals"
+command=/usr/bin/ttyd
+command_args="--interface 127.0.0.1 --port 7681 --writable --url-arg --base-path /docker/terminal --client-option titleFixed=VMAPI --client-option disableLeaveAlert=true /usr/local/bin/dockerexecctl attach"
+pidfile=/run/ttyd-vmapi.pid
+output_log=/var/log/ttyd-vmapi.log
+error_log=/var/log/ttyd-vmapi.log
+depend() {
+  need localmount docker
+  after net
+}
+start_pre() {
+  checkpath -d -m 0755 -o vmapi:vmapi /run/vmapi
+  checkpath -d -m 0755 -o vmapi:vmapi /run/vmapi/docker-exec
+}

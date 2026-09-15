@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+
+usage() {
+cat <<'TXT'
+dockerctl - minimal Docker container manager
+
+Commands:
+  list
+  list-json
+  show NAME
+  status NAME
+  create NAME IMAGE [options] [-- COMMAND [ARG...]]
+  update NAME FIELD VALUE
+  start NAME
+  stop NAME [--time SECONDS] [--force]
+  restart NAME [--time SECONDS]
+  logs NAME [--tail N] [--since TIME] [--timestamps] [--follow]
+  commit NAME IMAGE [--author TEXT] [--message TEXT] [--pause true|false]
+  delete NAME [--force] [--volumes]
+
+Create options:
+  --hostname NAME
+  --restart POLICY        no|always|unless-stopped|on-failure[:N]
+  --cpus N                e.g. 2 or 1.5
+  --memory SIZE           e.g. 512m, 2g
+  --network NAME          Docker network name/id
+  --ip ADDRESS            Static IPv4 address on --network
+  --env KEY=VALUE         repeatable
+  --publish SPEC          repeatable, e.g. 8080:80/tcp
+  --volume SPEC           repeatable, e.g. /srv/data:/data:ro
+  --label KEY=VALUE       repeatable
+  --user USER
+  --workdir PATH
+  --entrypoint COMMAND
+  --read-only
+
+Examples:
+  docker-create web nginx:latest --restart unless-stopped --publish 8080:80
+  docker-create app alpine:latest --env MODE=prod -- -- sleep 3600
+  docker-update web restart always
+TXT
+}
+
+require_docker() { need_cmd "$DOCKER_BIN"; }
+validate_container_name() {
+  [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "Invalid container name: ${1:-}"
+}
+validate_docker_arg() {
+  local v=${1-}
+  [[ -n $v && ${#v} -le 2048 ]] || die 'Docker argument is empty or too long'
+  validate_no_newline "$v"
+}
+validate_image_ref() { validate_docker_arg "$1"; [[ $1 != *[[:space:]]* ]] || die "Invalid image reference: $1"; }
+validate_cpus() { [[ ${1:-} =~ ^([0-9]+)(\.[0-9]+)?$ ]] || die "Invalid CPU value: ${1:-}"; }
+validate_memory() { [[ ${1:-} =~ ^[1-9][0-9]*([bBkKmMgG])?$ ]] || die "Invalid memory value: ${1:-}"; }
+validate_restart() { [[ ${1:-} =~ ^(no|always|unless-stopped|on-failure(:[0-9]+)?)$ ]] || die "Invalid restart policy: ${1:-}"; }
+validate_tail() { [[ ${1:-} =~ ^[0-9]+$ ]] || die "Invalid tail value: ${1:-}"; }
+validate_pause() { [[ ${1:-} == true || ${1:-} == false ]] || die "Invalid pause value: ${1:-}"; }
+require_container() { validate_container_name "$1"; "$DOCKER_BIN" container inspect "$1" >/dev/null 2>&1 || die "Container does not exist: $1"; }
+
+cmd_list() {
+  require_docker
+  "$DOCKER_BIN" container ls -a --format '{{.Names}}\t{{.State}}\t{{.Image}}\t{{.Status}}'
+}
+cmd_list_json() {
+  require_docker
+  "$DOCKER_BIN" container ls -a --format '{{json .}}'
+}
+cmd_show() { require_docker; require_container "$1"; "$DOCKER_BIN" container inspect "$1"; }
+cmd_status() { require_docker; require_container "$1"; "$DOCKER_BIN" container inspect --format '{{.State.Status}}' "$1"; }
+
+cmd_create() {
+  local name=${1:?name required} image=${2:?image required}; shift 2
+  validate_container_name "$name"; validate_image_ref "$image"; require_docker
+  if "$DOCKER_BIN" container inspect "$name" >/dev/null 2>&1; then die "Container already exists: $name"; fi
+
+  local -a args=(container create --name "$name") cmd=()
+  local hostname='' restart='' cpus='' memory='' network='' ip_address='' user='' workdir='' entrypoint=''
+  local read_only=false
+  while (($#)); do
+    case "$1" in
+      --hostname) hostname=${2:?}; shift 2;;
+      --restart) restart=${2:?}; shift 2;;
+      --cpus) cpus=${2:?}; shift 2;;
+      --memory) memory=${2:?}; shift 2;;
+      --network) network=${2:?}; shift 2;;
+      --ip) ip_address=${2:?}; shift 2;;
+      --env) validate_docker_arg "${2:?}"; args+=(--env "$2"); shift 2;;
+      --publish) validate_docker_arg "${2:?}"; args+=(--publish "$2"); shift 2;;
+      --volume) validate_docker_arg "${2:?}"; args+=(--volume "$2"); shift 2;;
+      --label) validate_docker_arg "${2:?}"; args+=(--label "$2"); shift 2;;
+      --user) user=${2:?}; shift 2;;
+      --workdir) workdir=${2:?}; shift 2;;
+      --entrypoint) entrypoint=${2:?}; shift 2;;
+      --read-only) read_only=true; shift;;
+      --) shift; cmd=("$@"); break;;
+      *) die "Unknown option: $1";;
+    esac
+  done
+
+  if [[ -n $hostname ]]; then validate_docker_arg "$hostname"; args+=(--hostname "$hostname"); fi
+  if [[ -n $restart ]]; then validate_restart "$restart"; args+=(--restart "$restart"); fi
+  if [[ -n $cpus ]]; then validate_cpus "$cpus"; args+=(--cpus "$cpus"); fi
+  if [[ -n $memory ]]; then validate_memory "$memory"; args+=(--memory "$memory"); fi
+  if [[ -n $network ]]; then validate_docker_arg "$network"; args+=(--network "$network"); fi
+  if [[ -n $ip_address ]]; then [[ -n $network ]] || die '--ip requires --network'; [[ $ip_address =~ ^[0-9A-Fa-f:.]+$ ]] || die 'Invalid static IP address'; args+=(--ip "$ip_address"); fi
+  if [[ -n $user ]]; then validate_docker_arg "$user"; args+=(--user "$user"); fi
+  if [[ -n $workdir ]]; then validate_docker_arg "$workdir"; args+=(--workdir "$workdir"); fi
+  if [[ -n $entrypoint ]]; then validate_docker_arg "$entrypoint"; args+=(--entrypoint "$entrypoint"); fi
+  $read_only && args+=(--read-only)
+
+  local c; for c in "${cmd[@]}"; do validate_docker_arg "$c"; done
+  args+=("$image")
+  ((${#cmd[@]})) && args+=("${cmd[@]}")
+  "$DOCKER_BIN" "${args[@]}"
+}
+
+cmd_update() {
+  local name=${1:?} field=${2:?} value=${3:?}; require_docker; require_container "$name"
+  case "$field" in
+    cpus) validate_cpus "$value"; "$DOCKER_BIN" container update --cpus "$value" "$name" >/dev/null;;
+    memory) validate_memory "$value"; "$DOCKER_BIN" container update --memory "$value" "$name" >/dev/null;;
+    restart|restart_policy) validate_restart "$value"; "$DOCKER_BIN" container update --restart "$value" "$name" >/dev/null;;
+    *) die "Unsupported container field: $field";;
+  esac
+}
+cmd_start() { require_docker; require_container "$1"; "$DOCKER_BIN" container start "$1"; }
+cmd_stop() {
+  local name=${1:?}; shift; require_docker; require_container "$name"
+  local force=false time=''
+  while (($#)); do case "$1" in --force) force=true; shift;; --time) time=${2:?}; validate_int "$time"; shift 2;; *) die "Unknown option: $1";; esac; done
+  if $force; then "$DOCKER_BIN" container kill "$name" >/dev/null
+  else
+    local -a args=(container stop); [[ -n $time ]] && args+=(--time "$time"); args+=("$name"); "$DOCKER_BIN" "${args[@]}" >/dev/null
+  fi
+}
+cmd_restart() {
+  local name=${1:?}; shift; require_docker; require_container "$name"
+  local time=''; while (($#)); do case "$1" in --time) time=${2:?}; validate_int "$time"; shift 2;; *) die "Unknown option: $1";; esac; done
+  local -a args=(container restart); [[ -n $time ]] && args+=(--time "$time"); args+=("$name"); "$DOCKER_BIN" "${args[@]}" >/dev/null
+}
+cmd_logs() {
+  local name=${1:?}; shift; require_docker; require_container "$name"
+  local -a args=(container logs); local tail=200 since='' follow=false timestamps=false
+  while (($#)); do case "$1" in
+    --tail) tail=${2:?}; validate_tail "$tail"; shift 2;;
+    --since) since=${2:?}; validate_docker_arg "$since"; shift 2;;
+    --timestamps) timestamps=true; shift;;
+    --follow) follow=true; shift;;
+    *) die "Unknown option: $1";;
+  esac; done
+  args+=(--tail "$tail"); [[ -n $since ]] && args+=(--since "$since"); $timestamps && args+=(--timestamps); $follow && args+=(--follow)
+  args+=("$name"); "$DOCKER_BIN" "${args[@]}"
+}
+cmd_commit() {
+  local name=${1:?} image=${2:?}; shift 2; require_docker; require_container "$name"; validate_image_ref "$image"
+  local -a args=(container commit); local author='' message='' pause=''
+  while (($#)); do case "$1" in
+    --author) author=${2:?}; validate_docker_arg "$author"; shift 2;;
+    --message) message=${2:?}; validate_docker_arg "$message"; shift 2;;
+    --pause) pause=${2:?}; validate_pause "$pause"; shift 2;;
+    *) die "Unknown option: $1";;
+  esac; done
+  [[ -n $author ]] && args+=(--author "$author")
+  [[ -n $message ]] && args+=(--message "$message")
+  [[ $pause == false ]] && args+=(--no-pause)
+  args+=("$name" "$image")
+  "$DOCKER_BIN" "${args[@]}"
+}
+cmd_delete() {
+  local name=${1:?}; shift; require_docker; require_container "$name"
+  local -a args=(container rm)
+  while (($#)); do case "$1" in --force) args+=(--force); shift;; --volumes) args+=(--volumes); shift;; *) die "Unknown option: $1";; esac; done
+  args+=("$name"); "$DOCKER_BIN" "${args[@]}" >/dev/null
+}
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case "$cmd" in
+    help|-h|--help) usage;;
+    list) cmd_list "$@";; list-json) cmd_list_json "$@";; show) cmd_show "$@";; status) cmd_status "$@";;
+    create) cmd_create "$@";; update|set) cmd_update "$@";; start) cmd_start "$@";; stop) cmd_stop "$@";; restart|reboot) cmd_restart "$@";; logs) cmd_logs "$@";; commit) cmd_commit "$@";; delete) cmd_delete "$@";;
+    *) usage >&2; die "Unknown command: $cmd";;
+  esac
+}
+main "$@"

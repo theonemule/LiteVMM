@@ -1,0 +1,144 @@
+/* Shared VMAPI console theme and layout rules. Bootstrap supplies base components; this file supplies VMAPI branding and responsive application chrome. */
+:root {
+  --vmapi-sidebar: #10141b;
+  --vmapi-sidebar-muted: #8d98a7;
+  --vmapi-surface: #f5f6f8;
+  --vmapi-border: rgba(20, 29, 43, .10);
+}
+
+html, body { min-height: 100%; }
+body { background: var(--vmapi-surface); }
+.min-w-0 { min-width: 0; }
+.sidebar {
+  width: 248px;
+  min-height: 100vh;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  background: var(--vmapi-sidebar);
+  color: #fff;
+}
+.brand { color: #fff; letter-spacing: -.01em; }
+.brand:hover { color: #fff; }
+.brand small { color: var(--vmapi-sidebar-muted); font-weight: 400; letter-spacing: 0; }
+.brand-mark {
+  width: 38px; height: 38px; border-radius: 11px;
+  display: grid; place-items: center; font-weight: 800;
+  background: #fff; color: var(--vmapi-sidebar);
+  box-shadow: 0 10px 30px rgba(0,0,0,.18);
+}
+.sidebar .nav-link { color: #aeb6c2; border-radius: .7rem; padding: .62rem .8rem; }
+.sidebar .nav-link:hover { color: #fff; background: rgba(255,255,255,.06); }
+.sidebar .nav-link.active { background: #fff; color: #111827; font-weight: 600; }
+.status-dot { width: .55rem; height: .55rem; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+.topbar { min-height: 72px; background: color-mix(in srgb, var(--bs-body-bg) 92%, transparent); backdrop-filter: blur(10px); z-index: 1020; }
+.host-switcher { width: min(250px, 30vw); min-width: 160px; }
+.host-indicator { font-size: .75rem; font-weight: 650; line-height: 1.2; }
+.host-indicator::after { content: attr(data-remote); margin-left: .4rem; color: var(--bs-secondary-color); font-weight: 500; }
+.host-indicator-remote::after { color: var(--bs-primary); }
+.content-wrap { max-width: 1500px; margin: 0 auto; }
+.metric-card, .panel-card { border: 1px solid var(--vmapi-border); box-shadow: 0 10px 30px rgba(20,29,43,.045); }
+.metric-card { min-height: 132px; }
+.metric-value { font-size: clamp(1.8rem, 3vw, 2.5rem); line-height: 1; letter-spacing: -.04em; }
+.metric-label { color: var(--bs-secondary-color); font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
+.section-title { letter-spacing: -.02em; }
+.table > :not(caption) > * > * { padding-top: .85rem; padding-bottom: .85rem; vertical-align: middle; }
+.table thead th { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--bs-secondary-color); font-weight: 700; border-bottom-width: 1px; }
+.resource-name { font-weight: 650; letter-spacing: -.01em; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+.badge-state { font-weight: 650; letter-spacing: .01em; }
+.empty-state { padding: 4rem 1rem; text-align: center; color: var(--bs-secondary-color); }
+.empty-glyph { width: 46px; height: 46px; border-radius: 14px; display: grid; place-items: center; margin: 0 auto 1rem; background: var(--bs-tertiary-bg); color: var(--bs-secondary-color); font-weight: 800; }
+.action-row { display: flex; gap: .35rem; justify-content: flex-end; flex-wrap: wrap; }
+.form-section { border-top: 1px solid var(--bs-border-color); padding-top: 1.15rem; margin-top: 1.15rem; }
+.form-section:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+.form-section-title { font-size: .82rem; text-transform: uppercase; letter-spacing: .06em; font-weight: 750; color: var(--bs-secondary-color); margin-bottom: .8rem; }
+.code-panel { background: #111827; color: #d8dee9; border-radius: .75rem; padding: 1rem; font-size: .8rem; max-height: 420px; overflow: auto; }
+.log-panel { min-height: 360px; white-space: pre-wrap; }
+.command-preview { white-space: pre-wrap; word-break: break-word; }
+.bridge-chip { display: inline-flex; align-items: center; gap: .45rem; padding-right: .55rem; }
+.bridge-chip .btn { font-size: .7rem; line-height: 1.2; }
+.bridge-chip .btn-close { width: .45rem; height: .45rem; padding: .2rem; filter: none; }
+.list-compact .list-group-item { padding: .65rem .8rem; }
+.upload-drop { border: 1px dashed var(--bs-border-color); border-radius: .8rem; padding: 1.25rem; background: var(--bs-tertiary-bg); }
+.clickable { cursor: pointer; }
+@media (max-width: 767.98px) {
+  .topbar { flex-wrap: wrap; gap: .5rem !important; padding-top: .6rem; padding-bottom: .6rem; }
+  .host-switcher { order: 3; width: 100%; min-width: 0; }
+  .topbar > .ms-auto:last-child { margin-left: auto !important; }
+  .content-wrap { padding-left: .75rem !important; padding-right: .75rem !important; }
+  .table-responsive { margin-left: -.25rem; margin-right: -.25rem; }
+  .action-row { justify-content: flex-start; }
+}
+[data-bs-theme="dark"] {
+  --vmapi-surface: #0f1217;
+  --vmapi-border: rgba(255,255,255,.08);
+}
+
+/* Lightweight resource monitoring */
+.resource-meter {
+  border: 1px solid var(--vmapi-border);
+  background: color-mix(in srgb, var(--bs-body-bg) 94%, var(--bs-tertiary-bg));
+  overflow: hidden;
+}
+.resource-value {
+  font-size: 1.45rem;
+  line-height: 1.1;
+  font-weight: 700;
+  letter-spacing: -.035em;
+}
+.resource-progress { height: 5px; background: var(--bs-tertiary-bg); }
+.resource-chart { width: 100%; height: 58px; display: block; }
+.modal .resource-meter { min-height: 155px; }
+.console-body {
+  width: 100vw;
+  height: 100vh;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #05070a;
+  overflow: hidden;
+}
+.console-bar {
+  flex: 0 0 auto;
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  gap: .75rem;
+  padding: .45rem .75rem;
+  background: var(--bs-body-bg);
+  border-bottom: 1px solid var(--vmapi-border);
+  position: relative;
+  z-index: 10;
+}
+.console-title { min-width: 0; }
+.console-title h1 { max-width: 36vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.console-state { margin-left: auto; white-space: nowrap; }
+.console-actions { flex: 0 0 auto; }
+.console-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100vw;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #05070a;
+  overflow: hidden;
+}
+.console-screen {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  outline: none;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.console-screen canvas { max-width: 100%; max-height: 100%; }
+@media (max-width: 767.98px) {
+  .console-bar { flex-wrap: wrap; align-items: flex-start; }
+  .console-title h1 { max-width: 48vw; }
+  .console-state { order: 3; width: 100%; margin-left: 0; }
+  .console-actions { margin-left: auto; }
+}

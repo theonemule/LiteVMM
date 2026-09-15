@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# GOST TAP -> Relay over WebSocket -> hub Lighttpd HTTP Basic authentication.
+set -Eeuo pipefail
+umask 077
+ROOT=${VMAPI_OVERLAY_ROOT:-/etc/vmapi/overlays}
+RUN=${VMAPI_OVERLAY_RUN:-/run/vmapi-overlay}
+PEERS=${VMAPI_PEER_ROOT:-/var/lib/vmapi/peers}
+PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+NETCTL=${VMAPI_NETCTL:-/usr/local/bin/netctl}
+GOST=${VMAPI_GOST:-/usr/bin/gost}
+WEB_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
+PASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
+SERVICE=${VMAPI_RC_SERVICE:-rc-service}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+valid_name() { [[ ${1:-} =~ ^[a-z][a-z0-9-]{0,10}$ ]] || die 'Overlay name must be 1-11 lowercase letters, digits or hyphens, starting with a letter'; }
+valid_id() { [[ ${1:-} =~ ^[a-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
+conf() { printf '%s/%s.conf' "$ROOT" "$1"; }
+tap_name() { printf 'vmo-%s' "$1"; }
+checksum() { printf '%s' "$1" | cksum | awk '{print $1}'; }
+tap_port() { echo $((38000 + $(checksum "tap-$1") % 10000)); }
+relay_port() { echo $((18080 + $(checksum "relay-$1") % 10000)); }
+health_cidr() { local octet=$((20 + $(checksum "$NAME") % 200)); [[ $ROLE == hub ]] && echo "10.77.$octet.1/24" || echo "10.77.$octet.2/24"; }
+health_peer() { local octet=$((20 + $(checksum "$NAME") % 200)); [[ $ROLE == hub ]] && echo "10.77.$octet.2" || echo "10.77.$octet.1"; }
+
+access() {
+  install -d -m 0750 "$ROOT"
+  if getent group vmapi >/dev/null; then
+    chown root:vmapi "$ROOT"; chmod 0750 "$ROOT"
+  fi
+  install -d -m 0700 "$RUN"
+}
+load() {
+  valid_name "$1"; NAME=$1
+  [[ -r $(conf "$NAME") ]] || die "Overlay not found: $NAME"
+  BRIDGE='' ROLE='' PEER='' PEERS_LIST='' MTU=1400 STAGED=false TAP_BRIDGE_LEARNING=off
+  # Only this privileged controller writes these shell-escaped files.
+  # shellcheck source=/dev/null
+  source "$(conf "$NAME")"
+  [[ -n $PEERS_LIST ]] || PEERS_LIST=$PEER
+  read -ra MEMBERS <<< "$PEERS_LIST"
+  [[ $ROLE == hub || $ROLE == spoke ]] || die 'Old routed overlay must be reset and recreated as hub/spoke'
+  [[ $BRIDGE =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && $BRIDGE != "$(tap_name "$NAME")" ]] || die 'Invalid Linux bridge name'
+  [[ $MTU =~ ^[0-9]{4}$ && $MTU -ge 1200 && $MTU -le 1499 ]] || die 'MTU must be 1200-1499'
+  [[ $STAGED == true || $STAGED == false ]] || die 'Invalid staged flag'
+  [[ $TAP_BRIDGE_LEARNING == off ]] || die 'TAP bridge learning must remain disabled for GOST overlays'
+  ((${#MEMBERS[@]} > 0 && ${#MEMBERS[@]} <= 16)) || die 'Select 1-16 paired peers'
+  [[ $ROLE == hub || ${#MEMBERS[@]} == 1 ]] || die 'A spoke needs exactly one hub'
+  [[ $STAGED == false || ${#MEMBERS[@]} == 1 ]] || die 'Staged address validation requires one peer'
+  local id; for id in "${MEMBERS[@]}"; do valid_id "$id"; done
+  # Recompute ports so previous renderers cannot leave publicly bound listeners.
+  TAP_PORT=$(tap_port "$NAME"); RELAY_PORT=$(relay_port "$NAME")
+}
+peer() {
+  local id=${1:?peer node id required} NAME='' RELAY_USER='' RELAY_PASSWORD='' URL=''
+  valid_id "$id"; [[ -r $PEERS/$id.conf ]] || die "Peer $id is not paired"
+  # shellcheck source=/dev/null
+  source "$PEERS/$id.conf"
+  [[ $RELAY_USER =~ ^[A-Za-z0-9._-]{1,64}$ && $RELAY_PASSWORD =~ ^[A-Fa-f0-9]{48,128}$ ]] || die 'Peer lacks a valid pairing credential; re-pair it'
+  # Pairing accepts an API suffix; the transport always uses the origin.
+  [[ $URL =~ ^(https?)://([A-Za-z0-9.-]+)(:([0-9]{1,5}))?(/[^[:space:]\"\\]*)?$ ]] || die 'Peer has no valid HTTP(S) endpoint'
+  PEER_SCHEME=${BASH_REMATCH[1]}; PEER_HOST=${BASH_REMATCH[2]}; PEER_PORT=${BASH_REMATCH[4]}
+  [[ -n $PEER_PORT ]] || { [[ $PEER_SCHEME == https ]] && PEER_PORT=443 || PEER_PORT=80; }
+  ((10#$PEER_PORT > 0 && 10#$PEER_PORT <= 65535)) || die 'Invalid peer port'
+  PEER_USER=$RELAY_USER; PEER_PASSWORD=$RELAY_PASSWORD
+}
+write_config() {
+  local tmp; tmp=$(mktemp "$ROOT/.config.XXXXXX")
+  printf 'SCHEMA=3\nBRIDGE=%q\nROLE=%q\nPEERS_LIST=%q\nMTU=%q\nSTAGED=%q\nTAP_BRIDGE_LEARNING=%q\n' "$BRIDGE" "$ROLE" "${MEMBERS[*]}" "$MTU" "$STAGED" "$TAP_BRIDGE_LEARNING" > "$tmp"
+  if getent group vmapi >/dev/null; then chown root:vmapi "$tmp"; fi
+  chmod 0640 "$tmp"; mv -f -- "$tmp" "$(conf "$NAME")"
+}
+
+render_config() (
+  load "$1"
+  local tmp header scheme id
+  for id in "${MEMBERS[@]}"; do peer "$id"; done
+  tmp=$(mktemp "$RUN/.gost.XXXXXX"); trap 'rm -f -- "$tmp"' EXIT
+  if [[ $ROLE == hub ]]; then
+    cat > "$tmp" <<YAML
+services:
+- name: overlay-tap
+  addr: "127.0.0.1:$TAP_PORT"
+  handler: {type: tap}
+  listener:
+    type: tap
+    metadata: {name: "$(tap_name "$NAME")", net: "$(health_cidr)", mtu: $MTU}
+- name: overlay-relay
+  addr: "127.0.0.1:$RELAY_PORT"
+  handler: {type: relay, metadata: {bind: true}}
+  listener: {type: ws, metadata: {path: "/overlay/$NAME"}}
+YAML
+  else
+    header=$(printf '%s:%s' "$PEER_USER" "$PEER_PASSWORD" | base64 | tr -d '\n')
+    [[ $PEER_SCHEME == https ]] && scheme=wss || scheme=ws
+    cat > "$tmp" <<YAML
+services:
+- name: overlay-tap
+  addr: "127.0.0.1:$TAP_PORT"
+  handler: {type: tap, chain: overlay-chain}
+  listener:
+    type: tap
+    metadata: {name: "$(tap_name "$NAME")", net: "$(health_cidr)", mtu: $MTU}
+  forwarder: {nodes: [{name: hub-tap, addr: "127.0.0.1:$TAP_PORT"}]}
+chains:
+- name: overlay-chain
+  hops:
+  - name: hub
+    nodes:
+    - name: hub
+      addr: "$PEER_HOST:$PEER_PORT"
+      connector: {type: relay}
+      dialer:
+        type: $scheme
+        tls: {secure: true, serverName: "$PEER_HOST"}
+        metadata:
+          path: "/overlay/$NAME"
+          keepalive: true
+          ttl: 15s
+          header:
+            Authorization: "Basic $header"
+YAML
+  fi
+  chmod 0600 "$tmp"; mv -f -- "$tmp" "$RUN/$NAME.yaml"
+)
+
+# Install the candidate before validation: lighttpd -tt must see the NEW routes.
+# A pure spoke never invokes Lighttpd unless removing its own previous hub routes.
+render_web() (
+  local out="$WEB_ROOT/conf.d/zz-vmapi-overlay.conf" tmp backup file id require hubs=0
+  for file in "$ROOT"/*.conf; do
+    [[ -f $file ]] || continue
+    load "$(basename "$file" .conf)"; [[ $ROLE == hub ]] && hubs=$((hubs+1))
+  done
+  if ((hubs == 0)) && [[ ! -f $out && ! -f $WEB_ROOT/conf.d/vmapi-overlay.conf ]]; then return 0; fi
+  command -v lighttpd >/dev/null || die 'Hub role requires Lighttpd'
+  [[ -f $WEB_ROOT/lighttpd.conf ]] || die 'Hub Lighttpd is not configured'
+  "$PEERCTL" sync-auth
+  install -d -m 0755 "$WEB_ROOT/conf.d"
+  tmp=$(mktemp "$WEB_ROOT/conf.d/.overlay.XXXXXX"); backup=$(mktemp "$RUN/.web-backup.XXXXXX")
+  trap 'rm -f -- "$tmp" "$backup"' EXIT
+  [[ ! -f $out ]] || cp -p -- "$out" "$backup"
+  printf '# Generated by overlayctl. Authentication occurs before WebSocket upgrade.\n' > "$tmp"
+  for file in "$ROOT"/*.conf; do
+    [[ -f $file ]] || continue
+    load "$(basename "$file" .conf)"; [[ $ROLE == hub ]] || continue
+    require=''
+    for id in "${MEMBERS[@]}"; do peer "$id"; require+="${require:+|}user=$PEER_USER"; done
+    cat >> "$tmp" <<LIGHTY
+\$HTTP["url"] =~ "^/overlay/$NAME\$" {
+  auth.backend = "htpasswd"
+  auth.backend.htpasswd.userfile = "$PASSWD"
+  auth.require = ( "" => ( "method" => "basic", "realm" => "VMAPI peers", "require" => "$require" ) )
+  proxy.server = ( "" => (( "host" => "127.0.0.1", "port" => $RELAY_PORT )) )
+  proxy.header = ( "upgrade" => "enable" )
+}
+LIGHTY
+  done
+  chmod 0644 "$tmp"; mv -f -- "$tmp" "$out"
+  if ! lighttpd -tt -f "$WEB_ROOT/lighttpd.conf" >&2; then
+    if [[ -s $backup ]]; then cp -p -- "$backup" "$out"; else rm -f -- "$out"; fi
+    die 'Lighttpd rejected new overlay routes; restored previous routes'
+  fi
+  "$SERVICE" lighttpd restart >&2 || die 'Lighttpd restart failed'
+  # No route remains on a former hub, and the separate old password file is retired.
+  ((hubs > 0)) || rm -f -- "$out"
+  rm -f -- "$WEB_ROOT/gost.passwd" "$WEB_ROOT/conf.d/vmapi-overlay.conf"
+)
+
+tap_is_tap() { ip -d link show "$(tap_name "$1")" 2>/dev/null | grep -q 'tun type tap'; }
+process_running() {
+  local pid; [[ -r $RUN/$1.pid ]] || return 1; read -r pid < "$RUN/$1.pid"
+  [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]] || return 1
+  kill -0 "$pid" 2>/dev/null && tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Fxq "$RUN/$1.yaml"
+}
+stop_one() {
+  if process_running "$1"; then
+    local pid; read -r pid < "$RUN/$1.pid"; kill "$pid" 2>/dev/null || true
+    for _ in {1..30}; do process_running "$1" || break; sleep .1; done
+    process_running "$1" && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f -- "$RUN/$1.pid"
+  # This prefix is owned by VMAPI; bridges and attached workloads are preserved.
+  tap_is_tap "$1" && ip link delete "$(tap_name "$1")" 2>/dev/null || true
+}
+start_one() {
+  load "$1"; render_config "$NAME"
+  modprobe tun 2>/dev/null || true
+  [[ -c /dev/net/tun ]] || die 'TUN/TAP is unavailable'
+  if ! ip link show "$BRIDGE" >/dev/null 2>&1; then "$NETCTL" bridge-create "$BRIDGE" --manual >&2; fi
+  [[ -d /sys/class/net/$BRIDGE/bridge ]] || die "$BRIDGE is not a Linux bridge"
+  ip link set "$BRIDGE" up
+  stop_one "$NAME"
+  "$GOST" -C "$RUN/$NAME.yaml" </dev/null &
+  local pid=$!; CHILDREN+=("$pid"); STARTED+=("$NAME")
+  printf '%s\n' "$pid" > "$RUN/$NAME.pid"
+  for _ in {1..50}; do tap_is_tap "$NAME" && break; kill -0 "$pid" 2>/dev/null || die "GOST exited for $NAME"; sleep .1; done
+  tap_is_tap "$NAME" || die "GOST did not create TAP for $NAME"
+  if [[ $STAGED == false ]]; then
+    ip addr flush dev "$(tap_name "$NAME")"
+    ip link set "$(tap_name "$NAME")" master "$BRIDGE"
+  # GOST tracks remote MAC addresses itself.  If the Linux bridge learns a
+  # locally attached guest MAC from a reflected overlay frame, unicast return
+  # traffic (including DHCP ACKs) is sent back into the tunnel.  Keep this
+  # aggregate TAP port flooding unknown remote destinations instead.
+  bridge link set dev "$(tap_name "$NAME")" learning "$TAP_BRIDGE_LEARNING" flood on hairpin off
+  fi
+  ip link set "$(tap_name "$NAME")" up
+}
+run() {
+  access
+  local file pid; CHILDREN=(); STARTED=()
+  cleanup() {
+    trap - EXIT TERM INT
+    for pid in "${CHILDREN[@]}"; do kill "$pid" 2>/dev/null || true; done
+    for file in "${STARTED[@]}"; do stop_one "$file"; done
+    wait 2>/dev/null || true
+  }
+  trap cleanup EXIT; trap 'exit 0' TERM INT
+  # A stale controller can have left owned children behind. stop_one verifies
+  # /proc command arguments before touching any pid.
+  for file in "$RUN"/*.pid; do [[ -f $file ]] && stop_one "$(basename "$file" .pid)"; done
+  for file in "$ROOT"/*.conf; do [[ -f $file ]] && start_one "$(basename "$file" .conf)"; done
+  if ((${#CHILDREN[@]})); then
+    wait -n "${CHILDREN[@]}" || true
+    die 'A GOST child exited; restarting the overlay service'
+  else
+    while :; do sleep 60 & wait $!; done
+  fi
+}
+restart_service() { "$SERVICE" vmapi-overlay restart 8>&- >&2; }
+wait_ready() {
+  local name=$1
+  for _ in {1..100}; do
+    if process_running "$name" && tap_is_tap "$name"; then return 0; fi
+    sleep .1
+  done
+  return 1
+}
+show() (
+  load "$1"
+  local process=false type=missing up=false bridged=false running=false state=active first=true id info
+  process_running "$NAME" && process=true
+  tap_is_tap "$NAME" && type=tap
+  info=$(ip -o link show "$(tap_name "$NAME")" 2>/dev/null || true)
+  [[ $info =~ \<[^\>]*UP[,\>] ]] && up=true
+  [[ $info == *" master $BRIDGE "* ]] && bridged=true
+  [[ $STAGED == true ]] && state=staged
+  [[ $process == true && $type == tap && $up == true && ($STAGED == true || $bridged == true) ]] && running=true
+  printf '{"name":"%s","bridge":"%s","role":"%s","mtu":%s,"peers":[' "$NAME" "$BRIDGE" "$ROLE" "$MTU"
+  for id in "${MEMBERS[@]}"; do $first || printf ','; first=false; printf '"%s"' "$id"; done
+  printf '],"tap":"%s","tap_bridge_learning":"%s","state":"%s","running":%s,"tap_process":%s,"tap_type":"%s","tap_up":%s,"tap_bridged":%s,"relay_path":"/overlay/%s","tap_cidr":"%s","tap_peer":"%s"}\n' "$(tap_name "$NAME")" "$TAP_BRIDGE_LEARNING" "$state" "$running" "$process" "$type" "$up" "$bridged" "$NAME" "$(health_cidr)" "$(health_peer)"
+)
+list() { local file first=true; printf '['; for file in "$ROOT"/*.conf; do [[ -f $file ]] || continue; $first || printf ','; first=false; show "$(basename "$file" .conf)"; done; printf ']\n'; }
+health() (
+  load "$1"; local reachable=null
+  if [[ $STAGED == true ]]; then
+    reachable=false
+    ping -n -I "$(tap_name "$NAME")" -c 3 -W 2 "$(health_peer)" >&2 && reachable=true
+  fi
+  printf '{"name":"%s","staged":%s,"peer_reachable":%s,"probe":"%s"}\n' "$NAME" "$STAGED" "$reachable" "$([[ $STAGED == true ]] && echo tap-arp-icmp || echo stage-required)"
+)
+validate() {
+  load "$1"; [[ $STAGED == true ]] || die 'Stage both endpoints before validating their TAP addresses'
+  ping -n -I "$(tap_name "$NAME")" -c 3 -W 2 "$(health_peer)" >&2 || die 'Peer TAP did not answer'
+  printf '{"name":"%s","peer_reachable":true}\n' "$NAME"
+}
+create() {
+  NAME=${1:?overlay name required}; shift; valid_name "$NAME"
+  BRIDGE='' ROLE='' MTU=1400 STAGED=false TAP_BRIDGE_LEARNING=off; MEMBERS=()
+  while (($#)); do
+    case $1 in
+      --bridge) BRIDGE=${2:?}; shift 2;; --role) ROLE=${2:?}; shift 2;;
+      --peer) MEMBERS+=("${2,,}"); shift 2;; --mtu) MTU=${2:?}; shift 2;;
+      --staged) STAGED=true; shift;; *) die "Unknown option: $1";;
+    esac
+  done
+  [[ ! -e $(conf "$NAME") ]] || die 'Overlay already exists'
+  local name=$NAME new_bridge=$BRIDGE file other id
+  declare -A seen=()
+  for id in "${MEMBERS[@]}"; do peer "$id"; [[ -z ${seen[$id]+x} ]] || die 'Duplicate peer'; seen[$id]=1; done
+  # Reserve each local bridge and computed port for exactly one overlay.
+  for file in "$ROOT"/*.conf; do
+    [[ -f $file ]] || continue; other=$(basename "$file" .conf)
+    [[ $(tap_port "$other") != "$(tap_port "$name")" && $(relay_port "$other") != "$(relay_port "$name")" ]] || die "Port collision with $other; choose another overlay name"
+    (load "$other"; [[ $BRIDGE != "$new_bridge" ]]) || die "Bridge is already used by $other"
+  done
+  write_config
+  # Validation failure must not leave a half-created definition behind.
+  if ! (load "$name"; render_config "$name"; render_web); then
+    rm -f -- "$(conf "$name")" "$RUN/$name.yaml"; die 'Overlay configuration failed'
+  fi
+  if ! restart_service || ! wait_ready "$name"; then
+    rm -f -- "$(conf "$name")" "$RUN/$name.yaml"
+    render_web; restart_service || true; die 'Overlay startup failed'
+  fi
+  show "$name"
+}
+set_stage() { load "$1"; STAGED=$2; [[ $STAGED == false || ${#MEMBERS[@]} == 1 ]] || die 'Staging requires one peer'; write_config; restart_service; wait_ready "$1" || die 'TAP startup failed'; show "$1"; }
+delete() {
+  local name=$1; load "$name"; stop_one "$name"
+  rm -f -- "$(conf "$name")" "$RUN/$name.yaml"
+  render_web; restart_service
+}
+reset() {
+  "$SERVICE" vmapi-overlay stop >&2 || true
+  local file name
+  for file in "$ROOT"/*.conf; do
+    [[ -f $file ]] || continue; name=$(basename "$file" .conf); valid_name "$name"
+    stop_one "$name"; rm -f -- "$file" "$RUN/$name.yaml"
+  done
+  render_web
+}
+revoke_peer() {
+  local id=$1 file name member remaining changed=false
+  valid_id "$id"
+  for file in "$ROOT"/*.conf; do
+    [[ -f $file ]] || continue; name=$(basename "$file" .conf); load "$name"; remaining=()
+    for member in "${MEMBERS[@]}"; do [[ $member == "$id" ]] || remaining+=("$member"); done
+    ((${#remaining[@]} != ${#MEMBERS[@]})) || continue
+    changed=true; stop_one "$name"
+    if ((${#remaining[@]})); then MEMBERS=("${remaining[@]}"); write_config
+    else rm -f -- "$file" "$RUN/$name.yaml"; fi
+  done
+  if $changed; then render_web; restart_service; fi
+}
+migrate_config() {
+  local file name
+  for file in "$ROOT"/*.conf; do
+    [[ -f $file ]] || continue
+    name=$(basename "$file" .conf)
+    load "$name"
+    write_config
+  done
+}
+
+case ${1:-} in
+  run) run; exit;;
+  help|-h|--help|'') echo 'overlayctl create NAME --bridge BRIDGE --role hub|spoke --peer NODE_ID [--peer NODE_ID ...] [--mtu 1400] [--staged]'; echo 'overlayctl list|show NAME|health NAME|stage NAME|validate NAME|activate NAME|delete NAME|reset|render|migrate-config|restart-service'; exit;;
+esac
+access
+# The supervisor never takes this mutation lock, so service restarts cannot deadlock.
+case $1 in list|show|health|validate|render-config) ;; *) exec 8>"$RUN/.lock"; flock -x 8;; esac
+cmd=$1; shift
+case $cmd in
+  create) create "$@";; list) list;; show) show "$@";; health) health "$@";; validate) validate "$@";;
+  stage) set_stage "$1" true;; activate) set_stage "$1" false;; delete) delete "$@";; reset) reset;;
+  render) for f in "$ROOT"/*.conf; do [[ -f $f ]] && render_config "$(basename "$f" .conf)"; done; render_web;;
+  render-config) render_config "$@";; restart-service) restart_service;; revoke-peer) revoke_peer "$@";; migrate-config) migrate_config;;
+  *) die "Unknown command: $cmd";;
+esac

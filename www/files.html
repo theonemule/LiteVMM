@@ -1,0 +1,58 @@
+<!doctype html>
+<!-- Dedicated host file-browser shell. Its JavaScript uses the authenticated VMAPI API rather than direct file URLs. -->
+<html lang="en" data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyVisor File Browser</title>
+  <link href="/vendor/bootstrap/bootstrap.min.css" rel="stylesheet">
+  <link href="/app.css" rel="stylesheet">
+  <style>
+    body{min-height:100vh;background:var(--bs-tertiary-bg)}
+    .file-shell{height:calc(100vh - 74px);min-height:32rem}
+    .tree-pane{width:18rem;overflow:auto;border-right:1px solid var(--bs-border-color)}
+    .file-pane{min-width:0;overflow:auto}
+    .tree-item{display:block;width:100%;border:0;background:transparent;text-align:left;padding:.35rem .5rem;border-radius:.35rem;color:inherit}
+    .tree-item:hover,.tree-item.active{background:var(--bs-primary-bg-subtle);color:var(--bs-primary-text-emphasis)}
+    .file-row{cursor:default}.file-row:hover{background:var(--bs-tertiary-bg)}.file-row.selected{background:var(--bs-primary-bg-subtle)}
+    .file-name{cursor:pointer}.file-icon{width:1.5rem;display:inline-block;text-align:center}
+    @media(max-width:767.98px){.file-shell{height:auto;min-height:0}.tree-pane{width:100%;max-height:12rem;border-right:0;border-bottom:1px solid var(--bs-border-color)}}
+  </style>
+</head>
+<body>
+  <nav class="navbar bg-dark navbar-dark px-3 py-3">
+    <a class="navbar-brand fw-semibold" href="/">VMAPI <span class="fw-normal text-white-50">File browser</span></a>
+    <div class="d-flex gap-2"><button id="themeBtn" class="btn btn-sm btn-outline-light">Theme</button><button id="refreshBtn" class="btn btn-sm btn-light">Refresh</button></div>
+  </nav>
+  <main class="container-fluid p-3">
+    <div id="alert" class="alert d-none" role="alert"></div>
+    <div id="uploadProgress" class="card shadow-sm border-0 mb-3 d-none" aria-live="polite"><div class="card-body py-3"><div class="d-flex justify-content-between small mb-1"><span id="uploadStatus">Preparing upload</span><span id="uploadPercent">0%</span></div><div class="progress" role="progressbar" aria-label="File upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="uploadBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div></div></div>
+    <div class="card shadow-sm border-0 file-shell overflow-hidden">
+      <div class="card-header bg-body py-3">
+        <div class="d-flex flex-wrap align-items-center gap-2">
+          <button id="upBtn" class="btn btn-sm btn-outline-secondary">Up</button>
+          <nav id="breadcrumbs" class="small flex-grow-1" aria-label="breadcrumb"></nav>
+          <input id="uploadInput" type="file" multiple hidden>
+          <button id="uploadBtn" class="btn btn-sm btn-primary">Upload files</button>
+          <button id="newFolderBtn" class="btn btn-sm btn-outline-primary">New folder</button>
+          <button id="moveBtn" class="btn btn-sm btn-outline-secondary" disabled>Move</button>
+          <button id="downloadBtn" class="btn btn-sm btn-outline-secondary" disabled>Download</button>
+          <button id="deleteBtn" class="btn btn-sm btn-outline-danger" disabled>Delete</button>
+        </div>
+      </div>
+      <div class="d-flex flex-column flex-md-row flex-grow-1 overflow-hidden">
+        <aside class="tree-pane p-2 bg-body-tertiary"><div class="small text-uppercase text-secondary fw-semibold px-2 py-1">Folders</div><div id="tree"></div></aside>
+        <section class="file-pane flex-grow-1 bg-body">
+          <table class="table table-hover align-middle mb-0">
+            <thead class="sticky-top bg-body"><tr><th style="width:2.5rem"><input id="selectAll" class="form-check-input" type="checkbox" aria-label="Select all"></th><th>Name</th><th class="d-none d-md-table-cell">Type</th><th class="text-end">Size</th><th class="d-none d-lg-table-cell">Modified</th><th class="d-none d-xl-table-cell">Permissions</th></tr></thead>
+            <tbody id="fileRows"><tr><td colspan="6" class="text-center text-secondary py-5">Loading…</td></tr></tbody>
+          </table>
+        </section>
+      </div>
+      <div class="card-footer bg-body small text-secondary"><span id="status">Loading…</span></div>
+    </div>
+  </main>
+  <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
+  <script src="/files.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -u
+VMCTL=${VMCTL:-/usr/local/bin/vmctl}
+for vm in $($VMCTL list 2>/dev/null); do
+  [[ $($VMCTL show "$vm" | awk -F= '$1=="AUTOSTART"{print $2; exit}') == true ]] || continue
+  $VMCTL start "$vm" || echo "Failed to autostart $vm" >&2
+done

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+
+CONSOLECTL=${CONSOLECTL:-/usr/local/bin/consolectl}
+DOCKEREXECCTL=${DOCKEREXECCTL:-/usr/local/bin/dockerexecctl}
+INTERVAL=${VMAPI_CONSOLE_GC_INTERVAL:-60}
+
+while true; do
+  "$CONSOLECTL" gc || true
+  "$DOCKEREXECCTL" gc || true
+  sleep "$INTERVAL"
+done

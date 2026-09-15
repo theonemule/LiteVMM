@@ -1,0 +1,36 @@
+# Local credentials and generated pairing material
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+vmapi-peer.htpasswd
+gost.passwd
+
+# Generated runtime and host state
+run/
+var/
+etc/vmapi/overlays/*.conf
+!etc/vmapi/overlays/.gitkeep
+*.pid
+*.sock
+*.log
+
+# Deployment and provisioning output
+*.ps1
+*.psm1
+hyperv-provision.log
+*.tar.gz
+
+# Editor and operating system files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

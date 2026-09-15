@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+BACKUP_ROOT=${VMAPI_BACKUP_ROOT:-/var/lib/vmapi/backups}
+SCHEDULE_ROOT=${VMAPI_BACKUP_SCHEDULE_ROOT:-/etc/vmapi/backups}
+CRONTAB=${VMAPI_BACKUP_CRONTAB:-/etc/crontabs/root}
+LOG_ROOT=${VMAPI_BACKUP_LOG_ROOT:-/var/log/vmapi/backups}
+JOB_ROOT=${VMAPI_BACKUP_JOB_ROOT:-/var/lib/vmapi/backup-jobs}
+VMCTL=${VMCTL:-/usr/local/bin/vmctl}
+SELF=${VMAPI_BACKUPCTL:-/usr/local/bin/vmbackupctl}
+PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+
+usage() { cat <<'TXT'
+vmbackupctl - VM archive backup manager
+
+Commands:
+  list [VM]
+  create VM [--live] [--label LABEL] [--destination DIR] [--keep COUNT] [--peer NODE_ID]
+  start VM [create options]       Start a tracked backup job and return immediately
+  job JOB_ID                      Show a tracked backup job's current state
+  download VM ARCHIVE
+  receive ARCHIVE             Store an archive read from stdin (paired hosts only)
+  import ARCHIVE              Read a VM archive from stdin
+  restore VM ARCHIVE [--destination DIR]
+  delete VM ARCHIVE
+  schedule VM CRON [--label POLICY] [--destination DIR] [--keep COUNT] [--live] [--peer NODE_ID]
+  unschedule VM [POLICY]
+  schedules
+TXT
+}
+valid_archive() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.tar\.gz$ ]] || die "Invalid backup archive: ${1:-}"; }
+valid_destination() { [[ ${1:-} == /* && ${1:-} != *$'\n'* && ${1:-} != *$'\r'* ]] || die 'Backup destination must be an absolute path'; }
+valid_keep() { [[ ${1:-} =~ ^[1-9][0-9]{0,3}$ ]] || die 'Retention count must be between 1 and 9999'; }
+valid_peer_id() { [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
+valid_job_id() { [[ ${1:-} =~ ^[A-Za-z0-9._-]{8,128}$ ]] || die 'Invalid backup job id'; }
+backup_progress() {
+  local percent=${1:?percent required} message=${2:?message required} tmp
+  [[ -n ${BACKUP_PROGRESS_FILE:-} ]] || return 0
+  tmp="${BACKUP_PROGRESS_FILE}.tmp.$$"
+  printf '{"state":"running","percent":%s,"message":"%s"}\n' "$percent" "$(json_escape "$message")" > "$tmp"
+  mv -f -- "$tmp" "$BACKUP_PROGRESS_FILE"
+}
+backup_dir() { local root=${2:-$BACKUP_ROOT}; validate_vm_name "$1"; valid_destination "$root"; printf '%s/%s\n' "$root" "$1"; }
+archive_path() { printf '%s/%s\n' "$(backup_dir "$1")" "$2"; }
+require_stopped_vm() { require_vm "$1"; [[ $($VMCTL status "$1") == stopped ]] || die "VM must be stopped for a consistent backup; use --live for QMP disk copies: $1"; }
+qmp() {
+  local name=$1 payload=$2 socket
+  socket="$(vm_dir "$name")/runtime/qmp.sock"
+  [[ -S $socket ]] || die 'QMP socket is unavailable'
+  command -v socat >/dev/null 2>&1 || die 'socat is required for live backups'
+  { printf '%s\n' '{"execute":"qmp_capabilities"}'; printf '%s\n' "$payload"; } | socat -T 10 - "UNIX-CONNECT:$socket" | tail -n1
+}
+live_disk_copy() {
+  local name=$1 target_dir=$2 conf idx file format bus target job output device
+  conf=$(vm_conf "$name")
+  while IFS= read -r idx; do
+    file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" ''); format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2); bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" virtio)
+    [[ $format == qcow2 && $bus == virtio ]] || die "Live backup supports virtio qcow2 disks only: disk$idx"
+    target="$target_dir/$file"; job="vmapi-backup-$idx"
+    device="drive$idx"
+    output=$(qmp "$name" "{\"execute\":\"drive-backup\",\"arguments\":{\"device\":\"$device\",\"target\":\"$target\",\"format\":\"qcow2\",\"sync\":\"full\",\"job-id\":\"$job\",\"auto-finalize\":true,\"auto-dismiss\":true}}")
+    if [[ $output == *'"error"'* ]]; then
+      device="virtio$idx"
+      output=$(qmp "$name" "{\"execute\":\"drive-backup\",\"arguments\":{\"device\":\"$device\",\"target\":\"$target\",\"format\":\"qcow2\",\"sync\":\"full\",\"job-id\":\"$job\",\"auto-finalize\":true,\"auto-dismiss\":true}}")
+    fi
+    [[ $output == *'"return"'* ]] || die "QMP could not start disk$idx backup: $output"
+    while :; do
+      output=$(qmp "$name" '{"execute":"query-block-jobs"}')
+      [[ $output == *"$job"* ]] || break
+      [[ $output != *'"error"'* ]] || die "QMP disk copy failed: $output"
+      sleep 1
+    done
+    [[ -f $target ]] || die "QMP disk copy did not create $file"
+  done < <(indexes_for "$conf" DISK)
+}
+stage_vm_config() {
+  local name=$1 stage=$2 file
+  mkdir -p "$stage/$name"
+  # Retain configuration metadata and NVRAM, but never archive transient
+  # sockets/PIDs. Any legacy disk that is configured below is moved into the
+  # portable disks/ member so restores use the new storage layout.
+  tar -C "$(vm_dir "$name")" --exclude=runtime -cf - . | tar -C "$stage/$name" -xf -
+  local conf; conf=$(vm_conf "$name")
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    rm -f -- "$stage/$name/$file"
+  done < <(while IFS= read -r idx; do cfg_get_file "$conf" "DISK_${idx}_FILE" ''; done < <(indexes_for "$conf" DISK))
+}
+stage_vm_disks() {
+  local name=$1 stage=$2 conf idx file source
+  conf=$(vm_conf "$name")
+  mkdir -p "$stage/$name/disks"
+  while IFS= read -r idx; do
+    file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
+    [[ -n $file ]] || die "Disk index has no file name: $idx"
+    source=$(vm_disk_path "$name" "$file")
+    [[ -f $source ]] || die "Disk file missing: $source"
+    cp --reflink=auto "$source" "$stage/$name/disks/$file" 2>/dev/null || cp "$source" "$stage/$name/disks/$file"
+  done < <(indexes_for "$conf" DISK)
+}
+cmd_list() {
+  local vm=${1-} dir file
+  if [[ -n $vm ]]; then dir=$(backup_dir "$vm"); else dir="$BACKUP_ROOT"; fi
+  shopt -s nullglob
+  for file in "$dir"/*/*.tar.gz "$dir"/*.tar.gz; do [[ -f $file ]] || continue; printf '{"vm":"%s","archive":"%s","bytes":%s,"modified":"%s"}\n' "$(json_escape "$(basename "$(dirname "$file")")")" "$(json_escape "$(basename "$file")")" "$(stat -c %s "$file")" "$(stat -c %y "$file")"; done
+  shopt -u nullglob
+}
+prune_archives() {
+  local name=$1 root=$2 label=$3 keep=$4 file
+  [[ -n $keep ]] || return 0
+  mapfile -t files < <(find "$(backup_dir "$name" "$root")" -maxdepth 1 -type f -name "${name}-${label}-*.tar.gz" -printf '%T@ %p\n' | sort -nr | awk 'NR>'"$keep"' {sub(/^[^ ]+ /, ""); print}')
+  for file in "${files[@]}"; do rm -f -- "$file"; done
+}
+cmd_create() {
+  local name=${1:?VM name required}; shift; local label=manual destination=$BACKUP_ROOT keep='' peer_id='' stamp archive dir tmp live=false stage bytes transfer_out receive_path progress_file=''
+  while (($#)); do case "$1" in
+    --live) live=true; shift;; --label) label=${2:?}; shift 2;; --destination) destination=${2:?}; shift 2;; --keep) keep=${2:?}; shift 2;; --peer) peer_id=${2:?}; shift 2;; --progress-file) progress_file=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  BACKUP_PROGRESS_FILE=$progress_file
+  backup_progress 5 'Validating VM and backup destination'
+  $live || require_stopped_vm "$name"
+  [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "Invalid backup label"; valid_destination "$destination"; [[ -z $keep ]] || valid_keep "$keep"; [[ -z $peer_id ]] || valid_peer_id "$peer_id"
+  install -d -o vmapi -g vmapi -m 0750 "$destination" "$(backup_dir "$name" "$destination")"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ); archive="${name}-${label}-${stamp}.tar.gz"; dir=$(backup_dir "$name" "$destination"); tmp="$dir/.${archive}.tmp"
+  stage=$(mktemp -d "$dir/.archive.XXXXXX")
+  backup_progress 15 'Copying VM configuration'
+  stage_vm_config "$name" "$stage"
+  if $live; then
+    [[ $($VMCTL status "$name") == running ]] || die "VM is not running; use a normal backup: $name"
+    mkdir -p "$stage/$name/disks"; chown vmapi:vmapi "$stage" "$stage/$name" "$stage/$name/disks" 2>/dev/null || true; chmod 0750 "$stage" "$stage/$name" "$stage/$name/disks"
+    backup_progress 30 'Creating live disk copies'
+    live_disk_copy "$name" "$stage/$name/disks"
+  else
+    backup_progress 30 'Copying attached virtual disks'
+    stage_vm_disks "$name" "$stage"
+  fi
+  trap 'rm -rf -- "$stage"' RETURN
+  backup_progress 75 'Compressing backup archive'
+  tar -C "$stage" -czf "$tmp" "$name"
+  chmod 0640 "$tmp"; chown vmapi:vmapi "$tmp" 2>/dev/null || true; mv -f "$tmp" "$dir/$archive"
+  bytes=$(stat -c %s "$dir/$archive")
+  if [[ -n $peer_id ]]; then
+    backup_progress 90 'Transferring archive to paired host'
+    receive_path="/backups/receive/$archive?label=$label${keep:+&keep=$keep}"
+    if ! transfer_out=$("$PEERCTL" proxy "$peer_id" PUT "$receive_path" application/gzip < "$dir/$archive" 2>&1); then
+      die "Paired-host backup transfer failed; the local staging archive was retained: $transfer_out"
+    fi
+    rm -f -- "$dir/$archive"
+    rmdir "$dir" 2>/dev/null || true
+    backup_progress 100 'Backup stored on paired host'
+    printf '{"vm":"%s","archive":"%s","bytes":%s,"target":"peer","peer_id":"%s"}\n' "$(json_escape "$name")" "$(json_escape "$archive")" "$bytes" "$(json_escape "$peer_id")"
+  else
+    backup_progress 95 'Finalizing local backup archive'
+    prune_archives "$name" "$destination" "$label" "$keep"
+    backup_progress 100 'Backup stored locally'
+    printf '{"vm":"%s","archive":"%s","path":"%s","bytes":%s,"target":"local","destination":"%s"}\n' "$(json_escape "$name")" "$(json_escape "$archive")" "$(json_escape "$dir/$archive")" "$bytes" "$(json_escape "$destination")"
+  fi
+}
+cmd_start() {
+  local name=${1:?VM name required}; shift
+  validate_vm_name "$name"
+  install -d -o vmapi -g vmapi -m 0750 "$JOB_ROOT" "$LOG_ROOT"
+  local job state log
+  job="${name}-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+  state="$JOB_ROOT/$job.json"; log="$LOG_ROOT/$job.log"
+  printf '{"id":"%s","vm":"%s","state":"running","percent":0,"message":"Queued"}\n' "$(json_escape "$job")" "$(json_escape "$name")" > "$state"
+  chown vmapi:vmapi "$state" 2>/dev/null || true; chmod 0640 "$state"
+  (
+    local_result=''
+    if local_result=$("$SELF" create "$name" "$@" --progress-file "$state" 2>&1); then
+      printf '{"id":"%s","vm":"%s","state":"completed","percent":100,"message":"Backup complete","result":%s}\n' "$(json_escape "$job")" "$(json_escape "$name")" "$local_result" > "$state"
+    else
+      printf '{"id":"%s","vm":"%s","state":"failed","percent":0,"message":"%s"}\n' "$(json_escape "$job")" "$(json_escape "$name")" "$(json_escape "$local_result")" > "$state"
+    fi
+    chown vmapi:vmapi "$state" 2>/dev/null || true; chmod 0640 "$state"
+  ) </dev/null > "$log" 2>&1 &
+  printf '{"id":"%s","vm":"%s","state":"running","percent":0,"message":"Queued"}\n' "$(json_escape "$job")" "$(json_escape "$name")"
+}
+cmd_job() { local job=${1:?job id required}; valid_job_id "$job"; [[ -f "$JOB_ROOT/$job.json" ]] || die 'Backup job not found'; cat "$JOB_ROOT/$job.json"; }
+cmd_download() { local name=${1:?VM name required} archive=${2:?archive required}; valid_archive "$archive"; [[ -f $(archive_path "$name" "$archive") ]] || die 'Backup archive not found'; cat "$(archive_path "$name" "$archive")"; }
+cmd_import() {
+  local archive=${1:?archive required} source
+  valid_archive "$archive"
+  source=$(mktemp)
+  trap 'rm -f -- "$source"' RETURN
+  cat > "$source"
+  cmd_import_file "$archive" "$source"
+}
+cmd_receive() {
+  local archive=${1:?archive required}; shift; local source name dir target label='' keep=''
+  valid_archive "$archive"
+  while (($#)); do case "$1" in --label) label=${2:?}; shift 2;; --keep) keep=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  [[ -z $label || $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup label'; [[ -z $keep ]] || valid_keep "$keep"
+  source=$(mktemp); trap 'rm -f -- "$source"' RETURN
+  cat > "$source"
+  gzip -t "$source" 2>/dev/null || die 'Uploaded backup is not a valid gzip archive'
+  # Consume the full tar listing. An early-exiting reader can SIGPIPE tar and,
+  # with pipefail enabled, abort this command without a useful error message.
+  name=$(tar -tzf "$source" 2>/dev/null | awk -F/ 'NR==1 {print $1}')
+  validate_vm_name "$name"
+  tar -tzf "$source" 2>/dev/null | grep -Fx "$name/vm.conf" >/dev/null || die 'Uploaded backup does not contain a VM configuration'
+  dir=$(backup_dir "$name"); install -d -o vmapi -g vmapi -m 0750 "$BACKUP_ROOT" "$dir"
+  target="$dir/$archive"; [[ ! -e $target ]] || die "Backup already exists: $archive"
+  chmod 0640 "$source"; chown vmapi:vmapi "$source" 2>/dev/null || true; mv "$source" "$target"
+  trap - RETURN
+  [[ -z $label || -z $keep ]] || prune_archives "$name" "$BACKUP_ROOT" "$label" "$keep"
+  printf '{"received":true,"vm":"%s","archive":"%s","bytes":%s}\n' "$(json_escape "$name")" "$(json_escape "$archive")" "$(stat -c %s "$target")"
+}
+cmd_import_file() {
+  local archive=${1:?archive required} source=${2:?source required} name stage diskstage conf idx file
+  valid_archive "$archive"
+  name=$(tar -tzf "$source" 2>/dev/null | awk -F/ 'NR==1 {print $1}')
+  validate_vm_name "$name"
+  [[ ! -e "$VM_ROOT/$name" && ! -e "$DISK_ROOT/$name" ]] || die "VM already exists: $name"
+  install -d -m 0750 "$VM_ROOT" "$DISK_ROOT"
+  stage=$(mktemp -d "$VM_ROOT/.import.XXXXXX")
+  tar -xzf "$source" -C "$stage"
+  [[ -f "$stage/$name/vm.conf" ]] || die 'Archive does not contain a valid VM directory'
+  [[ ! -e "$VM_ROOT/$name" && ! -e "$DISK_ROOT/$name" ]] || die "VM already exists: $name"
+  diskstage="$stage/$name/disks"
+  # Old archives placed disk files next to vm.conf. Relocate every configured
+  # legacy disk during import while accepting the new disks/ archive layout.
+  if [[ ! -d $diskstage ]]; then
+    mkdir -p "$diskstage"
+    conf="$stage/$name/vm.conf"
+    while IFS= read -r idx; do
+      file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
+      [[ -z $file || ! -f "$stage/$name/$file" ]] || mv "$stage/$name/$file" "$diskstage/$file"
+    done < <(indexes_for "$conf" DISK)
+  fi
+  mv "$stage/$name" "$VM_ROOT/$name"
+  mv "$VM_ROOT/$name/disks" "$DISK_ROOT/$name"
+  chown -R vmapi:vmapi "$VM_ROOT/$name" 2>/dev/null || true
+  chown -R vmapi:vmapi "$DISK_ROOT/$name" 2>/dev/null || true
+  chmod 0750 "$VM_ROOT/$name" "$VM_ROOT/$name/runtime" "$DISK_ROOT/$name" 2>/dev/null || true
+  rm -rf -- "$stage"
+  printf '{"imported":true,"vm":"%s"}\n' "$(json_escape "$name")"
+}
+cmd_restore() {
+  local name=${1:?VM name required} archive=${2:?archive required}; shift 2; local destination=$BACKUP_ROOT source stage
+  valid_archive "$archive"; validate_vm_name "$name"
+  while (($#)); do case "$1" in --destination) destination=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  source="$(backup_dir "$name" "$destination")/$archive"; [[ -f $source ]] || die 'Backup archive not found'
+  [[ ! -e "$VM_ROOT/$name" ]] || die "VM already exists: $name; delete it before restoring"
+  cmd_import_file "$archive" "$source"
+}
+cmd_delete() { local name=${1:?VM name required} archive=${2:?archive required}; valid_archive "$archive"; rm -f -- "$(archive_path "$name" "$archive")"; }
+cmd_schedule() {
+  local name=${1:?VM name required} cron=${2:?cron expression required}; shift 2; local label=scheduled destination=$BACKUP_ROOT keep='' live=false peer_id='' file live_arg='' peer_arg=''
+  validate_vm_name "$name"; [[ $cron != *$'\n'* && $cron != *$'\r'* && $cron != *';'* ]] || die 'Invalid cron expression'
+  while (($#)); do case "$1" in --live) live=true; shift;; --label) label=${2:?}; shift 2;; --destination) destination=${2:?}; shift 2;; --keep) keep=${2:?}; shift 2;; --peer) peer_id=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'; valid_destination "$destination"; [[ -z $keep ]] || valid_keep "$keep"; [[ -z $peer_id ]] || valid_peer_id "$peer_id"
+  install -d -m 0700 "$SCHEDULE_ROOT"; file="$SCHEDULE_ROOT/$name-$label"
+  printf 'NAME=%q\nLABEL=%q\nDESTINATION=%q\nKEEP=%q\nLIVE=%q\nPEER_ID=%q\nCRON=%q\n' "$name" "$label" "$destination" "$keep" "$live" "$peer_id" "$cron" > "$file"; chmod 0600 "$file"
+  install -d -m 0755 /etc/crontabs "$LOG_ROOT"
+  touch "$CRONTAB"; chmod 0600 "$CRONTAB"
+  sed -i "\|# vmapi-backup:$name:$label$|d" "$CRONTAB"
+  $live && live_arg=' --live'
+  [[ -n $peer_id ]] && peer_arg=" --peer $(printf '%q' "$peer_id")"
+  # Run schedules as tracked jobs too.  Cron only needs to enqueue the work;
+  # the per-job state and log retain the real completion result for the UI.
+  printf '%s %s start %q --label %q --destination %q%s%s%s >> %q 2>&1 # vmapi-backup:%s:%s\n' "$cron" "$SELF" "$name" "$label" "$destination" "${keep:+ --keep $(printf '%q' "$keep")}" "$live_arg" "$peer_arg" "$LOG_ROOT/$name-$label.log" "$name" "$label" >> "$CRONTAB"
+}
+cmd_schedules() { local file NAME LABEL DESTINATION KEEP LIVE PEER_ID CRON; shopt -s nullglob; for file in "$SCHEDULE_ROOT"/*; do NAME=''; LABEL=''; DESTINATION=''; KEEP=''; LIVE=''; PEER_ID=''; CRON=''; source "$file"; printf '{"vm":"%s","cron":"%s","label":"%s","destination":"%s","keep":"%s","live":%s,"target":"%s","peer_id":"%s"}\n' "$(json_escape "$NAME")" "$(json_escape "$CRON")" "$(json_escape "$LABEL")" "$(json_escape "$DESTINATION")" "$(json_escape "$KEEP")" "${LIVE:-false}" "$([[ -n $PEER_ID ]] && printf peer || printf local)" "$(json_escape "$PEER_ID")"; done; shopt -u nullglob; }
+cmd_unschedule() { local name=${1:?VM name required} label=${2-}; validate_vm_name "$name"; if [[ -n $label ]]; then rm -f -- "$SCHEDULE_ROOT/$name-$label" "/etc/cron.d/vmapi-backup-$name-$label"; sed -i "\|# vmapi-backup:$name:$label$|d" "$CRONTAB" 2>/dev/null || true; else rm -f -- "$SCHEDULE_ROOT/$name" "$SCHEDULE_ROOT/$name-"* "/etc/cron.d/vmapi-backup-$name" "/etc/cron.d/vmapi-backup-$name-"*; sed -i "\|# vmapi-backup:$name:|d" "$CRONTAB" 2>/dev/null || true; fi; }
+case "${1:-help}" in list) shift; cmd_list "$@";; create) shift; cmd_create "$@";; start) shift; cmd_start "$@";; job) shift; cmd_job "$@";; download) shift; cmd_download "$@";; receive) shift; cmd_receive "$@";; import) shift; cmd_import "$@";; import-file) shift; cmd_import_file "$@";; restore) shift; cmd_restore "$@";; delete) shift; cmd_delete "$@";; schedule) shift; cmd_schedule "$@";; unschedule) shift; cmd_unschedule "$@";; schedules) cmd_schedules;; help|-h|--help) usage;; *) usage >&2; die "Unknown command: ${1:-}";; esac

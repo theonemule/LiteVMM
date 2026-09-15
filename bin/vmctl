@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+usage() {
+cat <<'TXT'
+vmctl - minimal QEMU/KVM VM manager
+
+Commands:
+  list
+  show NAME
+  status NAME
+  create NAME [options]
+  set NAME FIELD VALUE
+  start NAME
+  stop NAME [--force]
+  reboot NAME [--force]
+  delete NAME
+  disk-add NAME --size SIZE [--file FILE] [--format qcow2|raw] [--bus virtio|sata|scsi]
+  disk-import-stdin NAME FILE [--format qcow2|raw|vmdk] [--bus virtio|sata|scsi]
+  disk-download NAME INDEX
+  disk-remove NAME INDEX [--delete-file]
+  disk-resize NAME INDEX SIZE
+  disk-set NAME INDEX bus virtio|sata|scsi
+  nic-add NAME --mode nat|bridge|overlay [--bridge BR|--overlay NAME] [--model MODEL] [--mac MAC]
+  nic-remove NAME INDEX
+  nic-set NAME INDEX mode|bridge|model|mac VALUE
+  pci-add NAME BDF
+  pci-remove NAME INDEX
+  console-info NAME
+  command NAME              Print the QEMU command that would be launched
+
+Create options:
+  --memory MB       default 2048
+  --cpus N          default 2
+  --disk SIZE       e.g. 40G; omit for no initial disk
+  --disk-format F   qcow2|raw
+  --disk-bus B      virtio|sata|scsi
+  --iso FILE        filename from shared image store
+  --network M       nat|bridge|overlay|none
+  --bridge BR       required when network=bridge
+  --overlay NAME    required when network=overlay (a named VMAPI L2 overlay)
+  --nic-model M     virtio-net-pci|e1000|e1000e|rtl8139
+  --autostart B     true|false
+  --firmware F      bios|uefi
+  --machine M       q35|pc (or another QEMU machine name)
+  --cpu C           host, max, etc.
+  --emulation B     permit slow software emulation when KVM is unavailable (default false)
+  --vnc-display N   QEMU VNC display; default is next unused
+  --vnc-bind ADDR   default 127.0.0.1
+  --display M       vnc|none
+  --boot ORDER      QEMU boot order, e.g. c or dc
+TXT
+}
+
+valid_nic_model() { [[ $1 == virtio-net-pci || $1 == e1000 || $1 == e1000e || $1 == rtl8139 ]] || die "Unsupported NIC model: $1"; }
+valid_disk_format() { [[ $1 == qcow2 || $1 == raw || $1 == vmdk ]] || die "Unsupported disk format: $1"; }
+valid_disk_bus() { [[ $1 == virtio || $1 == sata || $1 == scsi ]] || die "Unsupported disk bus: $1"; }
+valid_mac() { [[ $1 =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || die "Invalid MAC address: $1"; }
+valid_bridge() { [[ $1 =~ ^[A-Za-z0-9_.:-]{1,31}$ ]] || die "Invalid bridge name: $1"; }
+valid_overlay() { [[ $1 =~ ^[a-z][a-z0-9-]{0,10}$ ]] || die "Invalid overlay name: $1"; }
+overlay_bridge() { local name=$1 file=${VMAPI_OVERLAY_ROOT:-/etc/vmapi/overlays}/$name.conf; valid_overlay "$name"; [[ -r $file ]] || die "Overlay not found: $name"; local NAME='' BRIDGE=''; source "$file"; valid_bridge "$BRIDGE"; printf '%s' "$BRIDGE"; }
+valid_pci_bdf() { [[ $1 =~ ^([0-9A-Fa-f]{4}:)?[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] || die "Invalid PCI BDF: $1"; }
+
+cmd_list() {
+  mkdir -p "$VM_ROOT"
+  shopt -s nullglob
+  local d
+  for d in "$VM_ROOT"/*; do [[ -f "$d/vm.conf" ]] && basename "$d"; done | sort
+  shopt -u nullglob
+}
+cmd_show() { require_vm "$1"; cat "$(vm_conf "$1")"; }
+cmd_status() { require_vm "$1"; vm_state "$1"; }
+
+cmd_create() {
+  local name=${1:-}; shift || true
+  validate_vm_name "$name"
+  mkdir -p "$VM_ROOT" "$DISK_ROOT" "$ISO_ROOT"
+  [[ ! -e "$VM_ROOT/$name" && ! -e "$DISK_ROOT/$name" ]] || die "VM already exists: $name"
+
+  local memory=$DEFAULT_MEMORY_MB cpus=$DEFAULT_VCPUS disk='' disk_format=$DEFAULT_DISK_FORMAT disk_bus=$DEFAULT_DISK_BUS
+  local iso='' network=nat bridge='' overlay='' nic_model=$DEFAULT_NIC_MODEL autostart=false firmware=bios
+  local machine=$DEFAULT_MACHINE cpu=$DEFAULT_CPU allow_tcg=false vnc_display='' vnc_bind=$DEFAULT_VNC_BIND display=vnc boot=c
+  while (($#)); do
+    case "$1" in
+      --memory) memory=${2:?}; shift 2;; --cpus) cpus=${2:?}; shift 2;; --disk) disk=${2:?}; shift 2;;
+      --disk-format) disk_format=${2:?}; shift 2;; --disk-bus) disk_bus=${2:?}; shift 2;;
+      --iso) iso=${2:?}; shift 2;; --network) network=${2:?}; shift 2;; --bridge) bridge=${2:?}; shift 2;; --overlay) overlay=${2:?}; shift 2;;
+      --nic-model) nic_model=${2:?}; shift 2;; --autostart) autostart=${2:?}; shift 2;;
+      --firmware) firmware=${2:?}; shift 2;; --machine) machine=${2:?}; shift 2;; --cpu) cpu=${2:?}; shift 2;; --emulation) allow_tcg=${2:?}; shift 2;;
+      --vnc-display) vnc_display=${2:?}; shift 2;; --vnc-bind) vnc_bind=${2:?}; shift 2;;
+      --display) display=${2:?}; shift 2;; --boot) boot=${2:?}; shift 2;;
+      *) die "Unknown option: $1";;
+    esac
+  done
+  validate_positive_int "$memory"; validate_positive_int "$cpus"; validate_bool "$autostart"; validate_bool "$allow_tcg"
+  [[ -z "$disk" ]] || validate_size "$disk"; valid_disk_format "$disk_format"; valid_disk_bus "$disk_bus"; valid_nic_model "$nic_model"
+  [[ $network == nat || $network == bridge || $network == overlay || $network == none ]] || die "network must be nat, bridge, overlay, or none"
+  [[ $network != bridge ]] || { [[ -n "$bridge" ]] || die "--bridge is required for bridged networking"; valid_bridge "$bridge"; }
+  [[ $network != overlay ]] || { [[ -n "$overlay" ]] || die "--overlay is required for overlay networking"; bridge=$(overlay_bridge "$overlay"); }
+  [[ $firmware == bios || $firmware == uefi ]] || die "firmware must be bios or uefi"
+  [[ $display == vnc || $display == none ]] || die "display must be vnc or none"
+  [[ $boot =~ ^[acdn]{1,4}$ ]] || die "Invalid QEMU boot order: $boot"
+  [[ -z "$iso" ]] || resolve_image "$iso" >/dev/null
+  if [[ $display == vnc ]]; then
+    [[ -n "$vnc_display" ]] || vnc_display=$(next_vnc_display)
+    validate_int "$vnc_display"; (( vnc_display >= 0 && vnc_display < 100 )) || die "VNC display out of range"
+  fi
+
+  local dir="$VM_ROOT/$name" diskdir="$DISK_ROOT/$name" conf="$VM_ROOT/$name/vm.conf"
+  mkdir -m 0750 -p "$dir/runtime"
+  mkdir -m 0750 -p "$diskdir"
+  local uuid; uuid=$(cat /proc/sys/kernel/random/uuid)
+  cat > "$conf" <<CFG
+NAME=$name
+UUID=$uuid
+MEMORY_MB=$memory
+VCPUS=$cpus
+MACHINE=$machine
+CPU=$cpu
+ALLOW_TCG=$allow_tcg
+FIRMWARE=$firmware
+AUTOSTART=$autostart
+DISPLAY=$display
+VNC_BIND=$vnc_bind
+VNC_DISPLAY=$vnc_display
+BOOT_ORDER=$boot
+ISO=$iso
+CFG
+  chmod 0640 "$conf"
+
+  if [[ $firmware == uefi ]]; then
+    local vars
+    vars=$(probe_ovmf_vars) || { rm -rf -- "$dir" "$diskdir"; die "UEFI requested but no OVMF VARS template found"; }
+    cp --reflink=auto "$vars" "$dir/nvram.fd" 2>/dev/null || cp "$vars" "$dir/nvram.fd"
+  fi
+
+  if [[ -n "$disk" ]]; then
+    need_cmd "$QEMU_IMG"
+    "$QEMU_IMG" create -f "$disk_format" "$diskdir/disk0.$disk_format" "$disk" >/dev/null
+    cat >> "$conf" <<CFG
+DISK_0_FILE=disk0.$disk_format
+DISK_0_FORMAT=$disk_format
+DISK_0_BUS=$disk_bus
+CFG
+  fi
+
+  if [[ $network != none ]]; then
+    local mac; mac=$(random_mac)
+    cat >> "$conf" <<CFG
+NIC_0_MODE=$network
+NIC_0_MODEL=$nic_model
+NIC_0_MAC=$mac
+NIC_0_BRIDGE=$bridge
+NIC_0_OVERLAY=$overlay
+CFG
+  fi
+  printf '%s\n' "$name"
+}
+
+cmd_set() {
+  local name=${1:?} field=${2:?} value=${3-}
+  require_vm "$name"; require_stopped "$name"
+  local key
+  case "$field" in
+    memory|memory_mb) validate_positive_int "$value"; key=MEMORY_MB;;
+    cpus|vcpus) validate_positive_int "$value"; key=VCPUS;;
+    autostart) validate_bool "$value"; key=AUTOSTART;;
+    machine) [[ $value =~ ^[A-Za-z0-9._+-]+$ ]] || die "Invalid machine"; key=MACHINE;;
+    cpu) [[ $value =~ ^[A-Za-z0-9._,+-]+$ ]] || die "Invalid CPU value"; key=CPU;;
+    emulation|allow_tcg) validate_bool "$value"; key=ALLOW_TCG;;
+    firmware) [[ $value == bios || $value == uefi ]] || die "firmware must be bios or uefi"; key=FIRMWARE;;
+    iso) [[ -z $value ]] || resolve_image "$value" >/dev/null; key=ISO;;
+    boot|boot_order) [[ $value =~ ^[acdn]{1,4}$ ]] || die "Invalid boot order"; key=BOOT_ORDER;;
+    display) [[ $value == vnc || $value == none ]] || die "display must be vnc or none"; key=DISPLAY;;
+    vnc_bind) key=VNC_BIND;;
+    vnc_display) validate_int "$value"; key=VNC_DISPLAY;;
+    *) die "Unsupported field: $field";;
+  esac
+  if [[ $field == firmware && $value == uefi && ! -f "$(vm_dir "$name")/nvram.fd" ]]; then
+    local vars; vars=$(probe_ovmf_vars) || die "No OVMF VARS template found"
+    cp "$vars" "$(vm_dir "$name")/nvram.fd"
+  fi
+  cfg_set "$name" "$key" "$value"
+}
+
+cmd_disk_add() {
+  local name=${1:?}; shift; require_vm "$name"; require_stopped "$name"
+  local size='' file='' format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS
+  while (($#)); do case "$1" in
+    --size) size=${2:?}; shift 2;; --file) file=${2:?}; shift 2;; --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  [[ -n $size ]] || die "--size is required"; validate_size "$size"; valid_disk_format "$format"; valid_disk_bus "$bus"
+  local conf; conf=$(vm_conf "$name"); local idx; idx=$(next_index "$conf" DISK)
+  [[ -n $file ]] || file="disk${idx}.${format}"; validate_filename "$file"
+  [[ ! -e "$(disk_file "$name" "$file")" && ! -e "$(vm_dir "$name")/$file" ]] || die "Disk file already exists: $file"
+  install -d -m 0750 "$(disk_dir "$name")"
+  need_cmd "$QEMU_IMG"; "$QEMU_IMG" create -f "$format" "$(disk_file "$name" "$file")" "$size" >/dev/null
+  cfg_set_file "$conf" "DISK_${idx}_FILE" "$file"; cfg_set_file "$conf" "DISK_${idx}_FORMAT" "$format"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$bus"
+  printf '%s\n' "$idx"
+}
+cmd_disk_import_stdin() {
+  local name=${1:?} file=${2:?}; shift 2; require_vm "$name"; require_stopped "$name"
+  local format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS
+  while (($#)); do case "$1" in
+    --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  validate_filename "$file"; valid_disk_format "$format"; valid_disk_bus "$bus"
+  local target; target=$(disk_file "$name" "$file")
+  [[ ! -e $target && ! -e "$(vm_dir "$name")/$file" ]] || die "Disk file already exists: $file"
+  install -d -m 0750 "$(disk_dir "$name")"
+  local tmp; tmp=$(mktemp "$(disk_dir "$name")/.upload.XXXXXX"); trap 'rm -f -- "$tmp"' RETURN
+  cat > "$tmp"; [[ -s $tmp ]] || die 'Upload body was empty'
+  chmod 0640 "$tmp"; mv "$tmp" "$target"; trap - RETURN
+  local conf idx; conf=$(vm_conf "$name"); idx=$(next_index "$conf" DISK)
+  cfg_set_file "$conf" "DISK_${idx}_FILE" "$file"; cfg_set_file "$conf" "DISK_${idx}_FORMAT" "$format"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$bus"
+  printf '%s\n' "$idx"
+}
+cmd_disk_download() {
+  local name=${1:?} idx=${2:?}; require_vm "$name"; validate_int "$idx"
+  local file; file=$(cfg_get_file "$(vm_conf "$name")" "DISK_${idx}_FILE" '')
+  [[ -n $file ]] || die "Disk index not found: $idx"
+  local path; path=$(vm_disk_path "$name" "$file")
+  [[ -f $path ]] || die "Disk file missing: $path"
+  cat -- "$path"
+}
+cmd_disk_remove() {
+  local name=${1:?} idx=${2:?}; shift 2; require_vm "$name"; require_stopped "$name"; validate_int "$idx"
+  local delete=false; [[ ${1:-} == --delete-file ]] && delete=true
+  local conf; conf=$(vm_conf "$name"); local file; file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
+  [[ -n $file ]] || die "Disk index not found: $idx"
+  cfg_delete_prefix_file "$conf" "DISK_${idx}_"
+  $delete && rm -f -- "$(vm_disk_path "$name" "$file")"
+}
+
+
+cmd_disk_resize() {
+  local name=${1:?} idx=${2:?} size=${3:?}; require_vm "$name"; require_stopped "$name"; validate_int "$idx"; validate_size "$size"
+  local conf file; conf=$(vm_conf "$name"); file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
+  [[ -n $file && -f "$(vm_disk_path "$name" "$file")" ]] || die "Disk index not found: $idx"
+  need_cmd "$QEMU_IMG"; "$QEMU_IMG" resize "$(vm_disk_path "$name" "$file")" "$size" >/dev/null
+}
+cmd_disk_set() {
+  local name=${1:?} idx=${2:?} field=${3:?} value=${4:?}; require_vm "$name"; require_stopped "$name"; validate_int "$idx"
+  local conf; conf=$(vm_conf "$name"); [[ -n $(cfg_get_file "$conf" "DISK_${idx}_FILE" '') ]] || die "Disk index not found: $idx"
+  case "$field" in bus) valid_disk_bus "$value"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$value";; *) die "Unsupported disk field: $field";; esac
+}
+
+cmd_nic_add() {
+  local name=${1:?}; shift; require_vm "$name"; require_stopped "$name"
+  local mode='' bridge='' overlay='' model=$DEFAULT_NIC_MODEL mac=''
+  while (($#)); do case "$1" in
+    --mode) mode=${2:?}; shift 2;; --bridge) bridge=${2:?}; shift 2;; --overlay) overlay=${2:?}; shift 2;; --model) model=${2:?}; shift 2;; --mac) mac=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  [[ $mode == nat || $mode == bridge || $mode == overlay ]] || die "--mode must be nat, bridge, or overlay"; valid_nic_model "$model"
+  if [[ $mode == bridge ]]; then [[ -n $bridge ]] || die "--bridge is required"; valid_bridge "$bridge"; fi
+  if [[ $mode == overlay ]]; then [[ -n $overlay ]] || die "--overlay is required"; bridge=$(overlay_bridge "$overlay"); fi
+  [[ -n $mac ]] || mac=$(random_mac); valid_mac "$mac"
+  local conf; conf=$(vm_conf "$name"); local idx; idx=$(next_index "$conf" NIC)
+  cfg_set_file "$conf" "NIC_${idx}_MODE" "$mode"; cfg_set_file "$conf" "NIC_${idx}_MODEL" "$model"; cfg_set_file "$conf" "NIC_${idx}_MAC" "$mac"; cfg_set_file "$conf" "NIC_${idx}_BRIDGE" "$bridge"; cfg_set_file "$conf" "NIC_${idx}_OVERLAY" "$overlay"
+  printf '%s\n' "$idx"
+}
+cmd_nic_remove() {
+  local name=${1:?} idx=${2:?}; require_vm "$name"; require_stopped "$name"; validate_int "$idx"
+  local conf; conf=$(vm_conf "$name"); [[ -n $(cfg_get_file "$conf" "NIC_${idx}_MODE" '') ]] || die "NIC index not found: $idx"
+  cfg_delete_prefix_file "$conf" "NIC_${idx}_"
+}
+
+
+cmd_nic_set() {
+  local name=${1:?} idx=${2:?} field=${3:?} value=${4-}; require_vm "$name"; require_stopped "$name"; validate_int "$idx"
+  local conf; conf=$(vm_conf "$name"); [[ -n $(cfg_get_file "$conf" "NIC_${idx}_MODE" '') ]] || die "NIC index not found: $idx"
+  case "$field" in
+    mode) [[ $value == nat || $value == bridge || $value == overlay ]] || die "mode must be nat, bridge, or overlay"; cfg_set_file "$conf" "NIC_${idx}_MODE" "$value";;
+    overlay) bridge=$(overlay_bridge "$value"); cfg_set_file "$conf" "NIC_${idx}_OVERLAY" "$value"; cfg_set_file "$conf" "NIC_${idx}_BRIDGE" "$bridge"; cfg_set_file "$conf" "NIC_${idx}_MODE" overlay;;
+    bridge) [[ -z $value ]] || valid_bridge "$value"; cfg_set_file "$conf" "NIC_${idx}_BRIDGE" "$value";;
+    model) valid_nic_model "$value"; cfg_set_file "$conf" "NIC_${idx}_MODEL" "$value";;
+    mac) valid_mac "$value"; cfg_set_file "$conf" "NIC_${idx}_MAC" "$value";;
+    *) die "Unsupported NIC field: $field";;
+  esac
+}
+
+cmd_pci_add() {
+  local name=${1:?} bdf=${2:?}; require_vm "$name"; require_stopped "$name"; valid_pci_bdf "$bdf"
+  local conf; conf=$(vm_conf "$name"); local idx; idx=$(next_index "$conf" PCI)
+  cfg_set_file "$conf" "PCI_${idx}_BDF" "$bdf"; printf '%s\n' "$idx"
+}
+cmd_pci_remove() {
+  local name=${1:?} idx=${2:?}; require_vm "$name"; require_stopped "$name"; validate_int "$idx"
+  local conf; conf=$(vm_conf "$name"); [[ -n $(cfg_get_file "$conf" "PCI_${idx}_BDF" '') ]] || die "PCI index not found: $idx"
+  cfg_delete_prefix_file "$conf" "PCI_${idx}_"
+}
+
+build_qemu_args() {
+  local name=$1; require_vm "$name"; local conf dir; conf=$(vm_conf "$name"); dir=$(vm_dir "$name")
+  QEMU_ARGS=()
+    QEMU_ARGS+=("$QEMU_BIN" -name "$name" -uuid "$(cfg_get_file "$conf" UUID '')")
+  local cpu allow_tcg kvm_available=false
+  if [[ -r "$KVM_DEVICE" && -w "$KVM_DEVICE" ]]; then
+    kvm_available=true
+    QEMU_ARGS+=(-enable-kvm)
+  fi
+  cpu=$(cfg_get_file "$conf" CPU "$DEFAULT_CPU")
+  # Falling back silently to TCG pins host CPU and makes installers appear
+  # hung. It is an explicit lab-only choice, not an accidental default.
+  allow_tcg=$(cfg_get_file "$conf" ALLOW_TCG false)
+  validate_bool "$allow_tcg"
+  if [[ $kvm_available == false && $allow_tcg != true ]]; then
+    die "KVM acceleration is unavailable ($KVM_DEVICE is missing or inaccessible). Expose /dev/kvm for nested virtualization, or explicitly enable slow software emulation for a lab-only VM"
+  fi
+  [[ $kvm_available == true ]] || QEMU_ARGS+=(-accel tcg,thread=multi)
+  [[ $cpu == host && $kvm_available == false ]] && cpu=max
+  QEMU_ARGS+=(-machine "$(cfg_get_file "$conf" MACHINE "$DEFAULT_MACHINE")" -cpu "$cpu")
+  QEMU_ARGS+=(-smp "$(cfg_get_file "$conf" VCPUS "$DEFAULT_VCPUS")" -m "$(cfg_get_file "$conf" MEMORY_MB "$DEFAULT_MEMORY_MB")")
+  QEMU_ARGS+=(-nodefaults -no-user-config)
+
+  local firmware; firmware=$(cfg_get_file "$conf" FIRMWARE bios)
+  if [[ $firmware == uefi ]]; then
+    local code; code=$(probe_ovmf_code) || die "UEFI configured but OVMF code firmware not found"
+    [[ -f "$dir/nvram.fd" ]] || die "UEFI NVRAM missing: $dir/nvram.fd"
+    QEMU_ARGS+=(-drive "if=pflash,format=raw,readonly=on,file=$code" -drive "if=pflash,format=raw,file=$dir/nvram.fd")
+  fi
+
+  local idx file format bus diskpath has_sata=false has_scsi=false
+  while read -r idx; do
+    bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" virtio)
+    [[ $bus == sata ]] && has_sata=true; [[ $bus == scsi ]] && has_scsi=true
+  done < <(indexes_for "$conf" DISK)
+  $has_sata && QEMU_ARGS+=(-device ich9-ahci,id=ahci)
+  $has_scsi && QEMU_ARGS+=(-device virtio-scsi-pci,id=scsi0)
+  local sata_slot=0 scsi_slot=0
+  while read -r idx; do
+    file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" ''); format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2); bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" virtio)
+    diskpath=$(vm_disk_path "$name" "$file")
+    [[ -f "$diskpath" ]] || die "Disk file missing: $diskpath"
+    case "$bus" in
+      virtio) QEMU_ARGS+=(-drive "file=$diskpath,format=$format,if=none,id=drive$idx,cache=none,aio=threads" -device "virtio-blk-pci,drive=drive$idx,id=disk$idx");;
+      sata) QEMU_ARGS+=(-drive "file=$diskpath,format=$format,if=none,id=disk$idx,cache=none,aio=threads" -device "ide-hd,drive=disk$idx,bus=ahci.$sata_slot"); ((sata_slot+=1));;
+      scsi) QEMU_ARGS+=(-drive "file=$diskpath,format=$format,if=none,id=disk$idx,cache=none,aio=threads" -device "scsi-hd,drive=disk$idx,bus=scsi0.0,channel=0,scsi-id=$scsi_slot,lun=0"); ((scsi_slot+=1));;
+      *) die "Unsupported disk bus in config: $bus";;
+    esac
+  done < <(indexes_for "$conf" DISK)
+
+  local iso; iso=$(cfg_get_file "$conf" ISO '')
+  if [[ -n $iso ]]; then local ipath; ipath=$(resolve_image "$iso"); QEMU_ARGS+=(-drive "file=$ipath,media=cdrom,readonly=on"); fi
+  QEMU_ARGS+=(-boot "order=$(cfg_get_file "$conf" BOOT_ORDER c)")
+
+  local mode model mac br
+  while read -r idx; do
+    mode=$(cfg_get_file "$conf" "NIC_${idx}_MODE" nat); model=$(cfg_get_file "$conf" "NIC_${idx}_MODEL" "$DEFAULT_NIC_MODEL"); mac=$(cfg_get_file "$conf" "NIC_${idx}_MAC" ''); br=$(cfg_get_file "$conf" "NIC_${idx}_BRIDGE" '')
+    case "$mode" in
+      nat) QEMU_ARGS+=(-netdev "user,id=net$idx" -device "$model,netdev=net$idx,mac=$mac");;
+      bridge|overlay) valid_bridge "$br"; QEMU_ARGS+=(-netdev "bridge,id=net$idx,br=$br" -device "$model,netdev=net$idx,mac=$mac");;
+      *) die "Unsupported NIC mode in config: $mode";;
+    esac
+  done < <(indexes_for "$conf" NIC)
+
+  local bdf
+  while read -r idx; do bdf=$(cfg_get_file "$conf" "PCI_${idx}_BDF" ''); valid_pci_bdf "$bdf"; QEMU_ARGS+=(-device "vfio-pci,host=$bdf"); done < <(indexes_for "$conf" PCI)
+
+  local display; display=$(cfg_get_file "$conf" DISPLAY vnc)
+  case "$display" in
+    vnc) QEMU_ARGS+=(-display none -device VGA -vnc "$(cfg_get_file "$conf" VNC_BIND "$DEFAULT_VNC_BIND"):$(cfg_get_file "$conf" VNC_DISPLAY 1)");;
+    none) QEMU_ARGS+=(-display none);;
+    *) die "Unsupported display mode: $display";;
+  esac
+  QEMU_ARGS+=(-qmp "unix:$dir/runtime/qmp.sock,server=on,wait=off" -serial "unix:$dir/runtime/serial.sock,server=on,wait=off")
+}
+
+cmd_command() { build_qemu_args "$1"; printf '%q ' "${QEMU_ARGS[@]}"; printf '\n'; }
+cmd_start() {
+  local name=${1:?}; require_vm "$name"; [[ $(vm_state "$name") == stopped ]] || die "VM is already running: $name"
+  need_cmd "$QEMU_BIN"; mkdir -p "$(vm_dir "$name")/runtime"; rm -f -- "$(vm_dir "$name")/runtime/"{qemu.pid,qmp.sock,serial.sock}
+  build_qemu_args "$name"
+  QEMU_ARGS+=(-daemonize -pidfile "$(vm_dir "$name")/runtime/qemu.pid")
+  "${QEMU_ARGS[@]}"
+  sleep 0.15
+  require_running "$name"
+  vm_pid "$name"
+}
+
+qmp_exec() {
+  local name=$1 command=$2 sock="$(vm_dir "$name")/runtime/qmp.sock"
+  [[ -S "$sock" ]] || return 1
+  command -v socat >/dev/null 2>&1 || return 1
+  { printf '%s\n' '{"execute":"qmp_capabilities"}'; sleep 0.05; printf '{"execute":"%s"}\n' "$command"; } | socat -T 2 - "UNIX-CONNECT:$sock" >/dev/null 2>&1
+}
+cmd_stop() {
+  local name=${1:?}; shift || true; require_vm "$name"; require_running "$name"
+  local force=false; [[ ${1:-} == --force ]] && force=true
+  local pid; pid=$(vm_pid "$name")
+  kill -TERM "$pid" 2>/dev/null || true
+  local i
+  for ((i=0;i<20;i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    [[ $(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) == Z ]] && break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; sleep 1; fi
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  rm -f -- "$(vm_dir "$name")/runtime/"{qemu.pid,qmp.sock,serial.sock}
+}
+cmd_reboot() {
+  local name=${1:?}; shift || true; require_vm "$name"; require_running "$name"
+  if [[ ${1:-} == --force ]]; then qmp_exec "$name" system_reset || { cmd_stop "$name" --force; cmd_start "$name"; }
+  else qmp_exec "$name" system_reset || { cmd_stop "$name"; cmd_start "$name"; }; fi
+}
+cmd_delete() {
+  local name=${1:?}; require_vm "$name"; require_stopped "$name"
+  local d; d=$(vm_dir "$name")
+  [[ "$d" == "$VM_ROOT/"* && "$d" != "$VM_ROOT/" ]] || die "Refusing unsafe delete path"
+  local disks; disks=$(disk_dir "$name")
+  [[ "$disks" == "$DISK_ROOT/"* && "$disks" != "$DISK_ROOT/" ]] || die "Refusing unsafe disk delete path"
+  rm -rf --one-file-system -- "$d"
+  rm -rf --one-file-system -- "$disks"
+}
+cmd_console_info() {
+  local name=${1:?}; require_vm "$name"; local conf dir; conf=$(vm_conf "$name"); dir=$(vm_dir "$name")
+  printf 'state=%s\n' "$(vm_state "$name")"
+  printf 'display=%s\n' "$(cfg_get_file "$conf" DISPLAY vnc)"
+  printf 'vnc_bind=%s\n' "$(cfg_get_file "$conf" VNC_BIND "$DEFAULT_VNC_BIND")"
+  printf 'vnc_display=%s\n' "$(cfg_get_file "$conf" VNC_DISPLAY '')"
+  local vd; vd=$(cfg_get_file "$conf" VNC_DISPLAY '')
+  [[ $vd =~ ^[0-9]+$ ]] && printf 'vnc_port=%d\n' $((5900+vd)) || printf 'vnc_port=\n'
+  printf 'serial_socket=%s/runtime/serial.sock\n' "$dir"
+  printf 'qmp_socket=%s/runtime/qmp.sock\n' "$dir"
+}
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case "$cmd" in
+    help|-h|--help) usage;; list) cmd_list "$@";; show) cmd_show "$@";; status) cmd_status "$@";; create) cmd_create "$@";; set) cmd_set "$@";;
+    start) cmd_start "$@";; stop) cmd_stop "$@";; reboot) cmd_reboot "$@";; delete) cmd_delete "$@";;
+    disk-add) cmd_disk_add "$@";; disk-import-stdin) cmd_disk_import_stdin "$@";; disk-download) cmd_disk_download "$@";; disk-remove) cmd_disk_remove "$@";; disk-resize) cmd_disk_resize "$@";; disk-set) cmd_disk_set "$@";; nic-add) cmd_nic_add "$@";; nic-remove) cmd_nic_remove "$@";; nic-set) cmd_nic_set "$@";;
+    pci-add) cmd_pci_add "$@";; pci-remove) cmd_pci_remove "$@";; console-info) cmd_console_info "$@";; command) cmd_command "$@";;
+    *) usage >&2; die "Unknown command: $cmd";;
+  esac
+}
+main "$@"

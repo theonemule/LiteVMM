@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# supervise-daemon tracks the foreground controller and restarts it if GOST
+# exits. overlayctl owns and cleans up only the child GOST processes it starts.
+name="vmapi-overlay"
+description="VMAPI persistent GOST TAP overlays"
+supervisor="supervise-daemon"
+command="/usr/local/bin/overlayctl"
+command_args="run"
+command_background="no"
+respawn_delay="3"
+respawn_max="0"
+output_log="/var/log/vmapi-overlay.log"
+error_log="/var/log/vmapi-overlay.log"
+
+depend() {
+  need net
+  after lighttpd
+}

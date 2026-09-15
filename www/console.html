@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- Isolated noVNC console shell. It is opened by the main UI only after the API creates a scoped console session. -->
+<html lang="en" data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyVisor VM Console</title>
+  <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body class="console-body">
+  <header class="console-bar">
+    <div class="console-title"><div class="small text-uppercase text-secondary fw-semibold">VM console</div><h1 id="consoleTitle" class="h6 mb-0">Connecting</h1></div>
+    <div id="consoleState" class="console-state small text-secondary">Starting session...</div>
+    <div class="btn-group btn-group-sm console-actions" role="group" aria-label="Console controls">
+      <button id="pasteClipboard" class="btn btn-outline-secondary" type="button">Paste</button>
+      <button id="sendCtrlAltDel" class="btn btn-outline-secondary" type="button">Ctrl+Alt+Del</button>
+      <button id="disconnectConsole" class="btn btn-outline-secondary" type="button">Disconnect</button>
+      <button id="reconnectConsole" class="btn btn-outline-primary" type="button">Reconnect</button>
+    </div>
+  </header>
+  <main class="console-stage">
+    <div id="consoleScreen" class="console-screen" tabindex="0"></div>
+  </main>
+  <script src="/console.js"></script>
+</body>
+</html>

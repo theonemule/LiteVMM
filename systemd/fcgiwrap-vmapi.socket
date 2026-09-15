@@ -1,0 +1,13 @@
+# Socket activation endpoint shared by the web server and the VMAPI FastCGI worker.
+[Unit]
+Description=VMAPI fcgiwrap socket
+
+[Socket]
+ListenStream=/run/fcgiwrap-vmapi.sock
+SocketUser=www-data
+SocketGroup=www-data
+SocketMode=0660
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

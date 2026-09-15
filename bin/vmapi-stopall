@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -u
+VMCTL=${VMCTL:-/usr/local/bin/vmctl}
+rc=0
+for vm in $($VMCTL list 2>/dev/null); do
+  [[ $($VMCTL status "$vm" 2>/dev/null) == running ]] || continue
+  $VMCTL stop "$vm" || rc=1
+done
+exit $rc

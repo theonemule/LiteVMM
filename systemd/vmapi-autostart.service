@@ -1,0 +1,17 @@
+# One-shot boot service that starts only VMs explicitly marked AUTOSTART=true.
+[Unit]
+Description=Start VMAPI virtual machines marked AUTOSTART=true
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vmapi
+Group=vmapi
+SupplementaryGroups=kvm
+ExecStart=/usr/local/bin/vmapi-autostart
+ExecStop=/usr/local/bin/vmapi-stopall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+# Purpose: OpenRC service definition for a VMAPI runtime component.
+# The web server provides public access; this service owns only the local runtime process.
+supervisor=supervise-daemon
+name="VMAPI fcgiwrap"
+description="FastCGI wrapper for VMAPI CGI"
+command=/usr/bin/spawn-fcgi
+command_args="-n -s /run/fcgiwrap-vmapi.sock -M 0660 -U lighttpd -G lighttpd -u vmapi -g vmapi -- /usr/bin/env HOME=/var/lib/vmapi PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/fcgiwrap -f -c 8"
+pidfile=/run/fcgiwrap-vmapi.pid
+output_log=/var/log/fcgiwrap-vmapi.log
+error_log=/var/log/fcgiwrap-vmapi.log
+depend() {
+  need localmount
+  after docker
+}
+start_pre() {
+  checkpath -d -m 0755 /run
+  rm -f /run/fcgiwrap-vmapi.sock
+}

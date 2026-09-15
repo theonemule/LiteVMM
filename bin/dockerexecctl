@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+STATE_DIR=${VMAPI_DOCKER_EXEC_STATE_DIR:-/run/vmapi/docker-exec}
+TTL=${VMAPI_DOCKER_EXEC_TTL:-900}
+
+usage() {
+cat <<'TXT'
+dockerexecctl - tokenized docker exec sessions for ttyd
+
+Commands:
+  start CONTAINER [--shell /bin/sh]
+  info CONTAINER
+  touch CONTAINER
+  stop CONTAINER
+  attach TOKEN
+  gc
+TXT
+}
+
+valid_container() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "Invalid container name: ${1:-}"; }
+valid_shell() { [[ ${1:-} =~ ^(/[A-Za-z0-9._+-]+)+$ || ${1:-} =~ ^[A-Za-z0-9._+-]+$ ]] || die "Invalid shell: ${1:-}"; }
+session_file() { printf '%s/%s.env\n' "$STATE_DIR" "$1"; }
+now() { date +%s; }
+init_state() { install -d -m 0755 /run/vmapi "$STATE_DIR"; chown vmapi:vmapi /run/vmapi "$STATE_DIR" 2>/dev/null || true; }
+new_token() { if [[ -r /proc/sys/kernel/random/uuid ]]; then tr -d '-' < /proc/sys/kernel/random/uuid; else od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; fi; }
+container_running() { "$DOCKER_BIN" container inspect --format '{{.State.Running}}' "$1" 2>/dev/null | grep -qx true; }
+
+write_session() {
+  local name=$1 token=$2 shell=$3 updated tmp file
+  updated=$(now); file=$(session_file "$name"); tmp="$file.$$"
+  cat > "$tmp" <<EOF
+CONTAINER=$(printf '%q' "$name")
+TOKEN=$(printf '%q' "$token")
+SHELL_CMD=$(printf '%q' "$shell")
+UPDATED=$(printf '%q' "$updated")
+EOF
+  chmod 0640 "$tmp"; chown vmapi:vmapi "$tmp" 2>/dev/null || true; mv -f "$tmp" "$file"
+}
+load_session() { local name=$1 file; file=$(session_file "$name"); [[ -r $file ]] || return 1; source "$file"; }
+find_session_by_token() {
+  local token=$1 file TOKEN CONTAINER SHELL_CMD UPDATED
+  [[ $token =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
+  shopt -s nullglob
+  for file in "$STATE_DIR"/*.env; do
+    TOKEN='' CONTAINER='' SHELL_CMD='' UPDATED=''
+    source "$file" || continue
+    [[ $TOKEN == "$token" ]] || continue
+    printf '%s\n' "$file"; shopt -u nullglob; return 0
+  done
+  shopt -u nullglob; return 1
+}
+session_valid() {
+  local name=$1 CONTAINER='' TOKEN='' SHELL_CMD='' UPDATED=''
+  load_session "$name" || return 1
+  [[ ${UPDATED:-0} =~ ^[0-9]+$ ]] || return 1
+  (( UPDATED + TTL >= $(now) )) || return 1
+  container_running "$CONTAINER" || return 1
+}
+json_session() {
+  local name=$1 CONTAINER='' TOKEN='' SHELL_CMD='' UPDATED=''
+  load_session "$name" || die "Exec session not found: $name"
+  printf '{"container":"%s","token":"%s","shell":"%s","url":"/docker/terminal/?arg=%s","ttl_seconds":%s,"updated":%s}\n' "$(json_escape "$CONTAINER")" "$(json_escape "$TOKEN")" "$(json_escape "$SHELL_CMD")" "$(json_escape "$TOKEN")" "$TTL" "$UPDATED"
+}
+cmd_start() {
+  local name=${1:?container required}; shift; local shell=/bin/sh token
+  valid_container "$name"; init_state; need_cmd "$DOCKER_BIN"
+  while (($#)); do case "$1" in --shell) shell=${2:?}; valid_shell "$shell"; shift 2;; *) die "Unknown option: $1";; esac; done
+  container_running "$name" || die "Container is not running: $name"
+  if session_valid "$name"; then touch_session "$name"; json_session "$name"; return; fi
+  token=$(new_token); write_session "$name" "$token" "$shell"; json_session "$name"
+}
+touch_session() {
+  local name=$1 CONTAINER='' TOKEN='' SHELL_CMD='' UPDATED=''
+  load_session "$name" || die "Exec session not found: $name"
+  write_session "$CONTAINER" "$TOKEN" "$SHELL_CMD"
+}
+cmd_attach() {
+  local token=${1:?token required} file CONTAINER='' TOKEN='' SHELL_CMD='' UPDATED=''
+  init_state; file=$(find_session_by_token "$token") || { echo 'Invalid or expired exec token' >&2; exit 1; }
+  source "$file"
+  [[ ${UPDATED:-0} =~ ^[0-9]+$ && $((UPDATED + TTL)) -ge $(now) ]] || { echo 'Exec token expired' >&2; exit 1; }
+  container_running "$CONTAINER" || { echo 'Container is not running' >&2; exit 1; }
+  write_session "$CONTAINER" "$TOKEN" "$SHELL_CMD"
+  exec "$DOCKER_BIN" exec -it "$CONTAINER" "$SHELL_CMD"
+}
+cmd_stop() { local name=${1:?container required}; valid_container "$name"; rm -f -- "$(session_file "$name")"; }
+cmd_gc() {
+  local file CONTAINER TOKEN SHELL_CMD UPDATED changed=false
+  init_state; shopt -s nullglob
+  for file in "$STATE_DIR"/*.env; do
+    CONTAINER='' TOKEN='' SHELL_CMD='' UPDATED=''; source "$file" || { rm -f -- "$file"; changed=true; continue; }
+    if [[ ! ${UPDATED:-0} =~ ^[0-9]+$ ]] || (( UPDATED + TTL < $(now) )) || ! container_running "$CONTAINER"; then rm -f -- "$file"; changed=true; fi
+  done
+  shopt -u nullglob; $changed || true
+}
+
+case "${1:-help}" in
+  start) shift; cmd_start "$@";;
+  info) shift; name=${1:?container required}; session_valid "$name" || die "Exec session not running: $name"; json_session "$name";;
+  touch) shift; name=${1:?container required}; touch_session "$name"; json_session "$name";;
+  stop) shift; cmd_stop "$@";;
+  attach) shift; cmd_attach "$@";;
+  gc) shift; cmd_gc "$@";;
+  help|-h|--help) usage;;
+  *) usage >&2; die "Unknown command: ${1:-}";;
+esac

@@ -1,0 +1,15 @@
+{
+  "name": "tinyvisor-documentation",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Standalone Eleventy documentation site for TinyVisor",
+  "scripts": {
+    "build": "eleventy",
+    "start": "eleventy --serve",
+    "check": "eleventy"
+  },
+  "devDependencies": {
+    "@11ty/eleventy": "^3.1.6"
+  }
+}

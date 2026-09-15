@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+COMPOSE_ROOT=${VMAPI_COMPOSE_ROOT:-/var/lib/vmapi/compose}
+
+usage() {
+cat <<'TXT'
+dockercompoectl - stored Docker Compose project manager
+
+Commands:
+  list
+  show PROJECT
+  upload-stdin PROJECT
+  deploy PROJECT
+  down PROJECT
+  delete PROJECT
+TXT
+}
+valid_project() { [[ ${1:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$ ]] || die "Invalid Compose project name: ${1:-}"; }
+project_dir() { valid_project "$1"; printf '%s/%s\n' "$COMPOSE_ROOT" "$1"; }
+compose_file() { printf '%s/compose.yaml\n' "$(project_dir "$1")"; }
+compose() { command -v "$DOCKER_BIN" >/dev/null 2>&1 || die "Docker not found: $DOCKER_BIN"; "$DOCKER_BIN" compose "$@"; }
+project_exists() { [[ -f $(compose_file "$1") ]]; }
+validate_file() { compose -f "$1" config -q; }
+
+cmd_list() {
+  local dir name state file first=true
+  install -d -o vmapi -g vmapi -m 0750 "$COMPOSE_ROOT"
+  printf '['
+  shopt -s nullglob
+  for dir in "$COMPOSE_ROOT"/*; do
+    [[ -f $dir/compose.yaml ]] || continue
+    name=$(basename "$dir")
+    state=$(compose -p "$name" -f "$dir/compose.yaml" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')
+    $first || printf ','; first=false
+    printf '{"name":"%s","running":%s}' "$(json_escape "$name")" "${state:-0}"
+  done
+  shopt -u nullglob
+  printf ']\n'
+}
+cmd_show() { local name=${1:?project required}; project_exists "$name" || die 'Compose project not found'; cat "$(compose_file "$name")"; }
+cmd_upload_stdin() {
+  local name=${1:?project required} dir file tmp
+  dir=$(project_dir "$name"); install -d -o vmapi -g vmapi -m 0750 "$COMPOSE_ROOT" "$dir"
+  file=$(compose_file "$name"); tmp="$file.$$"
+  cat > "$tmp"
+  [[ -s $tmp ]] || die 'Compose file is empty'
+  validate_file "$tmp" || { rm -f -- "$tmp"; die 'Compose validation failed'; }
+  chmod 0640 "$tmp"; chown vmapi:vmapi "$tmp" 2>/dev/null || true; mv -f "$tmp" "$file"
+  printf '{"name":"%s","stored":true}\n' "$(json_escape "$name")"
+}
+cmd_deploy() {
+  local name=${1:?project required} file out
+  project_exists "$name" || die 'Compose project not found'
+  file=$(compose_file "$name"); validate_file "$file" || die 'Compose validation failed'
+  if ! out=$(compose -p "$name" -f "$file" up -d --remove-orphans 2>&1); then printf '%s\n' "$out" >&2; return 1; fi
+  printf '{"name":"%s","deployed":true}\n' "$(json_escape "$name")"
+}
+cmd_down() {
+  local name=${1:?project required} out
+  project_exists "$name" || die 'Compose project not found'
+  if ! out=$(compose -p "$name" -f "$(compose_file "$name")" down 2>&1); then printf '%s\n' "$out" >&2; return 1; fi
+  printf '{"name":"%s","stopped":true}\n' "$(json_escape "$name")"
+}
+cmd_delete() { local name=${1:?project required}; cmd_down "$name" >/dev/null 2>&1 || true; rm -rf -- "$(project_dir "$name")"; }
+
+case "${1:-help}" in
+  list) cmd_list;; show) shift; cmd_show "$@";; upload-stdin) shift; cmd_upload_stdin "$@";; deploy) shift; cmd_deploy "$@";; down) shift; cmd_down "$@";; delete) shift; cmd_delete "$@";; help|-h|--help) usage;; *) usage >&2; die "Unknown command: ${1:-}";;
+esac

@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+SAMPLE_INTERVAL=${METRICS_SAMPLE_INTERVAL:-0.20}
+
+usage() {
+cat <<'TXT'
+metricsctl - lightweight host, VM and Docker resource metrics
+
+Commands:
+  host
+  vm NAME
+  container NAME
+
+All commands emit one JSON object suitable for direct CGI responses.
+TXT
+}
+
+num_pct() {
+  awk -v n="${1:-0}" -v d="${2:-0}" 'BEGIN { if ((d+0) > 0) printf "%.2f", ((n+0) * 100) / (d+0); else printf "0.00" }'
+}
+
+num_div() {
+  awk -v n="${1:-0}" -v d="${2:-1}" 'BEGIN { if ((d+0) != 0) printf "%.4f", (n+0)/(d+0); else printf "0" }'
+}
+
+host_cpu_snapshot() {
+  awk '/^cpu / { total=0; for(i=2;i<=NF;i++) total+=$i; idle=$5+$6; printf "%.0f %.0f\n", total, idle; exit }' /proc/stat
+}
+
+host_cpu_total() {
+  awk '/^cpu / { total=0; for(i=2;i<=NF;i++) total+=$i; printf "%.0f\n", total; exit }' /proc/stat
+}
+
+host_cpu_percent() {
+  local t1 i1 t2 i2 dt di
+  read -r t1 i1 < <(host_cpu_snapshot)
+  sleep "$SAMPLE_INTERVAL"
+  read -r t2 i2 < <(host_cpu_snapshot)
+  dt=$((t2-t1)); di=$((i2-i1))
+  awk -v t="$dt" -v i="$di" 'BEGIN { if (t>0) printf "%.2f", ((t-i)*100)/t; else printf "0.00" }'
+}
+
+host_cpu_count() {
+  local n
+  n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  [[ $n =~ ^[0-9]+$ && $n -gt 0 ]] || n=$(grep -c '^processor[[:space:]]*:' /proc/cpuinfo 2>/dev/null || true)
+  [[ $n =~ ^[0-9]+$ && $n -gt 0 ]] || n=1
+  printf '%s\n' "$n"
+}
+
+memory_values() {
+  awk '
+    /^MemTotal:/ {t=$2*1024}
+    /^MemAvailable:/ {a=$2*1024}
+    END { if(a=="") a=0; u=t-a; if(u<0)u=0; printf "%.0f %.0f %.0f\n", t,u,a }
+  ' /proc/meminfo
+}
+
+metric_fs_path() {
+  if [[ -e "$VM_ROOT" ]]; then printf '%s\n' "$VM_ROOT"
+  elif [[ -e "$(dirname "$VM_ROOT")" ]]; then dirname "$VM_ROOT"
+  else printf '/\n'; fi
+}
+
+filesystem_values() {
+  local p=${1:-/} kb used avail
+  read -r kb used avail < <(df -Pk "$p" | awk 'NR>1 {t=$2;u=$3;a=$4} END{print t,u,a}')
+  printf '%s %s %s\n' "$((kb*1024))" "$((used*1024))" "$((avail*1024))"
+}
+
+network_totals() {
+  awk 'NR>2 {gsub(":"," "); if($1!="lo"){rx+=$2; tx+=$10}} END{printf "%.0f %.0f\n",rx,tx}' /proc/net/dev
+}
+
+uptime_seconds() { awk '{printf "%.0f\n", $1}' /proc/uptime; }
+
+cmd_host() {
+  local cpu cpus mt mu ma dt du da rx tx up load1 load5 load15 disk_path kvm_available=false
+  cpu=$(host_cpu_percent); cpus=$(host_cpu_count)
+  read -r mt mu ma < <(memory_values)
+  disk_path=$(metric_fs_path); read -r dt du da < <(filesystem_values "$disk_path")
+  read -r rx tx < <(network_totals)
+  up=$(uptime_seconds); read -r load1 load5 load15 _ < /proc/loadavg
+  [[ -r "$KVM_DEVICE" && -w "$KVM_DEVICE" ]] && kvm_available=true
+  printf '{'
+  printf '"scope":"host","timestamp":%s,' "$(date +%s)"
+  printf '"cpu":{"utilization_percent":%s,"logical_cpus":%s,"load1":%s,"load5":%s,"load15":%s},' "$cpu" "$cpus" "$load1" "$load5" "$load15"
+  printf '"virtualization":{"kvm_available":%s,"note":"%s"},' "$kvm_available" "$(json_escape "$([[ $kvm_available == true ]] && printf 'KVM acceleration available' || printf 'KVM unavailable: VM starts require explicit software emulation and will be slow')")"
+  printf '"memory":{"used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s},' "$mu" "$mt" "$ma" "$(num_pct "$mu" "$mt")"
+  printf '"disk":{"path":"%s","used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s},' "$(json_escape "$disk_path")" "$du" "$dt" "$da" "$(num_pct "$du" "$dt")"
+  printf '"network":{"rx_bytes":%s,"tx_bytes":%s},' "$rx" "$tx"
+  printf '"uptime_seconds":%s' "$up"
+  printf '}\n'
+}
+
+proc_cpu_ticks() {
+  local pid=$1
+  awk '{print $14+$15}' "/proc/$pid/stat" 2>/dev/null
+}
+
+proc_rss_bytes() {
+  local pid=$1
+  awk '/^VmRSS:/ {printf "%.0f\n",$2*1024; found=1; exit} END{if(!found)print 0}' "/proc/$pid/status" 2>/dev/null || printf '0\n'
+}
+
+qemu_image_info() {
+  local file=$1 out virtual actual
+  if out=$("$QEMU_IMG" info -U --output=json "$file" 2>/dev/null); then :
+  elif out=$("$QEMU_IMG" info --output=json "$file" 2>/dev/null); then :
+  else out=''; fi
+  virtual=$(printf '%s\n' "$out" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+  actual=$(printf '%s\n' "$out" | sed -n 's/.*"actual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+  if [[ ! $virtual =~ ^[0-9]+$ ]]; then virtual=$(stat -c %s "$file" 2>/dev/null || echo 0); fi
+  if [[ ! $actual =~ ^[0-9]+$ ]]; then actual=$(( $(du -k "$file" 2>/dev/null | awk '{print $1+0}') * 1024 )); fi
+  printf '%s %s\n' "$virtual" "$actual"
+}
+
+bridge_interface_for_mac() {
+  local br=$1 mac=${2,,}
+  command -v bridge >/dev/null 2>&1 || return 1
+  bridge fdb show br "$br" 2>/dev/null | awk -v m="$mac" 'tolower($1)==m {for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+vm_network_json() {
+  local conf=$1 idx mode br mac iface rx=0 tx=0 found=false first=true val
+  printf '{"available":'
+  while read -r idx; do
+    mode=$(cfg_get_file "$conf" "NIC_${idx}_MODE" '')
+    [[ $mode == bridge ]] || continue
+    br=$(cfg_get_file "$conf" "NIC_${idx}_BRIDGE" '')
+    mac=$(cfg_get_file "$conf" "NIC_${idx}_MAC" '')
+    iface=$(bridge_interface_for_mac "$br" "$mac" || true)
+    [[ -n $iface && -r "/sys/class/net/$iface/statistics/rx_bytes" ]] || continue
+    found=true
+    val=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo 0); rx=$((rx+val))
+    val=$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0); tx=$((tx+val))
+  done < <(indexes_for "$conf" NIC)
+  if $found; then
+    printf 'true,"rx_bytes":%s,"tx_bytes":%s,"note":"bridged TAP counters discovered through the Linux bridge FDB"}' "$rx" "$tx"
+  else
+    printf 'false,"rx_bytes":0,"tx_bytes":0,"note":"per-VM network counters are available only when a bridged NIC can be mapped to its host TAP interface"}'
+  fi
+}
+
+cmd_vm() {
+  local name=${1:?VM name required} conf state pid vcpus mem_mb mem_alloc rss=0 cpu_raw=0 cpu_alloc=0
+  require_vm "$name"; conf=$(vm_conf "$name"); state=$(vm_state "$name")
+  vcpus=$(cfg_get_file "$conf" VCPUS 1); mem_mb=$(cfg_get_file "$conf" MEMORY_MB 0); mem_alloc=$((mem_mb*1024*1024))
+  if [[ $state == running ]]; then
+    pid=$(vm_pid "$name")
+    local p1 p2 h1 h2 cpus pd hd
+    p1=$(proc_cpu_ticks "$pid" || echo 0); h1=$(host_cpu_total); cpus=$(host_cpu_count)
+    sleep "$SAMPLE_INTERVAL"
+    p2=$(proc_cpu_ticks "$pid" || echo "$p1"); h2=$(host_cpu_total)
+    pd=$((p2-p1)); hd=$((h2-h1))
+    cpu_raw=$(awk -v p="$pd" -v h="$hd" -v c="$cpus" 'BEGIN{if(h>0)printf "%.2f",(p*c*100)/h;else printf "0.00"}')
+    cpu_alloc=$(awk -v p="$cpu_raw" -v v="$vcpus" 'BEGIN{if(v>0)printf "%.2f",p/v;else printf "0.00"}')
+    rss=$(proc_rss_bytes "$pid")
+  else pid=''; fi
+
+  local disk_first=true total_virtual=0 total_actual=0 idx file format bus virtual actual dir
+  dir=$(vm_dir "$name")
+  local disk_json='['
+  while read -r idx; do
+    file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
+    [[ -n $file && -f "$dir/$file" ]] || continue
+    format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" '')
+    bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" '')
+    read -r virtual actual < <(qemu_image_info "$dir/$file")
+    total_virtual=$((total_virtual+virtual)); total_actual=$((total_actual+actual))
+    $disk_first || disk_json+=','; disk_first=false
+    disk_json+="{\"index\":$idx,\"file\":\"$(json_escape "$file")\",\"format\":\"$(json_escape "$format")\",\"bus\":\"$(json_escape "$bus")\",\"virtual_bytes\":$virtual,\"host_allocated_bytes\":$actual,\"utilization_percent\":$(num_pct "$actual" "$virtual")}" 
+  done < <(indexes_for "$conf" DISK)
+  disk_json+=']'
+
+  printf '{'
+  printf '"scope":"vm","name":"%s","state":"%s","timestamp":%s,' "$(json_escape "$name")" "$state" "$(date +%s)"
+  if [[ -n $pid ]]; then printf '"pid":%s,' "$pid"; else printf '"pid":null,'; fi
+  printf '"cpu":{"allocated_vcpus":%s,"process_percent_one_core":%s,"utilization_percent":%s},' "$vcpus" "$cpu_raw" "$cpu_alloc"
+  printf '"memory":{"host_rss_bytes":%s,"allocated_bytes":%s,"utilization_percent":%s,"note":"host RSS of the QEMU process, not guest OS free/used memory"},' "$rss" "$mem_alloc" "$(num_pct "$rss" "$mem_alloc")"
+  printf '"disk":{"host_allocated_bytes":%s,"virtual_bytes":%s,"utilization_percent":%s,"note":"host image allocation versus virtual disk capacity; not guest filesystem fullness","disks":%s},' "$total_actual" "$total_virtual" "$(num_pct "$total_actual" "$total_virtual")" "$disk_json"
+  printf '"network":'; vm_network_json "$conf"
+  printf '}\n'
+}
+
+human_to_bytes() {
+  local s=${1//[[:space:]]/} n unit mul
+  [[ -n $s ]] || { printf '0\n'; return; }
+  if [[ $s =~ ^([0-9]+([.][0-9]+)?)([A-Za-z]+)?$ ]]; then
+    n=${BASH_REMATCH[1]}; unit=${BASH_REMATCH[3]:-B}
+  else printf '0\n'; return; fi
+  case "$unit" in
+    B|b) mul=1;;
+    kB|KB|kb) mul=1000;; MB|mb) mul=1000000;; GB|gb) mul=1000000000;; TB|tb) mul=1000000000000;;
+    KiB|KIB|kib) mul=1024;; MiB|MIB|mib) mul=1048576;; GiB|GIB|gib) mul=1073741824;; TiB|TIB|tib) mul=1099511627776;;
+    *) mul=1;;
+  esac
+  awk -v n="$n" -v m="$mul" 'BEGIN{printf "%.0f\n",n*m}'
+}
+
+strip_percent() { local v=${1%%%}; [[ $v =~ ^[0-9]+([.][0-9]+)?$ ]] && printf '%s\n' "$v" || printf '0\n'; }
+
+cmd_container() {
+  local name=${1:?container name required}
+  need_cmd "$DOCKER_BIN"
+  [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "Invalid container name: $name"
+  "$DOCKER_BIN" container inspect "$name" >/dev/null 2>&1 || die "Container does not exist: $name"
+
+  local inspect state nano mem_cfg quota period hostcpus alloc_cpus
+  inspect=$("$DOCKER_BIN" container inspect --format '{{.State.Status}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{.HostConfig.CpuQuota}}|{{.HostConfig.CpuPeriod}}' "$name")
+  IFS='|' read -r state nano mem_cfg quota period <<< "$inspect"
+  hostcpus=$(host_cpu_count)
+  if [[ ${nano:-0} =~ ^[0-9]+$ && $nano -gt 0 ]]; then alloc_cpus=$(num_div "$nano" 1000000000)
+  elif [[ ${quota:-0} =~ ^-?[0-9]+$ && ${period:-0} =~ ^[0-9]+$ && $quota -gt 0 && $period -gt 0 ]]; then alloc_cpus=$(num_div "$quota" "$period")
+  else alloc_cpus=$hostcpus; fi
+
+  local stats cpu_s mem_s memperc_s net_s block_s pids
+  stats=$("$DOCKER_BIN" stats --no-stream --all --format '{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}' "$name" 2>/dev/null || true)
+  IFS='|' read -r cpu_s mem_s memperc_s net_s block_s pids <<< "$stats"
+  local cpu_raw cpu_alloc mem_used mem_limit mem_pct nrx ntx bread bwrite
+  cpu_raw=$(strip_percent "${cpu_s:-0%}")
+  cpu_alloc=$(awk -v p="$cpu_raw" -v c="$alloc_cpus" 'BEGIN{if(c>0)printf "%.2f",p/c;else printf "0.00"}')
+  IFS='/' read -r a b <<< "${mem_s:-0B / 0B}"; mem_used=$(human_to_bytes "$a"); mem_limit=$(human_to_bytes "$b")
+  mem_pct=$(strip_percent "${memperc_s:-0%}")
+  IFS='/' read -r a b <<< "${net_s:-0B / 0B}"; nrx=$(human_to_bytes "$a"); ntx=$(human_to_bytes "$b")
+  IFS='/' read -r a b <<< "${block_s:-0B / 0B}"; bread=$(human_to_bytes "$a"); bwrite=$(human_to_bytes "$b")
+  [[ ${pids:-0} =~ ^[0-9]+$ ]] || pids=0
+
+  local size_info size_rw size_root
+  size_info=$("$DOCKER_BIN" container inspect --size --format '{{.SizeRw}}|{{.SizeRootFs}}' "$name" 2>/dev/null || echo '0|0')
+  IFS='|' read -r size_rw size_root <<< "$size_info"
+  [[ ${size_rw:-0} =~ ^[0-9]+$ ]] || size_rw=0; [[ ${size_root:-0} =~ ^[0-9]+$ ]] || size_root=0
+  [[ ${mem_cfg:-0} =~ ^[0-9]+$ ]] || mem_cfg=0
+
+  printf '{'
+  printf '"scope":"container","name":"%s","state":"%s","timestamp":%s,' "$(json_escape "$name")" "$(json_escape "$state")" "$(date +%s)"
+  printf '"cpu":{"docker_percent":%s,"allocated_cpus":%s,"utilization_percent":%s},' "$cpu_raw" "$alloc_cpus" "$cpu_alloc"
+  printf '"memory":{"used_bytes":%s,"effective_limit_bytes":%s,"configured_limit_bytes":%s,"utilization_percent":%s},' "$mem_used" "$mem_limit" "$mem_cfg" "$mem_pct"
+  printf '"disk":{"writable_layer_bytes":%s,"rootfs_bytes":%s,"utilization_percent":null,"note":"Docker writable-layer/rootfs size; containers do not have a fixed virtual disk capacity"},' "$size_rw" "$size_root"
+  printf '"network":{"rx_bytes":%s,"tx_bytes":%s},' "$nrx" "$ntx"
+  printf '"block_io":{"read_bytes":%s,"write_bytes":%s},"pids":%s' "$bread" "$bwrite" "$pids"
+  printf '}\n'
+}
+
+case "${1:-help}" in
+  host) shift; cmd_host "$@";;
+  vm) shift; cmd_vm "$@";;
+  container) shift; cmd_container "$@";;
+  help|-h|--help) usage;;
+  *) usage >&2; die "Unknown command: ${1:-}";;
+esac

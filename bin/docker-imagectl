@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+need_cmd "$DOCKER_BIN"
+validate_ref() { local v=${1:-}; [[ -n $v && ${#v} -le 512 && $v != *[[:space:]]* ]] || die "Invalid Docker image reference: $v"; validate_no_newline "$v"; }
+case ${1:-} in
+  list) "$DOCKER_BIN" image ls --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}\t{{.CreatedSince}}';;
+  list-json) "$DOCKER_BIN" image ls --format '{{json .}}';;
+  inspect) ref=${2:?image required}; validate_ref "$ref"; "$DOCKER_BIN" image inspect "$ref";;
+  pull) ref=${2:?image required}; validate_ref "$ref"; "$DOCKER_BIN" image pull "$ref";;
+  tag) src=${2:?source required}; dst=${3:?target required}; validate_ref "$src"; validate_ref "$dst"; "$DOCKER_BIN" image tag "$src" "$dst";;
+  remove|delete)
+    ref=${2:?image required}; shift 2; validate_ref "$ref"; args=(image rm); [[ ${1:-} == --force ]] && args+=(--force); args+=("$ref"); "$DOCKER_BIN" "${args[@]}";;
+  *) echo 'Usage: docker-imagectl list | inspect IMAGE | pull IMAGE | tag SOURCE TARGET | remove IMAGE [--force]' >&2; exit 2;;
+esac

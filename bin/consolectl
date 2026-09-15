@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+VMCTL=${VMCTL:-/usr/local/bin/vmctl}
+STATE_DIR=${VMAPI_CONSOLE_STATE_DIR:-/run/vmapi/consoles}
+TOKEN_FILE=${VMAPI_CONSOLE_TOKEN_FILE:-/run/vmapi/console.tokens}
+TTL=${VMAPI_CONSOLE_TTL:-120}
+
+usage() {
+cat <<'TXT'
+consolectl - noVNC/websockify token console sessions
+
+Commands:
+  start VM
+  info VM
+  touch VM
+  stop VM
+  gc
+TXT
+}
+
+validate_console_vm() { validate_vm_name "$1"; }
+session_file() { printf '%s/%s.env\n' "$STATE_DIR" "$1"; }
+now() { date +%s; }
+
+init_state() {
+  install -d -m 0755 /run/vmapi "$STATE_DIR"
+  touch "$TOKEN_FILE"
+  chmod 0640 "$TOKEN_FILE"
+  chown vmapi:vmapi /run/vmapi "$STATE_DIR" "$TOKEN_FILE" 2>/dev/null || true
+}
+
+load_session() {
+  local name=$1 file; file=$(session_file "$name")
+  [[ -r $file ]] || return 1
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
+console_info() {
+  local name=$1 key value
+  declare -gA INFO=()
+  while IFS='=' read -r key value; do INFO[$key]=$value; done < <("$VMCTL" console-info "$name")
+}
+
+new_token() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then tr -d '-' < /proc/sys/kernel/random/uuid
+  else od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
+write_session() {
+  local name=$1 token=$2 vnc_host=$3 vnc_port=$4 updated tmp file
+  updated=$(now); file=$(session_file "$name"); tmp="$file.$$"
+  cat > "$tmp" <<EOF
+NAME=$(printf '%q' "$name")
+TOKEN=$(printf '%q' "$token")
+VNC_HOST=$(printf '%q' "$vnc_host")
+VNC_PORT=$(printf '%q' "$vnc_port")
+UPDATED=$(printf '%q' "$updated")
+EOF
+  chmod 0640 "$tmp"
+  chown vmapi:vmapi "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
+}
+
+touch_session() {
+  local name=$1 file tmp NAME='' TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+  load_session "$name" || die "Console session not found: $name"
+  file=$(session_file "$name"); tmp="$file.$$"; UPDATED=$(now)
+  cat > "$tmp" <<EOF
+NAME=$(printf '%q' "$NAME")
+TOKEN=$(printf '%q' "$TOKEN")
+VNC_HOST=$(printf '%q' "$VNC_HOST")
+VNC_PORT=$(printf '%q' "$VNC_PORT")
+UPDATED=$(printf '%q' "$UPDATED")
+EOF
+  chmod 0640 "$tmp"
+  chown vmapi:vmapi "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
+}
+
+render_tokens() {
+  local tmp file name TOKEN VNC_HOST VNC_PORT UPDATED
+  init_state
+  tmp="$TOKEN_FILE.$$"
+  shopt -s nullglob
+  for file in "$STATE_DIR"/*.env; do
+    name=$(basename "$file" .env); TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+    # shellcheck disable=SC1090
+    source "$file" || continue
+    [[ -n ${TOKEN:-} && -n ${VNC_HOST:-} && ${VNC_PORT:-} =~ ^[0-9]+$ ]] || continue
+    [[ $("$VMCTL" status "$name" 2>/dev/null || true) == running ]] || continue
+    printf '%s: %s:%s\n' "$TOKEN" "$VNC_HOST" "$VNC_PORT"
+  done > "$tmp"
+  shopt -u nullglob
+  chmod 0640 "$tmp"
+  chown vmapi:vmapi "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$TOKEN_FILE"
+}
+
+session_valid() {
+  local name=$1 TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+  load_session "$name" || return 1
+  [[ -n ${TOKEN:-} && -n ${VNC_HOST:-} && ${VNC_PORT:-} =~ ^[0-9]+$ ]] || return 1
+  [[ $("$VMCTL" status "$name" 2>/dev/null || true) == running ]] || return 1
+}
+
+stop_session() {
+  local name=$1
+  validate_console_vm "$name"
+  rm -f -- "$(session_file "$name")"
+  render_tokens
+}
+
+gc_sessions() {
+  local file name TOKEN VNC_HOST VNC_PORT UPDATED cutoff changed=false
+  init_state
+  cutoff=$(( $(now) - TTL ))
+  shopt -s nullglob
+  for file in "$STATE_DIR"/*.env; do
+    name=$(basename "$file" .env); TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+    # shellcheck disable=SC1090
+    source "$file" || { rm -f -- "$file"; changed=true; continue; }
+    if [[ ! ${UPDATED:-0} =~ ^[0-9]+$ ]] || (( UPDATED < cutoff )) || [[ $("$VMCTL" status "$name" 2>/dev/null || true) != running ]]; then
+      rm -f -- "$file"
+      changed=true
+    fi
+  done
+  shopt -u nullglob
+  $changed && render_tokens || true
+}
+
+json_session() {
+  local name=$1 TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+  load_session "$name" || die "Console session not found: $name"
+  printf '{"name":"%s","token":"%s","vnc_host":"%s","vnc_port":%s,"path":"console/ws/","url":"/console.html?vm=%s&path=%s&token=%s","ttl_seconds":%s,"updated":%s}\n' \
+    "$(json_escape "$name")" "$(json_escape "$TOKEN")" "$(json_escape "$VNC_HOST")" "$VNC_PORT" "$(json_escape "$name")" "$(json_escape 'console/ws/')" "$(json_escape "$TOKEN")" "$TTL" "$UPDATED"
+}
+
+cmd_start() {
+  local name=${1:?VM name required} token vnc_host vnc_port
+  validate_console_vm "$name"; require_vm "$name"; init_state; gc_sessions
+  if session_valid "$name"; then touch_session "$name"; render_tokens; json_session "$name"; return; fi
+  [[ $("$VMCTL" status "$name") == running ]] || die "VM is not running: $name"
+  console_info "$name"
+  [[ ${INFO[display]:-} == vnc ]] || die "VM display is not VNC: $name"
+  vnc_host=${INFO[vnc_bind]:-127.0.0.1}; vnc_port=${INFO[vnc_port]:-}
+  [[ $vnc_port =~ ^[0-9]+$ ]] || die "VM has no VNC port: $name"
+  token=$(new_token)
+  write_session "$name" "$token" "$vnc_host" "$vnc_port"
+  render_tokens
+  json_session "$name"
+}
+
+cmd_info() { local name=${1:?VM name required}; validate_console_vm "$name"; session_valid "$name" || die "Console session not running: $name"; json_session "$name"; }
+cmd_touch() { local name=${1:?VM name required}; validate_console_vm "$name"; touch_session "$name"; render_tokens; json_session "$name"; }
+
+case "${1:-help}" in
+  start) shift; cmd_start "$@";;
+  info) shift; cmd_info "$@";;
+  touch) shift; cmd_touch "$@";;
+  stop) shift; stop_session "$@";;
+  gc) shift; gc_sessions "$@";;
+  help|-h|--help) usage;;
+  *) usage >&2; die "Unknown command: ${1:-}";;
+esac

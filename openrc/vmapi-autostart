@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# Purpose: OpenRC service definition for a VMAPI runtime component.
+# The web server provides public access; this service owns only the local runtime process.
+name="VMAPI autostart"
+description="Start VMAPI virtual machines marked AUTOSTART=true"
+command=/usr/local/bin/vmapi-autostart
+command_user=vmapi:vmapi
+start_stop_daemon_args="--group kvm"
+depend() {
+  need localmount
+  after net docker
+}
+stop() {
+  ebegin "Stopping VMAPI virtual machines"
+  start-stop-daemon --start --exec /usr/local/bin/vmapi-stopall --user vmapi --group vmapi --wait 30000
+  eend $?
+}

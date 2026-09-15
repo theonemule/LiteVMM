@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Purpose: VMAPI privileged command-line component.
+# Called by the CGI API or service units; environment variables may override paths for tests.
+# Validate externally supplied values before passing them to host virtualization or container tools.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+FILE_ROOT=${VMAPI_FILE_ROOT:-/}
+
+usage() { printf '%s\n' 'filectl list PATH | upload PATH | download PATH | mkdir PATH | move SOURCE DESTINATION | delete PATH... | archive PATH...'; }
+valid_virtual() { [[ ${1:-} == /* && ${1:-} != *$'\n'* && ${1:-} != *$'\r'* ]] || die 'Path must be an absolute path without control characters'; }
+root_path() { readlink -f -- "$FILE_ROOT" || die "File browser root does not exist: $FILE_ROOT"; }
+inside_root() { local root=$1 candidate=$2; [[ $root == / || $candidate == "$root" || $candidate == "$root/"* ]] || die 'Path escapes the file browser root'; }
+existing_path() { local virtual=$1 root candidate; valid_virtual "$virtual"; root=$(root_path); candidate=$(readlink -f -- "$root/${virtual#/}") || die "Path not found: $virtual"; inside_root "$root" "$candidate"; printf '%s\n' "$candidate"; }
+target_path() {
+  local virtual=$1 root parent base resolved_parent
+  valid_virtual "$virtual"; [[ $virtual != / ]] || die 'The file browser root cannot be modified'
+  root=$(root_path); parent=${virtual%/*}; [[ -n $parent ]] || parent=/; base=${virtual##*/}
+  [[ -n $base && $base != . && $base != .. ]] || die 'Invalid file name'
+  resolved_parent=$(existing_path "$parent"); [[ -d $resolved_parent ]] || die 'Destination parent is not a directory'
+  inside_root "$root" "$resolved_parent/$base"; printf '%s/%s\n' "${resolved_parent%/}" "$base"
+}
+virtual_path() { local root=$1 actual=$2 rel; if [[ $root == / ]]; then printf '%s\n' "$actual"; elif [[ $actual == "$root" ]]; then printf '/\n'; else rel=${actual#"$root"}; printf '%s\n' "$rel"; fi; }
+
+cmd_list() {
+  local virtual=${1:-/} root dir scan item name type size modified mode first=true vpath
+  root=$(root_path); dir=$(existing_path "$virtual"); [[ -d $dir ]] || die 'Path is not a directory'
+  printf '{"path":"%s","root":"%s","entries":[' "$(json_escape "$(virtual_path "$root" "$dir")")" "$(json_escape "$FILE_ROOT")"
+  shopt -s nullglob dotglob; scan=${dir%/}
+  for item in "$scan"/*; do
+    [[ -e $item || -L $item ]] || continue; name=${item##*/}; [[ $name != . && $name != .. ]] || continue
+    if [[ -L $item ]]; then type=link; size=0; elif [[ -d $item ]]; then type=directory; size=0; else type=file; size=$(stat -c %s -- "$item" 2>/dev/null || printf 0); fi
+    modified=$(stat -c %Y -- "$item" 2>/dev/null || printf 0); mode=$(stat -c %A -- "$item" 2>/dev/null || printf unknown); vpath=$(virtual_path "$root" "$item")
+    $first || printf ','; first=false
+    printf '{"name":"%s","path":"%s","type":"%s","bytes":%s,"modified":%s,"mode":"%s"}' "$(json_escape "$name")" "$(json_escape "$vpath")" "$type" "$size" "$modified" "$(json_escape "$mode")"
+  done
+  shopt -u nullglob dotglob
+  printf ']}\n'
+}
+
+cmd_upload() { local target; target=$(target_path "${1:?path required}"); [[ ! -d $target ]] || die 'Cannot replace a directory'; tmp="${target}.vmapi-upload.$$"; trap 'rm -f -- "$tmp"' RETURN; cat > "$tmp"; chmod 0640 "$tmp"; mv -f -- "$tmp" "$target"; trap - RETURN; printf '{"uploaded":true,"path":"%s","bytes":%s}\n' "$(json_escape "$1")" "$(stat -c %s -- "$target")"; }
+cmd_download() { local source; source=$(existing_path "${1:?path required}"); [[ -f $source && ! -L $source ]] || die 'Path is not a regular file'; cat -- "$source"; }
+cmd_mkdir() { local target; target=$(target_path "${1:?path required}"); [[ ! -e $target ]] || die 'Path already exists'; mkdir -- "$target"; chmod 0750 "$target"; printf '{"created":true,"path":"%s"}\n' "$(json_escape "$1")"; }
+cmd_move() { local source destination; [[ ${1:-} != / ]] || die 'The file browser root cannot be moved'; source=$(existing_path "${1:?source required}"); destination=$(target_path "${2:?destination required}"); [[ ! -e $destination ]] || die 'Destination already exists'; mv -- "$source" "$destination"; printf '{"moved":true,"source":"%s","destination":"%s"}\n' "$(json_escape "$1")" "$(json_escape "$2")"; }
+cmd_delete() { local virtual target count=0; (($#)) || die 'At least one path is required'; for virtual in "$@"; do [[ $virtual != / ]] || die 'The file browser root cannot be deleted'; target=$(existing_path "$virtual"); rm -rf -- "$target"; count=$((count+1)); done; printf '{"deleted":true,"count":%s}\n' "$count"; }
+cmd_archive() {
+  (($#)) || die 'At least one path is required'; command -v zip >/dev/null 2>&1 || die 'zip is required for multi-file downloads'
+  local root virtual actual rel; root=$(root_path); rels=()
+  for virtual in "$@"; do [[ $virtual != / ]] || die 'The file browser root cannot be archived'; actual=$(existing_path "$virtual"); rel=${actual#"$root/"}; [[ $root != / ]] || rel=${actual#/}; rels+=("$rel"); done
+  (cd "$root" && zip -q -r - -- "${rels[@]}")
+}
+
+case "${1:-help}" in
+  list) shift; cmd_list "$@";; upload) shift; cmd_upload "$@";; download) shift; cmd_download "$@";; mkdir) shift; cmd_mkdir "$@";; move) shift; cmd_move "$@";; delete) shift; cmd_delete "$@";; archive) shift; cmd_archive "$@";; help|-h|--help) usage;; *) usage >&2; die "Unknown command: ${1:-}";;
+esac
