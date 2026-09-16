@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Manage a loopback-only CNCF Distribution registry behind LiteVMM's HTTPS endpoint.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+ROOT=${VMAPI_REGISTRY_ROOT:-/var/lib/vmapi/registry}
+CONF=${VMAPI_REGISTRY_CONFIG:-/etc/vmapi/registry.conf}
+PASSWD_FILE=${VMAPI_REGISTRY_PASSWD_FILE:-/etc/vmapi-registry.htpasswd}
+PEER_PASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
+PORT=${VMAPI_REGISTRY_LOOPBACK_PORT:-5000}
+IMAGE=${VMAPI_REGISTRY_IMAGE:-registry:3}
+CONTAINER=${VMAPI_REGISTRY_CONTAINER:-litevmm-registry}
+LIGHTTPD_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
+NGINX_CONF=${VMAPI_NGINX_REGISTRY_CONF:-/etc/nginx/vmapi-registry.conf}
+WEB_MODE=${VMAPI_REGISTRY_WEB_MODE:-auto}
+ALLOW_INSECURE_PEER=${VMAPI_REGISTRY_ALLOW_INSECURE_PEER:-false}
+
+valid_user(){ [[ ${1:-} =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid registry username'; }
+valid_ref(){ local v=${1:-}; [[ -n $v && ${#v} -le 512 && $v != *[[:space:]]* && $v != /* && $v != *://* ]] || die "Invalid registry image reference: $v"; validate_no_newline "$v"; }
+valid_peer_id(){ [[ ${1:-} =~ ^[a-fA-F0-9]{32}$ ]] || die 'Invalid peer node id'; }
+json_string(){ local json=$1 key=$2; printf '%s' "$json" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -n1; }
+web_mode(){ [[ $WEB_MODE != auto ]] && { printf '%s\n' "$WEB_MODE"; return; }; if command -v lighttpd >/dev/null 2>&1 && [[ -d $LIGHTTPD_ROOT ]]; then echo lighttpd; elif command -v nginx >/dev/null 2>&1; then echo nginx; else echo none; fi; }
+load(){ ENABLED=false USERNAME='' PASSWORD=''; if [[ -r $CONF ]]; then source "$CONF"; fi; }
+write_conf(){ local tmp; tmp=$(mktemp "${CONF}.XXXXXX"); printf 'ENABLED=%q\nUSERNAME=%q\nPASSWORD=%q\n' "$ENABLED" "$USERNAME" "$PASSWORD" > "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$CONF"; }
+container_running(){ "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -Fxq true; }
+render_web(){
+  local mode; mode=$(web_mode); [[ $mode != none ]] || return 0
+  load
+  case $mode in
+    lighttpd)
+      install -d -m 0755 "$LIGHTTPD_ROOT/conf.d"; local f="$LIGHTTPD_ROOT/conf.d/zz-vmapi-registry.conf"; : > "$f"
+      if [[ $ENABLED == true ]]; then cat > "$f" <<CFG
+\$HTTP["url"] =~ "^/v2(?:/|\$)" {
+  auth.backend = "htpasswd"
+  auth.backend.htpasswd.userfile = "$PASSWD_FILE"
+  auth.require = ( "" => ( "method" => "basic", "realm" => "LiteVMM registry", "require" => "valid-user" ) )
+  proxy.server = ( "" => (( "host" => "127.0.0.1", "port" => $PORT )) )
+  proxy.header = ( "host" => "enable" )
+}
+CFG
+      fi
+      [[ ${VMAPI_REGISTRY_SKIP_RELOAD:-false} == true ]] || { lighttpd -tt -f "$LIGHTTPD_ROOT/lighttpd.conf" >/dev/null; if command -v rc-service >/dev/null 2>&1; then rc-service lighttpd restart >/dev/null; elif [[ -r /run/lighttpd.pid ]]; then kill -USR1 "$(cat /run/lighttpd.pid)"; fi; };;
+    nginx)
+      : > "$NGINX_CONF"
+      if [[ $ENABLED == true ]]; then cat > "$NGINX_CONF" <<CFG
+location /v2/ {
+    auth_basic "LiteVMM registry";
+    auth_basic_user_file $PASSWD_FILE;
+    proxy_pass http://127.0.0.1:$PORT;
+    proxy_set_header Host \$http_host;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_request_buffering off;
+    proxy_buffering off;
+}
+CFG
+      fi
+      [[ ${VMAPI_REGISTRY_SKIP_RELOAD:-false} == true ]] || { nginx -t >/dev/null; systemctl reload nginx; };;
+  esac
+}
+enable(){
+  need_cmd "$DOCKER_BIN"; need_cmd openssl; local user=${1:-registry}; valid_user "$user"; install -d -m 0750 "$ROOT" "$(dirname "$CONF")"
+  load; USERNAME=$user; [[ -n $PASSWORD ]] || PASSWORD=$(openssl rand -hex 24); ENABLED=true
+  local hash; hash=$(printf '%s\n' "$PASSWORD" | openssl passwd -apr1 -stdin); printf '%s:%s\n' "$USERNAME" "$hash" > "$PASSWD_FILE"; chmod 0640 "$PASSWD_FILE"; [[ ! -e $PEER_PASSWD ]] || chown --reference="$PEER_PASSWD" "$PASSWD_FILE" 2>/dev/null || true
+  "$DOCKER_BIN" image inspect "$IMAGE" >/dev/null 2>&1 || "$DOCKER_BIN" pull "$IMAGE" >/dev/null
+  if "$DOCKER_BIN" container inspect "$CONTAINER" >/dev/null 2>&1; then "$DOCKER_BIN" rm -f "$CONTAINER" >/dev/null; fi
+  "$DOCKER_BIN" run -d --restart unless-stopped --name "$CONTAINER" -p "127.0.0.1:$PORT:5000" -v "$ROOT:/var/lib/registry" "$IMAGE" >/dev/null
+  write_conf; render_web; status
+}
+disable(){ load; ENABLED=false; write_conf; "$DOCKER_BIN" rm -f "$CONTAINER" >/dev/null 2>&1 || true; render_web; status; }
+status(){ load; local running=false; container_running && running=true; printf '{"enabled":%s,"running":%s,"username":"%s","image":"%s","loopback_port":%s,"path":"/v2/"}\n' "$ENABLED" "$running" "$(json_escape "$USERNAME")" "$(json_escape "$IMAGE")" "$PORT"; }
+credentials(){ load; [[ $ENABLED == true && -n $USERNAME && -n $PASSWORD ]] || die 'Registry is not enabled'; printf '{"username":"%s","password":"%s","path":"/v2/"}\n' "$(json_escape "$USERNAME")" "$(json_escape "$PASSWORD")"; }
+push(){ load; [[ $ENABLED == true ]] || die 'Registry is not enabled'; container_running || die 'Registry container is not running'; local src=${1:?source image required} dst=${2:?repository/tag required}; valid_ref "$src"; valid_ref "$dst"; local localref="127.0.0.1:$PORT/$dst"; "$DOCKER_BIN" image tag "$src" "$localref"; "$DOCKER_BIN" image push "$localref"; printf '{"published":true,"source":"%s","repository":"%s"}\n' "$(json_escape "$src")" "$(json_escape "$dst")"; }
+catalog(){ load; [[ $ENABLED == true ]] || die 'Registry is not enabled'; curl --fail --silent "http://127.0.0.1:$PORT/v2/_catalog"; printf '\n'; }
+peer_registry_profile(){
+  local peer=${1:?}; valid_peer_id "$peer"; local profile endpoint origin creds user pass host
+  profile=$("$PEERCTL" overlay-profile "$peer"); endpoint=$(json_string "$profile" endpoint); [[ -n $endpoint ]] || die 'Peer has no endpoint'
+  case "$endpoint" in
+    wss://*) origin="https://${endpoint#wss://}";;
+    ws://*) origin="http://${endpoint#ws://}";;
+    *) die 'Peer registry endpoint scheme is unsupported';;
+  esac
+  origin=${origin%/overlay}; origin=${origin%/}
+  if [[ $origin == http://* && $ALLOW_INSECURE_PEER != true ]]; then die 'Peer registry requires HTTPS; configure TLS on the peer or explicitly allow an insecure registry'; fi
+  creds=$("$PEERCTL" proxy "$peer" GET /docker/registry/credentials); user=$(json_string "$creds" username); pass=$(json_string "$creds" password)
+  [[ -n $user && -n $pass ]] || die 'Peer registry is disabled or did not return credentials'
+  host=${origin#http://}; host=${host#https://}
+  printf '%s\t%s\t%s\t%s\n' "$origin" "$host" "$user" "$pass"
+}
+peer_transfer(){
+  local action=$1 peer=$2 src=${3:?} repo=${4-}; valid_peer_id "$peer"; need_cmd "$DOCKER_BIN"; need_cmd "$PEERCTL"; valid_ref "$src"; [[ $action != push ]] || { valid_ref "$repo"; }
+  local origin host user pass cfg ref; IFS=$'\t' read -r origin host user pass < <(peer_registry_profile "$peer")
+  cfg=$(mktemp -d); trap 'rm -rf -- "$cfg"' RETURN
+  printf '%s' "$pass" | DOCKER_CONFIG="$cfg" "$DOCKER_BIN" login "$host" --username "$user" --password-stdin >/dev/null
+  case "$action" in
+    pull)
+      ref="$host/$src"; DOCKER_CONFIG="$cfg" "$DOCKER_BIN" image pull "$ref"; printf '{"pulled":true,"image":"%s","peer":"%s"}\n' "$(json_escape "$ref")" "$peer";;
+    push)
+      ref="$host/$repo"; "$DOCKER_BIN" image tag "$src" "$ref"; DOCKER_CONFIG="$cfg" "$DOCKER_BIN" image push "$ref"; printf '{"published":true,"source":"%s","image":"%s","peer":"%s"}\n' "$(json_escape "$src")" "$(json_escape "$ref")" "$peer";;
+  esac
+  trap - RETURN; rm -rf -- "$cfg"
+}
+case ${1:-status} in
+  enable) shift; enable "$@";; disable) disable;; status) status;; credentials) credentials;; push) shift; push "$@";; catalog) catalog;; render-web) render_web;;
+  peer-pull) shift; peer_transfer pull "$@";; peer-push) shift; peer_transfer push "$@";;
+  *) die 'Usage: registryctl status | enable [USERNAME] | disable | credentials | push SOURCE REPOSITORY[:TAG] | catalog | peer-pull PEER_ID REPOSITORY[:TAG] | peer-push PEER_ID SOURCE REPOSITORY[:TAG] | render-web';;
+esac

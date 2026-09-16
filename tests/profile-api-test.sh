@@ -21,6 +21,8 @@ x=json.loads(sys.argv[1])
 assert x['profile']=='backup'
 assert x['port']==5186
 assert 'backup-receiver' in x['capabilities']
+assert 'replication-receiver' in x['capabilities']
+assert 'replication-source' not in x['capabilities']
 assert 'qemu-kvm' not in x['capabilities']
 assert 'docker' not in x['capabilities']
 PY
@@ -34,8 +36,9 @@ python3 - "$docker" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
 assert x['profile']=='docker'
-assert 'docker' in x['capabilities'] and 'compose' in x['capabilities']
+assert 'docker' in x['capabilities'] and 'compose' in x['capabilities'] and 'registry' in x['capabilities']
 assert 'qemu-kvm' not in x['capabilities'] and 'backup' not in x['capabilities']
+assert 'replication-source' not in x['capabilities'] and 'replication-receiver' not in x['capabilities']
 PY
 
 virt=$(api virtualization /api/ | json_body)
@@ -43,7 +46,7 @@ python3 - "$virt" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
 assert x['profile']=='virtualization'
-for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init'):
+for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init','replication-source','replication-receiver'):
     assert cap in x['capabilities']
 assert 'docker' not in x['capabilities']
 PY
@@ -54,7 +57,7 @@ python3 - "$combo" <<'PY2'
 import json,sys
 x=json.loads(sys.argv[1])
 assert x['profile']=='virtualization-docker'
-for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init','docker','compose','container-terminal'):
+for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init','replication-source','replication-receiver','docker','compose','container-terminal','registry'):
     assert cap in x['capabilities'], cap
 PY2
 

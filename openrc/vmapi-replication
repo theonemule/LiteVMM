@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+name="vmapi-replication"
+description="LiteVMM continuous disk replication controller"
+supervisor="supervise-daemon"
+command="/usr/local/bin/replicationctl"
+command_args="daemon"
+command_background="no"
+respawn_delay="3"
+respawn_max="0"
+output_log="/var/log/vmapi-replication.log"
+error_log="/var/log/vmapi-replication.log"
+
+depend() {
+  need net
+  after lighttpd vmapi-autostart
+}

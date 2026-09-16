@@ -1,4 +1,4 @@
-# LiteVMM 0.7
+# LiteVMM 0.8
 
 LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, combined virtualization + Docker, or backup-receiver profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
 
@@ -46,10 +46,12 @@ The console covers:
 - VNC/serial/QMP console information
 - VM ISO/disk-image upload, listing and deletion
 - Docker container creation, lifecycle, inspection and resource/restart updates
-- Docker image pull/list/remove
+- Docker image pull/list/remove plus streamed build-context image builds
+- optional local OCI registry and direct image push/pull to paired LiteVMM Docker hosts
 - Docker network create/list/inspect/remove plus host bridge/interface visibility
 - named GOST TAP-over-WebSocket Layer-2 overlays for paired peers
-- Docker volume create/list/inspect/remove
+- continuous VM disk replication to paired virtualization or backup-receiver nodes over WSS without requiring an overlay network
+- Docker volume create/list/inspect/remove with Docker-local, host bind, NFS, SMB/CIFS, tmpfs, and custom-driver backends
 - five-second host, VM and container resource monitoring with rolling in-browser graphs
 - a System information view with OS, kernel, CPU/RAM, IP addressing, routes, disks, mounts, service state, and installed component versions
 
@@ -160,6 +162,37 @@ Pair records remain root-only in `/var/lib/vmapi/peers`. `peerctl sync-auth` reb
 
 Manual and scheduled backups run as tracked jobs. The VM backup dialog shows phase progress (validation, configuration, disks, compression, and peer transfer) and retains the final success or error state in `/var/lib/vmapi/backup-jobs`. QMP does not provide a reliable byte-level estimate for every disk mode, so the percentage represents completed phases rather than exact bytes copied. The dialog also queries each paired host and exposes peer-held archives for download; this matters because a successful peer-targeted archive is intentionally absent from the source host.
 
+### Live VM disk replication
+
+Virtualization profiles can continuously mirror the disks of a running VM to an authenticated paired LiteVMM host. The destination may be another virtualization host or a `backup` profile. A backup-only node receives and stores replicas but does not run the VM.
+
+Replication does **not** depend on the Layer-2 overlay feature and does not expose NBD on the LAN. LiteVMM creates a loopback-only `qemu-nbd` receiver for each destination disk, places a loopback GOST WebSocket listener in front of it, and proxies the WebSocket path through the existing LiteVMM HTTP(S) listener. The source creates its own loopback TCP endpoint through GOST and points QEMU's live `drive-mirror` job at that local NBD endpoint. With TLS enabled, the remote byte stream therefore travels over WSS on the same management port as the API.
+
+```text
+source QEMU drive-mirror
+        |
+        v
+loopback NBD endpoint
+        |
+        v
+GOST WSS tunnel  ==================>  existing LiteVMM HTTPS port
+                                             |
+                                             v
+                                      loopback GOST WS
+                                             |
+                                             v
+                                      loopback qemu-nbd
+                                             |
+                                             v
+                                      replica qcow2 disk
+```
+
+The first mirror performs a full disk synchronization. QEMU then leaves the mirror job active in its ready state so later guest writes continue to be copied. LiteVMM persists the replication relationship and runs a reconciliation service that recreates receiver processes, WebSocket tunnels, and mirror jobs after host or VM restarts. Reconnection performs a full reconciliation before returning to continuous mirroring.
+
+Stopping replication cancels the source mirror and closes the WSS/NBD receiver but intentionally retains the last synchronized qcow2 on the destination. The Backups page lists these as **retained replicas** until an administrator explicitly purges them. Disk add/remove/resize/rebind and VM deletion are blocked while persistent replication is configured so the mirror topology cannot silently diverge from the source VM.
+
+This is disk replication, not lock-step VM fault tolerance. LiteVMM does not replicate guest RAM or CPU state, perform distributed fencing, or automatically boot the destination VM after source failure.
+
 ### Cloud-init provisioning
 
 Virtualization profiles install `xorriso` and can attach a cloud-init NoCloud seed to any stopped VM. In the Create VM dialog, enable **Cloud-init provisioning**, optionally set the guest hostname, and paste user-data. LiteVMM accepts normal `#cloud-config` YAML or a cloud-init shell script beginning with a shebang. The guest image must already contain cloud-init with the NoCloud datasource enabled; LiteVMM does not install cloud-init inside the guest.
@@ -199,10 +232,10 @@ The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI val
 
 The LiteVMM API and console are always installed. Choose exactly one workload profile:
 
-- `virtualization` installs QEMU/KVM, VM networking and consoles, cloud-init NoCloud seed support, GOST overlays, and the backup sender/receiver.
-- `docker` installs Docker/Compose management and container terminals without QEMU/KVM or VM backup creation.
-- `virtualization-docker` installs the complete virtualization profile, including cloud-init and VM backups, plus Docker/Compose management.
-- `backup` installs only the paired backup receiver/archive-management surface. It cannot create, restore, migrate, or run VMs and does not install Docker.
+- `virtualization` installs QEMU/KVM, VM networking and consoles, cloud-init NoCloud seed support, GOST overlays, VM backup sender/receiver, and live disk replication source/receiver support.
+- `docker` installs Docker/Compose management, container terminals, storage-backend volume helpers, streamed image builds, and the optional local OCI registry without QEMU/KVM or VM backup creation.
+- `virtualization-docker` installs the complete virtualization profile, including cloud-init, VM backups, and live replication, plus the full Docker feature set.
+- `backup` installs the paired archive receiver plus the live-replication receiver. It can retain replica qcow2 disks but cannot create, restore, migrate, or run VMs and does not install Docker.
 
 On Alpine, Debian, Ubuntu, or a Debian derivative:
 
@@ -221,7 +254,7 @@ Debian uses Nginx on `127.0.0.1:5186` by default, so an SSH tunnel remains usefu
 
 ### Containerized backup receiver
 
-The repository root `Dockerfile` builds the backup-only profile. It persists pairing identity, peer state, and archives under `/var/lib/vmapi` and exposes port `5186` by default:
+The repository root `Dockerfile` builds the backup-only profile. It persists pairing identity, peer state, backup archives, and retained live-replica disks under `/var/lib/vmapi` and exposes port `5186` by default. The image includes `qemu-img`, `qemu-nbd`, and GOST solely for receiving replication streams; it does not include KVM or run guest VMs:
 
 ```bash
 docker build -t litevmm-backup .
@@ -395,7 +428,17 @@ docker-imagectl remove local/alpine:test
 docker-imagectl remove alpine:latest --force
 ```
 
+The Images page can also build an image from an uploaded tar or compressed-tar build context. LiteVMM streams the build context directly into `docker build`; it does not extract client-controlled archive members onto the host filesystem.
+
 Docker's own image store remains authoritative. VM installation media in `/var/lib/vmapi/isos` is unrelated to Docker's image store.
+
+### Local and peer OCI registry
+
+Docker profiles can optionally run a CNCF Distribution `registry:3` container bound only to `127.0.0.1:5000`. LiteVMM exposes the Registry v2 API at `/v2/` through the existing management web server, so the registry does not require a second remotely reachable port. Registry data persists under `/var/lib/vmapi/registry`.
+
+The UI can publish a local image to this registry. A paired Docker-capable LiteVMM host can also pull from or push to the registry directly. Pairing is used to retrieve the registry credential without exposing the peer API credential to the browser; image layers then transfer through the peer's normal HTTPS registry endpoint. Peer registry transfers require HTTPS by default.
+
+This registry is optional. Containers do not need it to share persistent files; use bind/NFS/SMB-backed storage when the requirement is shared data rather than image distribution.
 
 ### Docker network management
 
@@ -419,6 +462,17 @@ docker-volumectl inspect appdata
 docker-volumectl create appdata
 docker-volumectl remove appdata
 ```
+
+The console exposes storage as a backend choice rather than requiring the storage service itself to run in Docker. Supported presets are:
+
+- ordinary Docker-managed `local` volumes
+- a host directory exposed through a bind-backed local volume
+- NFS exports
+- SMB/CIFS shares
+- tmpfs memory-backed volumes
+- arbitrary Docker volume drivers and repeated driver options
+
+For example, a host path or network share can be presented to a container as an ordinary named Docker volume. This is useful when another NAS, file server, or storage appliance owns the data and LiteVMM only needs to make that storage available to containers. SMB credentials entered as local-driver options are visible to Docker administrators through volume inspection, so use a dedicated low-privilege share account.
 
 ## Resource monitoring
 
@@ -665,7 +719,16 @@ GET     /api/docker/images
 GET     /api/docker/images?image=alpine%3Alatest
 POST    /api/docker/images/pull       form: image=...
 POST    /api/docker/images/tag        form: source=...&target=...
+PUT     /api/docker/images/build?tag=...&dockerfile=Dockerfile   raw tar build context
 DELETE  /api/docker/images?image=...&force=true
+
+GET     /api/docker/registry
+POST    /api/docker/registry          form: username=...
+DELETE  /api/docker/registry
+GET     /api/docker/registry/catalog
+POST    /api/docker/registry/push     form: source=...&repository=...
+POST    /api/docker/registry/peer-pull form: peer_id=...&repository=...
+POST    /api/docker/registry/peer-push form: peer_id=...&source=...&repository=...
 ```
 
 ### Docker network endpoints
@@ -688,15 +751,28 @@ GET     /api/docker/volumes/{name}
 DELETE  /api/docker/volumes/{name}
 ```
 
-Volume create fields include `name`, `driver`, indexed `label_N`, and indexed `opt_N` values.
+Volume create fields include `name`, `driver`, indexed `label_N`, and indexed `opt_N` values. The UI presets translate bind, NFS, SMB/CIFS, and tmpfs choices into ordinary `local` driver options.
+
+### Live replication endpoints
+
+```text
+GET     /api/replications
+POST    /api/replications                       form: name=...&peer_id=...&speed=...
+GET     /api/replications/{vm}
+DELETE  /api/replications/{vm}
+GET     /api/replications/replicas              destination inventory
+DELETE  /api/replications/replicas/{id}?delete_file=true
+```
+
+Receiver setup/restart/stop routes are under `/peer-api/replications/receivers/...` and require an authenticated paired-host credential. The data path itself uses a random `/replication/TOKEN` WebSocket route whose generated htpasswd contains only the initiating peer account. NBD listeners remain bound to loopback.
 
 ## Design boundaries
 
 This intentionally does **not** attempt to become libvirt, Kubernetes or Portainer.
 
-On the VM side, host DHCP configuration, VFIO/IOMMU binding, clustered state, migration, snapshots, storage pools, scheduling and multi-host orchestration remain outside this layer. Host bridge creation is intentionally minimal: it creates Linux bridges, optionally attaches member interfaces and writes simple persistence where the host networking stack supports it.
+On the VM side, host DHCP configuration, VFIO/IOMMU binding, snapshots, general storage pools, workload scheduling, automatic HA failover, RAM/CPU state replication, and distributed fencing remain outside this layer. Live replication maintains standby disk copies only. Host bridge creation is intentionally minimal: it creates Linux bridges, optionally attaches member interfaces and writes simple persistence where the host networking stack supports it.
 
-On the Docker side, the project does not duplicate Docker metadata, implement its own registry, orchestrate multi-host clusters, manage Swarm/Kubernetes, or provide a registry credential store. The scripts simply expose a small, consistent administrative surface over the local Docker daemon.
+On the Docker side, the project does not duplicate Docker metadata, orchestrate Swarm/Kubernetes, or become a general container platform. The optional local registry is a loopback-bound CNCF Distribution service exposed through LiteVMM's existing HTTP(S) listener; Docker remains authoritative for containers, images, networks, and volumes.
 
 The result is one lightweight management plane with two native backends:
 

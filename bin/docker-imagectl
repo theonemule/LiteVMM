@@ -9,13 +9,22 @@ source "$LIB"
 DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
 need_cmd "$DOCKER_BIN"
 validate_ref() { local v=${1:-}; [[ -n $v && ${#v} -le 512 && $v != *[[:space:]]* ]] || die "Invalid Docker image reference: $v"; validate_no_newline "$v"; }
+validate_dockerfile() { local v=${1:-Dockerfile}; [[ -n $v && ${#v} -le 256 && $v != /* && $v != *\* && $v =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid Dockerfile path: $v"; [[ "/$v/" != */../* ]] || die 'Dockerfile path cannot traverse outside the build context'; }
 case ${1:-} in
   list) "$DOCKER_BIN" image ls --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}\t{{.CreatedSince}}';;
   list-json) "$DOCKER_BIN" image ls --format '{{json .}}';;
   inspect) ref=${2:?image required}; validate_ref "$ref"; "$DOCKER_BIN" image inspect "$ref";;
   pull) ref=${2:?image required}; validate_ref "$ref"; "$DOCKER_BIN" image pull "$ref";;
+  build-stdin)
+    ref=${2:?image tag required}; shift 2; validate_ref "$ref"; dockerfile=Dockerfile
+    while (($#)); do case "$1" in --file) dockerfile=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+    validate_dockerfile "$dockerfile"; log=$(mktemp); trap 'rm -f -- "$log"' RETURN
+    if id=$("$DOCKER_BIN" image build --quiet --tag "$ref" --file "$dockerfile" - 2>"$log"); then
+      printf '{"image":"%s","id":"%s"}\n' "$(json_escape "$ref")" "$(json_escape "$id")"
+    else cat "$log" >&2; return 1; fi
+    ;;
   tag) src=${2:?source required}; dst=${3:?target required}; validate_ref "$src"; validate_ref "$dst"; "$DOCKER_BIN" image tag "$src" "$dst";;
   remove|delete)
     ref=${2:?image required}; shift 2; validate_ref "$ref"; args=(image rm); [[ ${1:-} == --force ]] && args+=(--force); args+=("$ref"); "$DOCKER_BIN" "${args[@]}";;
-  *) echo 'Usage: docker-imagectl list | inspect IMAGE | pull IMAGE | tag SOURCE TARGET | remove IMAGE [--force]' >&2; exit 2;;
+  *) echo 'Usage: docker-imagectl list | inspect IMAGE | pull IMAGE | build-stdin TAG [--file Dockerfile] | tag SOURCE TARGET | remove IMAGE [--force]' >&2; exit 2;;
 esac

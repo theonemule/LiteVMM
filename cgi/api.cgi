@@ -34,6 +34,8 @@ BACKUPCTL=${BACKUPCTL:-/usr/local/bin/vmbackupctl}
 FILECTL=${FILECTL:-/usr/local/bin/filectl}
 STORAGECTL=${STORAGECTL:-/usr/local/bin/storagectl}
 CERTCTL=${CERTCTL:-/usr/local/bin/certctl}
+REPLICATIONCTL=${REPLICATIONCTL:-/usr/local/bin/replicationctl}
+REGISTRYCTL=${REGISTRYCTL:-/usr/local/bin/registryctl}
 declare -A FORM=()
 # peer-api.cgi sets this before executing us. This survives Lighttpd's internal
 # rewrite, which otherwise makes the original /peer-api route indistinguishable
@@ -57,14 +59,20 @@ require_capability() {
 capabilities_json() {
   local caps=(api system metrics cluster admin) cap first=true
   case "$VMAPI_PROFILE" in
-    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init files host-terminal);;
-    docker) caps+=(docker compose container-terminal files host-terminal);;
-    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init docker compose container-terminal files host-terminal);;
-    backup) caps+=(backup backup-receiver);;
+    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source replication-receiver files host-terminal);;
+    docker) caps+=(docker compose container-terminal registry files host-terminal);;
+    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source replication-receiver docker compose container-terminal registry files host-terminal);;
+    backup) caps+=(backup backup-receiver replication-receiver);;
   esac
   printf '['
   for cap in "${caps[@]}"; do $first || printf ','; first=false; printf '"%s"' "$cap"; done
   printf ']'
+}
+registry_cmd() {
+  if command -v sudo >/dev/null 2>&1; then sudo -n "$REGISTRYCTL" "$@"; else "$REGISTRYCTL" "$@"; fi
+}
+replication_cmd() {
+  if command -v sudo >/dev/null 2>&1; then sudo -n "$REPLICATIONCTL" "$@"; else "$REPLICATIONCTL" "$@"; fi
 }
 cert_cmd() {
   if command -v sudo >/dev/null 2>&1; then sudo -n "$CERTCTL" "$@"; else "$CERTCTL" "$@"; fi
@@ -234,6 +242,7 @@ fi
 # routes whose backing platform is not installed on this host.
 case "${P[0]-}" in
   backups) require_capability backup;;
+  replications) [[ ${P[1]-} == receivers || ${P[1]-} == replicas ]] && require_capability replication-receiver || require_capability replication-source;;
   vms|images|migrations|storage|networks|overlays) require_capability qemu-kvm;;
   docker|compose) require_capability docker;;
   files) require_capability files;;
@@ -266,6 +275,15 @@ if [[ $method == PUT && ${P[0]-} == compose && ${P[1]-} == projects && -n ${P[2]
   reply '201 Created' "$out"
 fi
 
+# Stream a Docker build context directly to the daemon. The CGI never extracts
+# client-controlled tar members onto the host filesystem.
+if [[ $method == PUT && ${P[0]-} == docker && ${P[1]-} == images && ${P[2]-} == build && -z ${P[3]-} ]]; then
+  parse_pairs "${QUERY_STRING:-}"; image=$(param tag); dockerfile=$(param dockerfile Dockerfile)
+  [[ -n $image ]] || error_reply '400 Bad Request' 'tag is required'
+  out=$(run_cmd "$DOCKER_IMAGECTL" build-stdin "$image" --file "$dockerfile")
+  reply '201 Created' "$out"
+fi
+
 if [[ $method == POST && ${P[0]-} == migrations && ${P[1]-} == import && -n ${P[2]-} && -z ${P[3]-} ]]; then
   out=$(backup_cmd import "${P[2]}" 2>&1) || error_reply '400 Bad Request' "$out"
   reply '201 Created' "$out"
@@ -292,10 +310,66 @@ read_params
 
 if [[ -z $route ]]; then
   caps=$(capabilities_json)
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":6,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":8,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
 fi
 
 case "${P[0]-}" in
+  replications)
+    if [[ ${P[1]-} == replicas ]]; then
+      [[ $PEER_API_REQUEST != true ]] || error_reply '403 Forbidden' 'Replica inventory is a local administration endpoint'
+      case "${P[2]-}" in
+        '')
+          [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
+          raw_json_reply '200 OK' replication_cmd receiver-list;;
+        *)
+          case "$method" in
+            GET) raw_json_reply '200 OK' replication_cmd receiver-show "${P[2]}";;
+            DELETE) raw_json_reply '200 OK' replication_cmd receiver-purge "${P[2]}" "$(param delete_file false)";;
+            *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
+          esac;;
+      esac
+    fi
+    if [[ ${P[1]-} == receivers ]]; then
+      [[ $PEER_API_REQUEST == true ]] || error_reply '403 Forbidden' 'Replication receivers are restricted to authenticated peers'
+      case "${P[2]-}" in
+        '')
+          case "$method" in
+            GET) raw_json_reply '200 OK' replication_cmd receiver-list;;
+            POST)
+              vm=$(param vm); idx=$(param disk_index); bytes=$(param bytes)
+              [[ -n $vm && -n $idx && -n $bytes ]] || error_reply '400 Bad Request' 'vm, disk_index, and bytes are required'
+              raw_json_reply '201 Created' replication_cmd receiver-create "$REMOTE_USER" "$vm" "$idx" "$bytes";;
+            *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
+          esac;;
+        *)
+          if [[ ${P[3]-} == restart ]]; then
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            raw_json_reply '200 OK' replication_cmd receiver-start "${P[2]}"
+          fi
+          case "$method" in
+            GET) raw_json_reply '200 OK' replication_cmd receiver-show "${P[2]}";;
+            DELETE) raw_json_reply '200 OK' replication_cmd receiver-delete "${P[2]}";;
+            *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
+          esac;;
+      esac
+    fi
+    case "${P[1]-}" in
+      '')
+        case "$method" in
+          GET) raw_json_reply '200 OK' replication_cmd list;;
+          POST)
+            name=$(param name); peer_id=$(param peer_id); [[ -n $name && -n $peer_id ]] || error_reply '400 Bad Request' 'name and peer_id are required'
+            speed=$(param speed 0); raw_json_reply '201 Created' replication_cmd start "$name" "$peer_id" "$speed";;
+          *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
+        esac;;
+      *)
+        case "$method" in
+          GET) raw_json_reply '200 OK' replication_cmd status "${P[1]}";;
+          DELETE) raw_json_reply '200 OK' replication_cmd stop "${P[1]}";;
+          *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
+        esac;;
+    esac;;
+
   backups)
     if [[ $VMAPI_PROFILE == backup ]]; then
       case "${P[1]-}" in schedules|schedule|unschedule|create|start|jobs|restore) error_reply '404 Not Found' 'Backup creation, scheduling, and restore require the virtualization profile';; esac
@@ -772,6 +846,36 @@ case "${P[0]-}" in
             [[ -n $source && -n $target ]] || error_reply '400 Bad Request' 'source and target are required'
             run_cmd "$DOCKER_IMAGECTL" tag "$source" "$target" >/dev/null; reply '200 OK' '{"tagged":true}';;
           *) error_reply '404 Not Found' 'Unknown Docker image endpoint';;
+        esac;;
+
+      registry)
+        case "${P[2]-}" in
+          '')
+            case "$method" in
+              GET) raw_json_reply '200 OK' registry_cmd status;;
+              POST) username=$(param username registry); raw_json_reply '201 Created' registry_cmd enable "$username";;
+              DELETE) raw_json_reply '200 OK' registry_cmd disable;;
+              *) error_reply '405 Method Not Allowed' 'Use GET, POST, or DELETE';;
+            esac;;
+          credentials)
+            [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
+            raw_json_reply '200 OK' registry_cmd credentials;;
+          catalog)
+            [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
+            raw_json_reply '200 OK' registry_cmd catalog;;
+          push)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            source=$(param source); repository=$(param repository); [[ -n $source && -n $repository ]] || error_reply '400 Bad Request' 'source and repository are required'
+            raw_json_reply '200 OK' registry_cmd push "$source" "$repository";;
+          peer-pull)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            peer_id=$(param peer_id); repository=$(param repository); [[ -n $peer_id && -n $repository ]] || error_reply '400 Bad Request' 'peer_id and repository are required'
+            raw_json_reply '200 OK' registry_cmd peer-pull "$peer_id" "$repository";;
+          peer-push)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            peer_id=$(param peer_id); source=$(param source); repository=$(param repository); [[ -n $peer_id && -n $source && -n $repository ]] || error_reply '400 Bad Request' 'peer_id, source, and repository are required'
+            raw_json_reply '200 OK' registry_cmd peer-push "$peer_id" "$source" "$repository";;
+          *) error_reply '404 Not Found' 'Unknown registry endpoint';;
         esac;;
 
       networks)

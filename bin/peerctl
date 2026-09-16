@@ -15,6 +15,7 @@ IDENTITY_ROOT=${VMAPI_IDENTITY_ROOT:-/etc/vmapi/identity}
 NODE_ID_FILE=${VMAPI_NODE_ID_FILE:-/etc/vmapi/node-id}
 HTPASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
 OVERLAYCTL=${VMAPI_OVERLAYCTL:-/usr/local/bin/overlayctl}
+REPLICATIONCTL=${VMAPI_REPLICATIONCTL:-/usr/local/bin/replicationctl}
 PAIR_TTL=${VMAPI_PAIR_TTL:-900}
 BACKUPCTL=${VMAPI_BACKUPCTL:-/usr/local/bin/vmbackupctl}
 VMCTL=${VMAPI_VMCTL:-/usr/local/bin/vmctl}
@@ -363,8 +364,11 @@ cmd_migrate() {
 }
 
 cmd_revoke() {
-  local id=${1:?node id required}
-  valid_id "$id"; id=${id,,}
+  local id=${1:?node id required} relay_user=''
+  valid_id "$id"; id=${id,,}; load_peer "$id"; relay_user=$PEER_RELAY_USER
+  # Tear down peer-bound data paths while the paired credential still exists,
+  # so source-side replication can notify and clean the destination receiver.
+  if [[ -x $REPLICATIONCTL ]]; then "$REPLICATIONCTL" revoke-peer "$id" "$relay_user" || true; fi
   rm -f -- "$(peer_file "$id")" "$(peer_public_file "$id")"
   cmd_sync_auth
   # Close existing WebSockets as well as rejecting future upgrades.

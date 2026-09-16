@@ -7,6 +7,7 @@ LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 source "$LIB"
 XORRISO_BIN=${XORRISO_BIN:-/usr/bin/xorriso}
+REPLICATION_JOB_ROOT=${VMAPI_REPLICATION_JOB_ROOT:-/var/lib/vmapi/replication-jobs}
 
 usage() {
 cat <<'TXT'
@@ -77,6 +78,8 @@ overlay_bridge() { local name=$1 file=${VMAPI_OVERLAY_ROOT:-/etc/vmapi/overlays}
 valid_pci_bdf() { [[ $1 =~ ^([0-9A-Fa-f]{4}:)?[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] || die "Invalid PCI BDF: $1"; }
 valid_cloud_hostname() { [[ ${1:-} =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die "Invalid cloud-init hostname: ${1:-}"; }
 valid_cloud_instance_id() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || die "Invalid cloud-init instance-id: ${1:-}"; }
+replication_configured() { [[ -r "$REPLICATION_JOB_ROOT/$1/state.conf" ]]; }
+require_no_replication() { replication_configured "$1" && die "Stop live replication before changing VM disks or deleting the VM: $1" || true; }
 
 cmd_list() {
   mkdir -p "$VM_ROOT"
@@ -257,7 +260,7 @@ cmd_cloud_init_disable() {
 }
 
 cmd_disk_add() {
-  local name=${1:?}; shift; require_vm "$name"; require_stopped "$name"
+  local name=${1:?}; shift; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"
   local size='' file='' format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS
   while (($#)); do case "$1" in
     --size) size=${2:?}; shift 2;; --file) file=${2:?}; shift 2;; --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
@@ -271,7 +274,7 @@ cmd_disk_add() {
   printf '%s\n' "$idx"
 }
 cmd_disk_import_stdin() {
-  local name=${1:?} file=${2:?}; shift 2; require_vm "$name"; require_stopped "$name"
+  local name=${1:?} file=${2:?}; shift 2; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"
   local format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS
   while (($#)); do case "$1" in
     --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
@@ -295,7 +298,7 @@ cmd_disk_download() {
   cat -- "$path"
 }
 cmd_disk_remove() {
-  local name=${1:?} idx=${2:?}; shift 2; require_vm "$name"; require_stopped "$name"; validate_int "$idx"
+  local name=${1:?} idx=${2:?}; shift 2; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"; validate_int "$idx"
   local delete=false; [[ ${1:-} == --delete-file ]] && delete=true
   local conf; conf=$(vm_conf "$name"); local file; file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
   [[ -n $file ]] || die "Disk index not found: $idx"
@@ -305,13 +308,13 @@ cmd_disk_remove() {
 
 
 cmd_disk_resize() {
-  local name=${1:?} idx=${2:?} size=${3:?}; require_vm "$name"; require_stopped "$name"; validate_int "$idx"; validate_size "$size"
+  local name=${1:?} idx=${2:?} size=${3:?}; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"; validate_int "$idx"; validate_size "$size"
   local conf file; conf=$(vm_conf "$name"); file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
   [[ -n $file && -f "$(vm_disk_path "$name" "$file")" ]] || die "Disk index not found: $idx"
   need_cmd "$QEMU_IMG"; "$QEMU_IMG" resize "$(vm_disk_path "$name" "$file")" "$size" >/dev/null
 }
 cmd_disk_set() {
-  local name=${1:?} idx=${2:?} field=${3:?} value=${4:?}; require_vm "$name"; require_stopped "$name"; validate_int "$idx"
+  local name=${1:?} idx=${2:?} field=${3:?} value=${4:?}; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"; validate_int "$idx"
   local conf; conf=$(vm_conf "$name"); [[ -n $(cfg_get_file "$conf" "DISK_${idx}_FILE" '') ]] || die "Disk index not found: $idx"
   case "$field" in bus) valid_disk_bus "$value"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$value";; *) die "Unsupported disk field: $field";; esac
 }
@@ -547,7 +550,7 @@ cmd_reboot() {
   else qmp_exec "$name" system_reset || { cmd_stop "$name"; cmd_start "$name"; }; fi
 }
 cmd_delete() {
-  local name=${1:?}; require_vm "$name"; require_stopped "$name"
+  local name=${1:?}; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"
   local d; d=$(vm_dir "$name")
   [[ "$d" == "$VM_ROOT/"* && "$d" != "$VM_ROOT/" ]] || die "Refusing unsafe delete path"
   local disks; disks=$(disk_dir "$name")
