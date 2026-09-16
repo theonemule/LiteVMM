@@ -26,8 +26,9 @@ Open **Virtual machines** from the left menu to see one row per QEMU/KVM guest. 
 2. Under **Identity and compute**, set a short, unique **Name**, then choose **vCPUs** and **Memory MB**. These are the guest's configured resources, not a reservation held while it is stopped.
 3. Under **Storage and boot**, choose the initial virtual-disk size, format, bus, an optional install image, and firmware.
 4. Under **Networking and display**, choose the connectivity model and display options.
-5. Expand **Advanced options** only if you need a different machine type, CPU model, boot order, or fixed VNC display number. The live command preview is there to review the resulting QEMU settings.
-6. Select **Create VM**, then use **Start** and **Console** to install the operating system.
+5. If the guest is a cloud-init-capable image, enable **Cloud-init provisioning**, optionally set its hostname, and paste `#cloud-config` YAML or a cloud-init shell script.
+6. Expand **Advanced options** only if you need a different machine type, CPU model, boot order, or fixed VNC display number. The live command preview is there to review the resulting QEMU settings.
+7. Select **Create VM**, then use **Start** and **Console** to boot or install the operating system.
 
 ### What each creation setting means
 
@@ -45,6 +46,29 @@ Open **Virtual machines** from the left menu to see one row per QEMU/KVM guest. 
 | **NIC model** | `virtio-net-pci` is normal for modern guests. `e1000e`, `e1000`, and `rtl8139` are compatibility choices. |
 | **Display / VNC bind** | **VNC** enables the browser console; the default bind address keeps VNC local to the host. **None** creates no graphical console. |
 | **Start at host boot** | Starts the VM when the LiteVMM host starts. Use it only for guests that should recover automatically. |
+| **Cloud-init provisioning** | Builds a per-VM NoCloud `cidata` ISO containing `user-data` and `meta-data`. The guest image must already include cloud-init. |
+
+## Provision with cloud-init
+
+Cloud-init support is available on the `virtualization` and `virtualization-docker` profiles. LiteVMM uses the NoCloud datasource model: it writes `user-data` plus `meta-data`, builds an ISO9660 image labeled `cidata`, and attaches that seed ISO to the VM as read-only CD-ROM media.
+
+The **User-data** editor accepts either `#cloud-config` YAML or a script beginning with `#!`. A typical cloud-config can create users, install packages, write files, and run commands on the guest's first boot. The guest image itself must contain cloud-init and support NoCloud; attaching a seed ISO does not add cloud-init to an ordinary operating-system image.
+
+The generated seed lives under `VM_ROOT/NAME/cloud-init`, so backups, restores, and migrations retain the exact provisioning source and seed. When you change user-data or the cloud-init hostname, LiteVMM generates a new `instance-id`. On a normal cloud image this causes cloud-init to treat the next boot as a new instance and run per-instance configuration again. For that reason, cloud-init changes are allowed only while the VM is stopped.
+
+Example user-data:
+
+```yaml
+#cloud-config
+package_update: true
+packages:
+  - curl
+write_files:
+  - path: /etc/litevmm-provisioned
+    content: provisioned by LiteVMM
+runcmd:
+  - systemctl restart ssh
+```
 
 ## Edit a VM safely
 

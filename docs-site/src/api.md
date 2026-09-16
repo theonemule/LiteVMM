@@ -11,7 +11,7 @@ All browser API paths begin with `/api` and require the same HTTP Basic authenti
 | Service | `GET /` returns service metadata, profile, management port, TLS state, and capabilities. |
 | System inventory | `GET /system` returns host, OS, hardware, network, storage, component-version, and service-state inventory. |
 | Metrics/logs | `GET /metrics`, `GET /logs?source=&limit=`. |
-| VMs | `GET, POST /vms`; `GET, PATCH, DELETE /vms/{name}`; lifecycle includes graceful `/shutdown` and `/restart` plus immediate `/stop` and `/reboot`; metrics, console, disks, NICs (including optional VLAN ID), and PCI subresources. |
+| VMs | `GET, POST /vms`; `GET, PATCH, DELETE /vms/{name}`; lifecycle includes graceful `/shutdown` and `/restart` plus immediate `/stop` and `/reboot`; metrics, console, disks, NICs (including optional VLAN ID), PCI, and `/vms/{name}/cloud-init` subresources. |
 | VM images | `GET /images`; `PUT, DELETE /images/{filename}`. |
 | Docker | Containers, images, networks, and volumes under `/docker/...`; container subresources include lifecycle, metrics, logs, commit, and exec sessions. |
 | Compose | `GET /compose/projects`; `PUT, GET, DELETE /compose/projects/{name}`; `POST .../deploy` and `.../down`. |
@@ -26,3 +26,8 @@ The exact request fields are enforced in `cgi/api.cgi`; use the console for norm
 
 
 Profile filtering is enforced by the CGI before platform tools are invoked. A hidden UI control is not the security boundary: direct calls to VM routes on a `backup` or `docker` node, or Docker routes on a `backup` or `virtualization` node, return `404 Not Found` for the unavailable capability.
+
+
+## Cloud-init VM resource
+
+Virtualization profiles expose `GET /vms/{name}/cloud-init`, `PUT /vms/{name}/cloud-init`, and `DELETE /vms/{name}/cloud-init`. `PUT` accepts URL-encoded `user_data` and optional `hostname`. User-data may be cloud-config YAML or a shell script. Updating it regenerates the NoCloud seed and rotates its instance ID; the VM must be stopped. VM creation also accepts `cloud_init_user_data` and optional `cloud_init_hostname`.

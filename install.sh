@@ -98,9 +98,9 @@ install_packages() {
       apk update
       apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client
       case $PROFILE in
-        virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd;;
+        virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso;;
         docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd;;
-        virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd docker docker-openrc docker-cli-compose;;
+        virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso docker docker-openrc docker-cli-compose;;
         backup) :;;
       esac
       if [[ $INSTALL_CERTBOT == true ]]; then apk add --no-cache certbot lighttpd-mod_openssl; fi
@@ -110,9 +110,9 @@ install_packages() {
       apt-get update
       apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils
       case $PROFILE in
-        virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd;;
+        virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso;;
         docker) apt-get install -y --no-install-recommends docker.io ttyd;;
-        virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd;;
+        virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso;;
         backup) :;;
       esac
       if [[ $INSTALL_CERTBOT == true ]]; then apt-get install -y --no-install-recommends certbot; fi
@@ -177,7 +177,7 @@ install_common_files() {
   install -m 0755 "$BASE/cgi/api.cgi" /usr/lib/vmapi/cgi/api.cgi
   install -m 0755 "$BASE/cgi/peer-api.cgi" /usr/lib/vmapi/cgi/peer-api.cgi
   while IFS= read -r -d '' asset; do relative=${asset#"$BASE/www/"}; install -D -m 0644 "$asset" "/usr/share/vmapi/www/$relative"; done < <(find "$BASE/www" -type f -print0)
-  for spec in 'vm-list list' 'vm-show show' 'vm-status status' 'vm-create create' 'vm-set set' 'vm-start start' 'vm-stop stop' 'vm-shutdown shutdown' 'vm-reboot reboot' 'vm-restart restart' 'vm-delete delete' 'vm-disk-add disk-add' 'vm-disk-remove disk-remove' 'vm-disk-resize disk-resize' 'vm-disk-set disk-set' 'vm-nic-add nic-add' 'vm-nic-remove nic-remove' 'vm-nic-set nic-set' 'vm-pci-add pci-add' 'vm-pci-remove pci-remove' 'vm-console-info console-info' 'vm-command command'; do
+  for spec in 'vm-list list' 'vm-show show' 'vm-status status' 'vm-create create' 'vm-set set' 'vm-start start' 'vm-stop stop' 'vm-shutdown shutdown' 'vm-reboot reboot' 'vm-restart restart' 'vm-delete delete' 'vm-disk-add disk-add' 'vm-disk-remove disk-remove' 'vm-disk-resize disk-resize' 'vm-disk-set disk-set' 'vm-nic-add nic-add' 'vm-nic-remove nic-remove' 'vm-nic-set nic-set' 'vm-pci-add pci-add' 'vm-pci-remove pci-remove' 'vm-cloud-init-set cloud-init-set' 'vm-cloud-init-show cloud-init-show' 'vm-cloud-init-disable cloud-init-disable' 'vm-console-info console-info' 'vm-command command'; do
     set -- $spec; wrapper=$1; sub=$2
     printf '#!/usr/bin/env bash\nexec /usr/local/bin/vmctl %s "$@"\n' "$sub" > "/usr/local/bin/$wrapper"; chmod 0755 "/usr/local/bin/$wrapper"
   done

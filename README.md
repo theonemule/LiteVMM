@@ -1,4 +1,4 @@
-# LiteVMM 0.6
+# LiteVMM 0.7
 
 LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, combined virtualization + Docker, or backup-receiver profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
 
@@ -42,6 +42,7 @@ The console covers:
 - overview/status counts for VMs, containers, VM images and Docker images
 - VM creation, start, stop, reboot, deletion and basic hardware editing
 - VM disks, NICs and PCI passthrough entries
+- optional cloud-init NoCloud provisioning with pasted user-data and per-VM seed ISOs
 - VNC/serial/QMP console information
 - VM ISO/disk-image upload, listing and deletion
 - Docker container creation, lifecycle, inspection and resource/restart updates
@@ -159,6 +160,24 @@ Pair records remain root-only in `/var/lib/vmapi/peers`. `peerctl sync-auth` reb
 
 Manual and scheduled backups run as tracked jobs. The VM backup dialog shows phase progress (validation, configuration, disks, compression, and peer transfer) and retains the final success or error state in `/var/lib/vmapi/backup-jobs`. QMP does not provide a reliable byte-level estimate for every disk mode, so the percentage represents completed phases rather than exact bytes copied. The dialog also queries each paired host and exposes peer-held archives for download; this matters because a successful peer-targeted archive is intentionally absent from the source host.
 
+### Cloud-init provisioning
+
+Virtualization profiles install `xorriso` and can attach a cloud-init NoCloud seed to any stopped VM. In the Create VM dialog, enable **Cloud-init provisioning**, optionally set the guest hostname, and paste user-data. LiteVMM accepts normal `#cloud-config` YAML or a cloud-init shell script beginning with a shebang. The guest image must already contain cloud-init with the NoCloud datasource enabled; LiteVMM does not install cloud-init inside the guest.
+
+For a VM named `web01`, LiteVMM stores the generated material under `/var/lib/vmapi/vms/web01/cloud-init/` as `user-data`, `meta-data`, and `seed.iso`. The ISO is ISO9660 with volume label `cidata` and is attached to QEMU as read-only CD-ROM media. Because the seed lives in the VM configuration directory, ordinary LiteVMM backup, restore, and migration archives include it automatically.
+
+Cloud-init determines first boot partly from its datasource instance ID. LiteVMM therefore generates a new NoCloud `instance-id` whenever the hostname or user-data is changed, causing normal per-instance cloud-init processing on the next boot. Saving an unchanged VM does not regenerate the seed. Disable cloud-init from the VM editor to remove the seed entirely.
+
+The shell API reads user-data from standard input:
+
+```bash
+cat user-data.yaml | vm-cloud-init-set web01 --hostname web01
+vm-cloud-init-show web01
+vm-cloud-init-disable web01
+```
+
+The equivalent browser/API resource is `/api/vms/{name}/cloud-init`.
+
 ### Host file browse
 
 The Overview page opens the file browser in a separate tab. It provides a
@@ -180,9 +199,9 @@ The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI val
 
 The LiteVMM API and console are always installed. Choose exactly one workload profile:
 
-- `virtualization` installs QEMU/KVM, VM networking and consoles, GOST overlays, and the backup sender/receiver.
+- `virtualization` installs QEMU/KVM, VM networking and consoles, cloud-init NoCloud seed support, GOST overlays, and the backup sender/receiver.
 - `docker` installs Docker/Compose management and container terminals without QEMU/KVM or VM backup creation.
-- `virtualization-docker` installs the complete virtualization profile, including VM backups, plus Docker/Compose management.
+- `virtualization-docker` installs the complete virtualization profile, including cloud-init and VM backups, plus Docker/Compose management.
 - `backup` installs only the paired backup receiver/archive-management surface. It cannot create, restore, migrate, or run VMs and does not install Docker.
 
 On Alpine, Debian, Ubuntu, or a Debian derivative:
@@ -560,6 +579,9 @@ DELETE  /api/vms/{name}/nics/{index}
 PATCH   /api/vms/{name}/nics/{index}
 POST    /api/vms/{name}/pci
 DELETE  /api/vms/{name}/pci/{index}
+GET     /api/vms/{name}/cloud-init
+PUT     /api/vms/{name}/cloud-init          form: user_data=...&hostname=...
+DELETE  /api/vms/{name}/cloud-init
 
 GET     /api/images                         # shared ISO/installer media
 PUT     /api/images/{filename}              # .iso or .img

@@ -57,9 +57,9 @@ require_capability() {
 capabilities_json() {
   local caps=(api system metrics cluster admin) cap first=true
   case "$VMAPI_PROFILE" in
-    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage files host-terminal);;
+    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init files host-terminal);;
     docker) caps+=(docker compose container-terminal files host-terminal);;
-    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage docker compose container-terminal files host-terminal);;
+    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init docker compose container-terminal files host-terminal);;
     backup) caps+=(backup backup-receiver);;
   esac
   printf '['
@@ -92,7 +92,7 @@ read_params() {
   parse_pairs "${QUERY_STRING:-}"
   local ct=${CONTENT_TYPE:-} len=${CONTENT_LENGTH:-0} body=''
   if [[ $ct == application/x-www-form-urlencoded* && $len =~ ^[0-9]+$ && $len -gt 0 ]]; then
-    (( len <= 65536 )) || error_reply '413 Payload Too Large' 'Form body exceeds 64 KiB'
+    (( len <= 1048576 )) || error_reply '413 Payload Too Large' 'Form body exceeds 1 MiB'
     # FastCGI request bodies are not line-oriented. read -N can return an
     # empty value on some fcgiwrap/BusyBox combinations; read the exact byte
     # count instead so pairing bundles and ordinary form submissions survive.
@@ -496,7 +496,14 @@ case "${P[0]-}" in
           [[ -n $(param vnc_bind) ]] && args+=(--vnc-bind "$(param vnc_bind)")
           [[ -n $(param display) ]] && args+=(--display "$(param display)")
           [[ -n $(param boot) ]] && args+=(--boot "$(param boot)")
+          cloud_user_data=$(param cloud_init_user_data); cloud_hostname=$(param cloud_init_hostname); [[ -n $cloud_hostname ]] || cloud_hostname=$name
           run_cmd "$VMCTL" "${args[@]}" >/dev/null
+          if [[ -n $cloud_user_data ]]; then
+            if ! cloud_out=$(printf '%s' "$cloud_user_data" | "$VMCTL" cloud-init-set "$name" --hostname "$cloud_hostname" 2>&1); then
+              vm_delete_cmd "$name" >/dev/null 2>&1 || true
+              error_reply '400 Bad Request' "Cloud-init configuration failed: $cloud_out"
+            fi
+          fi
           body=$(json_config "$name"); reply '201 Created' "$body";;
         *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
       esac
@@ -512,6 +519,20 @@ case "${P[0]-}" in
             field=$(param field); value=$(param value); [[ -n $field ]] || error_reply '400 Bad Request' 'field is required'
             run_cmd "$VMCTL" set "$name" "$field" "$value" >/dev/null; body=$(json_config "$name"); reply '200 OK' "$body";;
           *) error_reply '405 Method Not Allowed' 'Unsupported method';;
+        esac;;
+      cloud-init)
+        cgi_require_vm "$name"
+        case "$method" in
+          GET) raw_json_reply '200 OK' "$VMCTL" cloud-init-show "$name";;
+          PUT|POST)
+            user_data=$(param user_data); hostname=$(param hostname); [[ -n $hostname ]] || hostname=$name
+            [[ -n $user_data ]] || error_reply '400 Bad Request' 'user_data is required'
+            if ! cloud_out=$(printf '%s' "$user_data" | "$VMCTL" cloud-init-set "$name" --hostname "$hostname" 2>&1); then error_reply '400 Bad Request' "$cloud_out"; fi
+            raw_json_reply '200 OK' "$VMCTL" cloud-init-show "$name";;
+          DELETE)
+            run_cmd "$VMCTL" cloud-init-disable "$name" >/dev/null
+            raw_json_reply '200 OK' "$VMCTL" cloud-init-show "$name";;
+          *) error_reply '405 Method Not Allowed' 'Use GET, PUT, POST, or DELETE';;
         esac;;
       start)
         [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'

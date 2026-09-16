@@ -20,6 +20,7 @@ title: Configuration reference
 | `IMAGE_ROOT` | compatibility alias | Legacy fallback for `ISO_ROOT` on upgraded installations. |
 | `QEMU_BIN` | `/usr/bin/qemu-system-x86_64` | QEMU executable used to start VMs. |
 | `QEMU_IMG` | `/usr/bin/qemu-img` | Image utility used for disk creation and inspection. |
+| `XORRISO_BIN` | `/usr/bin/xorriso` | ISO builder used by virtualization profiles to create cloud-init NoCloud `cidata` seed images. |
 | `DEFAULT_MACHINE` | `q35` | QEMU machine model for newly created VMs. |
 | `DEFAULT_CPU` | `host` | QEMU CPU model. `host` exposes host capabilities; use a compatible fixed model for portability. |
 | `DEFAULT_MEMORY_MB` | `2048` | RAM assigned to a newly created VM, in MiB. |
@@ -35,7 +36,7 @@ title: Configuration reference
 
 ## Runtime environment overrides
 
-Tests and nonstandard deployments can override tool paths without editing the host config. Common examples are `VMAPI_LIB`, `VMAPI_CONFIG`, `VMAPI_FILE_ROOT`, `VMAPI_PEER_ROOT`, `VMAPI_BACKUP_ROOT`, `VMAPI_OVERLAY_ROOT`, and `DOCKER_BIN`. They are intentionally primarily for controlled deployments and tests; document any persistent override in your service unit.
+Tests and nonstandard deployments can override tool paths without editing the host config. Common examples are `VMAPI_LIB`, `VMAPI_CONFIG`, `VMAPI_FILE_ROOT`, `VMAPI_PEER_ROOT`, `VMAPI_BACKUP_ROOT`, `VMAPI_OVERLAY_ROOT`, `XORRISO_BIN`, and `DOCKER_BIN`. They are intentionally primarily for controlled deployments and tests; document any persistent override in your service unit.
 
 ## Per-VM settings
 

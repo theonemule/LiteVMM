@@ -16,7 +16,7 @@ vmapi_has_capability() {
   case "$cap" in
     api|system|metrics|cluster|admin) return 0;;
     backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ]];;
-    backup-create|qemu-kvm|vm-network|vm-console|storage) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker ]];;
+    backup-create|qemu-kvm|vm-network|vm-console|storage|cloud-init) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker ]];;
     docker|compose|container-terminal) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     files|host-terminal) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     *) return 1;;

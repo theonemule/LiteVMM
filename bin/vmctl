@@ -6,6 +6,7 @@ set -Eeuo pipefail
 LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 source "$LIB"
+XORRISO_BIN=${XORRISO_BIN:-/usr/bin/xorriso}
 
 usage() {
 cat <<'TXT'
@@ -35,6 +36,9 @@ Commands:
   pci-add NAME BDF
   pci-remove NAME INDEX
   console-info NAME
+  cloud-init-set NAME [--hostname HOST] [--instance-id ID]  Read user-data from stdin and build NoCloud seed
+  cloud-init-show NAME       Show cloud-init seed status and user-data as JSON
+  cloud-init-disable NAME    Remove the cloud-init seed
   command NAME              Print the QEMU command that would be launched
 
 Create options:
@@ -71,6 +75,8 @@ vm_tap_name() { local n; n=$(printf '%s' "$1:$2" | cksum | awk '{print $1}'); pr
 valid_overlay() { [[ $1 =~ ^[a-z][a-z0-9-]{0,10}$ ]] || die "Invalid overlay name: $1"; }
 overlay_bridge() { local name=$1 file=${VMAPI_OVERLAY_ROOT:-/etc/vmapi/overlays}/$name.conf; valid_overlay "$name"; [[ -r $file ]] || die "Overlay not found: $name"; local NAME='' BRIDGE=''; source "$file"; valid_bridge "$BRIDGE"; printf '%s' "$BRIDGE"; }
 valid_pci_bdf() { [[ $1 =~ ^([0-9A-Fa-f]{4}:)?[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] || die "Invalid PCI BDF: $1"; }
+valid_cloud_hostname() { [[ ${1:-} =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die "Invalid cloud-init hostname: ${1:-}"; }
+valid_cloud_instance_id() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || die "Invalid cloud-init instance-id: ${1:-}"; }
 
 cmd_list() {
   mkdir -p "$VM_ROOT"
@@ -137,6 +143,7 @@ VNC_BIND=$vnc_bind
 VNC_DISPLAY=$vnc_display
 BOOT_ORDER=$boot
 ISO=$iso
+CLOUD_INIT=false
 CFG
   chmod 0640 "$conf"
 
@@ -194,6 +201,59 @@ cmd_set() {
     cp "$vars" "$(vm_dir "$name")/nvram.fd"
   fi
   cfg_set "$name" "$key" "$value"
+}
+
+cloud_init_dir() { printf '%s/cloud-init\n' "$(vm_dir "$1")"; }
+cmd_cloud_init_set() {
+  local name=${1:?}; shift; require_vm "$name"; require_stopped "$name"
+  local hostname=$name instance_id='' user_data target build old
+  while (($#)); do
+    case "$1" in
+      --hostname) hostname=${2:?}; shift 2;;
+      --instance-id) instance_id=${2:?}; shift 2;;
+      *) die "Unknown cloud-init option: $1";;
+    esac
+  done
+  valid_cloud_hostname "$hostname"
+  [[ -n $instance_id ]] || instance_id="iid-$(cat /proc/sys/kernel/random/uuid)"
+  valid_cloud_instance_id "$instance_id"
+  user_data=$(cat)
+  [[ -n $user_data ]] || die 'cloud-init user-data is empty'
+  need_cmd "$XORRISO_BIN"
+  target=$(cloud_init_dir "$name")
+  build=$(mktemp -d "$(vm_dir "$name")/.cloud-init-build.XXXXXX")
+  old="$(vm_dir "$name")/.cloud-init-old"
+  trap 'rm -rf -- "$build"' RETURN
+  printf '%s\n' "$user_data" > "$build/user-data"
+  printf 'instance-id: %s\nlocal-hostname: %s\n' "$instance_id" "$hostname" > "$build/meta-data"
+  (cd "$build" && "$XORRISO_BIN" -as mkisofs -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data >/dev/null 2>&1)
+  [[ -s "$build/seed.iso" ]] || die 'cloud-init seed ISO was not created'
+  chmod 0640 "$build/user-data" "$build/meta-data" "$build/seed.iso"
+  rm -rf -- "$old"
+  [[ ! -e $target ]] || mv -- "$target" "$old"
+  mv -- "$build" "$target"
+  trap - RETURN
+  rm -rf -- "$old"
+  cfg_set "$name" CLOUD_INIT true
+  printf '%s\n' "$instance_id"
+}
+cmd_cloud_init_show() {
+  local name=${1:?}; require_vm "$name"
+  local conf enabled dir user_data='' instance_id='' hostname=''
+  conf=$(vm_conf "$name"); enabled=$(cfg_get_file "$conf" CLOUD_INIT false); validate_bool "$enabled"
+  dir=$(cloud_init_dir "$name")
+  if [[ $enabled == true ]]; then
+    [[ -r "$dir/user-data" && -r "$dir/meta-data" && -s "$dir/seed.iso" ]] || die 'cloud-init is enabled but its seed files are missing'
+    user_data=$(cat "$dir/user-data")
+    instance_id=$(awk -F': *' '$1=="instance-id"{sub(/^[^:]*:[[:space:]]*/,""); print; exit}' "$dir/meta-data")
+    hostname=$(awk -F': *' '$1=="local-hostname"{sub(/^[^:]*:[[:space:]]*/,""); print; exit}' "$dir/meta-data")
+  fi
+  printf '{"enabled":%s,"instance_id":"%s","local_hostname":"%s","user_data":"%s"}\n' "$enabled" "$(json_escape "$instance_id")" "$(json_escape "$hostname")" "$(json_escape "$user_data")"
+}
+cmd_cloud_init_disable() {
+  local name=${1:?}; require_vm "$name"; require_stopped "$name"
+  rm -rf -- "$(cloud_init_dir "$name")"
+  cfg_set "$name" CLOUD_INIT false
 }
 
 cmd_disk_add() {
@@ -354,6 +414,11 @@ build_qemu_args() {
 
   local iso; iso=$(cfg_get_file "$conf" ISO '')
   if [[ -n $iso ]]; then local ipath; ipath=$(resolve_image "$iso"); QEMU_ARGS+=(-drive "file=$ipath,media=cdrom,readonly=on"); fi
+  local cloud_init seed; cloud_init=$(cfg_get_file "$conf" CLOUD_INIT false); validate_bool "$cloud_init"
+  if [[ $cloud_init == true ]]; then
+    seed="$(cloud_init_dir "$name")/seed.iso"; [[ -s $seed ]] || die "cloud-init seed ISO is missing: $seed"
+    QEMU_ARGS+=(-drive "file=$seed,format=raw,media=cdrom,readonly=on")
+  fi
   QEMU_ARGS+=(-boot "order=$(cfg_get_file "$conf" BOOT_ORDER c)")
 
   local mode model mac br vlan tap
@@ -508,7 +573,7 @@ main() {
     help|-h|--help) usage;; list) cmd_list "$@";; show) cmd_show "$@";; status) cmd_status "$@";; create) cmd_create "$@";; set) cmd_set "$@";;
     start) cmd_start "$@";; stop) cmd_stop "$@";; shutdown) cmd_shutdown "$@";; reboot) cmd_reboot "$@";; restart) cmd_restart "$@";; delete) cmd_delete "$@";;
     disk-add) cmd_disk_add "$@";; disk-import-stdin) cmd_disk_import_stdin "$@";; disk-download) cmd_disk_download "$@";; disk-remove) cmd_disk_remove "$@";; disk-resize) cmd_disk_resize "$@";; disk-set) cmd_disk_set "$@";; nic-add) cmd_nic_add "$@";; nic-remove) cmd_nic_remove "$@";; nic-set) cmd_nic_set "$@";;
-    pci-add) cmd_pci_add "$@";; pci-remove) cmd_pci_remove "$@";; console-info) cmd_console_info "$@";; command) cmd_command "$@";;
+    pci-add) cmd_pci_add "$@";; pci-remove) cmd_pci_remove "$@";; cloud-init-set) cmd_cloud_init_set "$@";; cloud-init-show) cmd_cloud_init_show "$@";; cloud-init-disable) cmd_cloud_init_disable "$@";; console-info) cmd_console_info "$@";; command) cmd_command "$@";;
     *) usage >&2; die "Unknown command: $cmd";;
   esac
 }

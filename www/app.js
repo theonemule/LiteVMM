@@ -186,7 +186,13 @@
       ['--vnc-bind', o.vnc_bind], ['--display', o.display], ['--boot', o.boot]
     ];
     opts.forEach(([k,v]) => { if (v !== undefined && v !== null && v !== '') parts.push(k, v); });
-    return commandLine(parts);
+    const create = commandLine(parts);
+    if (o.cloud_init_enabled === 'true') {
+      const ci = ['/usr/local/bin/vmctl','cloud-init-set',o.name || 'NAME','--hostname',o.cloud_init_hostname || o.name || 'NAME'];
+      return `${create}
+${commandLine(ci)} < user-data`;
+    }
+    return create;
   }
 
   function containerCreateCommand(o) {
@@ -562,6 +568,7 @@
           <div class="col-md-4"><label class="form-label">VNC bind</label><input name="vnc_bind" class="form-control" value="127.0.0.1"></div>
           <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch mb-2"><input name="autostart" class="form-check-input" type="checkbox" id="vmAuto"><label class="form-check-label" for="vmAuto">Start at host boot</label></div></div>
         </div></div>
+        <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center"><span>Cloud-init provisioning</span><div class="form-check form-switch mb-0"><input name="cloud_init_enabled" id="vmCloudInitEnabled" class="form-check-input" type="checkbox"><label class="form-check-label" for="vmCloudInitEnabled">Enable</label></div></div><div id="vmCloudInitFields" class="d-none"><div class="row g-3"><div class="col-md-6"><label class="form-label">Guest hostname</label><input name="cloud_init_hostname" id="vmCloudInitHostname" class="form-control mono" placeholder="Defaults to VM name"></div><div class="col-12"><label class="form-label">User-data</label><textarea name="cloud_init_user_data" id="vmCloudInitUserData" rows="10" class="form-control mono" spellcheck="false" placeholder="#cloud-config&#10;package_update: true&#10;runcmd:&#10;  - echo provisioned by LiteVMM > /etc/litevmm-provisioned"></textarea><div class="form-text">Paste <span class="mono">#cloud-config</span> YAML or a cloud-init shell script beginning with a shebang. The guest image must already contain cloud-init with NoCloud support.</div></div></div></div></div>
         <div class="form-section"><button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#vmAdvanced">Advanced options</button><div id="vmAdvanced" class="collapse mt-3"><div class="row g-3">
           <div class="col-md-4"><label class="form-label">Machine</label><select name="machine" class="form-select">${selectOptions(['q35','pc'], 'q35')}</select></div>
           <div class="col-md-4"><label class="form-label">CPU model</label><select name="cpu" class="form-select">${selectOptions(['host','max','kvm64','qemu64'], 'host')}</select></div>
@@ -571,15 +578,20 @@
         </div></div></div>
         <div class="form-section"><div class="form-section-title">Create command</div><pre id="vmCreatePreview" class="code-panel command-preview mb-0"></pre></div>
       </form>`, onSubmit: async (el,m) => {
-        const f = new FormData($('#vmCreateForm', el)); const o = Object.fromEntries(f.entries()); o.autostart = f.has('autostart') ? 'true' : 'false'; o.emulation = f.has('emulation') ? 'true' : 'false';
+        const f = new FormData($('#vmCreateForm', el)); const o = Object.fromEntries(f.entries()); o.autostart = f.has('autostart') ? 'true' : 'false'; o.emulation = f.has('emulation') ? 'true' : 'false'; o.cloud_init_enabled = f.has('cloud_init_enabled') ? 'true' : 'false';
         if (o.network !== 'bridge') delete o.bridge;
         if (o.network !== 'overlay') delete o.overlay;
         if (!['bridge','overlay'].includes(o.network)) delete o.vlan;
+        if (o.cloud_init_enabled === 'true') {
+          if (!(o.cloud_init_user_data || '').trim()) throw new Error('Cloud-init user-data is required when cloud-init is enabled.');
+          if (!(o.cloud_init_hostname || '').trim()) o.cloud_init_hostname = o.name;
+        } else { delete o.cloud_init_user_data; delete o.cloud_init_hostname; }
+        delete o.cloud_init_enabled;
         await request('/vms', {method:'POST', form:o}); m.hide(); toast(`${o.name} created`); await renderRoute();
       }});
     const form = $('#vmCreateForm', $('#formModal'));
     const syncVmForm = () => {
-      const fd = new FormData(form); const o = Object.fromEntries(fd.entries()); o.autostart = fd.has('autostart') ? 'true' : 'false';
+      const fd = new FormData(form); const o = Object.fromEntries(fd.entries()); o.autostart = fd.has('autostart') ? 'true' : 'false'; o.cloud_init_enabled = fd.has('cloud_init_enabled') ? 'true' : 'false';
       const bridged = o.network === 'bridge';
       const overlay = o.network === 'overlay';
       $('#vmBridgeWrap', form).classList.toggle('d-none', !bridged);
@@ -588,14 +600,19 @@
       $('#vmOverlay', form).disabled = !overlay;
       $('#vmVlanWrap', form).classList.toggle('d-none', !(bridged||overlay));
       form.vlan.disabled = !(bridged||overlay);
+      const cloudInit = o.cloud_init_enabled === 'true';
+      $('#vmCloudInitFields', form).classList.toggle('d-none', !cloudInit);
+      form.cloud_init_hostname.disabled = !cloudInit;
+      form.cloud_init_user_data.disabled = !cloudInit;
+      if (cloudInit && !form.cloud_init_hostname.value.trim() && form.name.value.trim()) form.cloud_init_hostname.placeholder = form.name.value.trim();
       setPreview('#vmCreatePreview', vmCreateCommand(o));
     };
     form.addEventListener('input', syncVmForm); form.addEventListener('change', syncVmForm); syncVmForm();
   }
 
   async function openVMDetails(name) {
-    const [vm, images, nets, consoleInfo, metrics] = await Promise.all([
-      request(`/vms/${encodeURIComponent(name)}`), request('/images'), request('/networks'), request(`/vms/${encodeURIComponent(name)}/console`).catch(()=>null), request(`/vms/${encodeURIComponent(name)}/metrics`).catch(()=>null)
+    const [vm, images, nets, consoleInfo, metrics, cloudInit] = await Promise.all([
+      request(`/vms/${encodeURIComponent(name)}`), request('/images'), request('/networks'), request(`/vms/${encodeURIComponent(name)}/console`).catch(()=>null), request(`/vms/${encodeURIComponent(name)}/metrics`).catch(()=>null), request(`/vms/${encodeURIComponent(name)}/cloud-init`).catch(()=>({enabled:false,instance_id:'',local_hostname:'',user_data:''}))
     ]);
     const c = vm.config || {};
     const disks = indexedConfig(c, 'DISK', ['FILE','FORMAT','BUS']);
@@ -617,6 +634,7 @@
           <div class="col-md-2 d-flex align-items-end"><div class="form-check form-switch mb-2"><input name="autostart" id="editAuto" class="form-check-input" type="checkbox" ${String(c.AUTOSTART)==='true'?'checked':''}><label class="form-check-label" for="editAuto">Autostart</label></div></div>
           <div class="col-12"><div class="form-check form-switch"><input name="emulation" id="editEmulation" class="form-check-input" type="checkbox" ${String(c.ALLOW_TCG)==='true'?'checked':''}><label class="form-check-label" for="editEmulation">Allow software emulation when KVM is unavailable</label></div></div>
         </div>${vm.state === 'running' ? '<div class="alert alert-warning small mt-3 mb-0">Hardware settings can only be changed while the VM is stopped.</div>' : ''}</div>
+        <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center"><span>Cloud-init provisioning</span><div class="form-check form-switch mb-0"><input name="cloud_init_enabled" id="editCloudInitEnabled" class="form-check-input" type="checkbox" ${cloudInit.enabled?'checked':''} ${vm.state==='running'?'disabled':''}><label class="form-check-label" for="editCloudInitEnabled">Enabled</label></div></div><div id="editCloudInitFields" class="${cloudInit.enabled?'':'d-none'}"><div class="row g-3"><div class="col-md-6"><label class="form-label">Guest hostname</label><input name="cloud_init_hostname" class="form-control mono" value="${esc(cloudInit.local_hostname||name)}" ${vm.state==='running'?'disabled':''}></div><div class="col-md-6"><label class="form-label">Instance ID</label><input class="form-control mono" value="${esc(cloudInit.instance_id||'Generated when saved')}" readonly><div class="form-text">Changing cloud-init content generates a new instance ID for the next boot.</div></div><div class="col-12"><label class="form-label">User-data</label><textarea name="cloud_init_user_data" rows="10" class="form-control mono" spellcheck="false" ${vm.state==='running'?'disabled':''}>${esc(cloudInit.user_data||'')}</textarea><div class="form-text">The seed is attached as a NoCloud <span class="mono">cidata</span> ISO. The guest image must include cloud-init.</div></div></div></div>${vm.state==='running'?'<div class="alert alert-warning small mt-3 mb-0">Stop the VM before changing cloud-init. The current seed remains attached while it is running.</div>':''}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Disks <button type="button" class="btn btn-sm btn-outline-primary" id="addDiskBtn">Add disk</button></div>${resourceList(disks, d=>`<strong>disk${d.index}</strong> · ${esc(d.FILE || '')} · ${esc(d.FORMAT || '')} · ${esc(d.BUS || '')}`, 'disk')}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Network adapters <button type="button" class="btn btn-sm btn-outline-primary" id="addNicBtn">Add NIC</button></div>${resourceList(nics, n=>`<strong>nic${n.index}</strong> · ${esc(n.MODE || '')}${n.BRIDGE ? ` / ${esc(n.BRIDGE)}`:''} · ${esc(n.MODEL || '')}${n.VLAN ? ` · VLAN ${esc(n.VLAN)}` : ''} · <span class="mono">${esc(n.MAC || '')}</span>`, 'nic')}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">PCI passthrough <button type="button" class="btn btn-sm btn-outline-primary" id="addPciBtn">Add device</button></div>${resourceList(pci, p=>`<strong>pci${p.index}</strong> · <span class="mono">${esc(p.BDF || '')}</span>`, 'pci')}</div>
@@ -624,9 +642,19 @@
       </form>`, onSubmit: async (el,m) => {
         const f = new FormData($('#vmEditForm',el)); const updates = {cpus:f.get('cpus'),memory:f.get('memory'),cpu:f.get('cpu'),machine:f.get('machine'),emulation:f.has('emulation')?'true':'false',iso:f.get('iso') || '',boot:f.get('boot'),display:f.get('display'),autostart:f.has('autostart')?'true':'false'};
         for (const [field,value] of Object.entries(updates)) await request(`/vms/${encodeURIComponent(name)}`, {method:'PATCH', form:{field,value}});
+        if (vm.state !== 'running') {
+          const enabled = f.has('cloud_init_enabled');
+          const userData = f.get('cloud_init_user_data') || ''; const hostname = f.get('cloud_init_hostname') || name;
+          if (enabled) {
+            if (!userData.trim()) throw new Error('Cloud-init user-data is required when cloud-init is enabled.');
+            if (!cloudInit.enabled || userData !== (cloudInit.user_data||'') || hostname !== (cloudInit.local_hostname||name)) await request(`/vms/${encodeURIComponent(name)}/cloud-init`, {method:'PUT', form:{user_data:userData,hostname}});
+          } else if (cloudInit.enabled) await request(`/vms/${encodeURIComponent(name)}/cloud-init`, {method:'DELETE'});
+        }
         m.hide(); toast(`${name} updated`); await renderRoute();
       }});
 
+    const editCloudToggle = $('#editCloudInitEnabled', $('#formModal'));
+    if (editCloudToggle && vm.state !== 'running') editCloudToggle.onchange=()=>{$('#editCloudInitFields', $('#formModal')).classList.toggle('d-none',!editCloudToggle.checked);};
     if (metrics) renderVMMetrics(metrics, name);
     startDetailMetrics(`/vms/${encodeURIComponent(name)}/metrics`, m=>renderVMMetrics(m,name));
 

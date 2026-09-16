@@ -21,7 +21,7 @@ sudo ./install.sh --profile virtualization --port 5186
 # or: --profile backup
 ```
 
-With no `--profile`, an interactive install asks which profile to use. `virtualization` includes the backup engine, `docker` installs Docker/Compose without KVM, `virtualization-docker` combines the full virtualization + backup stack with Docker/Compose, and `backup` is a receive-only paired archive node. Add `--certbot` if this host should manage an ACME certificate from the Admin page.
+With no `--profile`, an interactive install asks which profile to use. `virtualization` includes cloud-init seed support and the backup engine, `docker` installs Docker/Compose without KVM, `virtualization-docker` combines cloud-init, virtualization, backups, and Docker/Compose, and `backup` is a receive-only paired archive node. Add `--certbot` if this host should manage an ACME certificate from the Admin page.
 
 ## 3. Connect
 

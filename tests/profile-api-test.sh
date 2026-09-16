@@ -43,7 +43,7 @@ python3 - "$virt" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
 assert x['profile']=='virtualization'
-for cap in ('qemu-kvm','backup','backup-create','vm-network'):
+for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init'):
     assert cap in x['capabilities']
 assert 'docker' not in x['capabilities']
 PY
@@ -54,7 +54,7 @@ python3 - "$combo" <<'PY2'
 import json,sys
 x=json.loads(sys.argv[1])
 assert x['profile']=='virtualization-docker'
-for cap in ('qemu-kvm','backup','backup-create','vm-network','docker','compose','container-terminal'):
+for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init','docker','compose','container-terminal'):
     assert cap in x['capabilities'], cap
 PY2
 
