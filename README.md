@@ -1,6 +1,6 @@
 # LiteVMM 0.6
 
-LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, or backup-receiver profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
+LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, combined virtualization + Docker, or backup-receiver profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
 
 There is no application database, no libvirt dependency, no Python/Node backend, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. Existing `vmapi` command, path, environment-variable, and API identifiers are retained for compatibility.
 
@@ -181,7 +181,8 @@ The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI val
 The LiteVMM API and console are always installed. Choose exactly one workload profile:
 
 - `virtualization` installs QEMU/KVM, VM networking and consoles, GOST overlays, and the backup sender/receiver.
-- `docker` installs Docker/Compose management and container terminals without QEMU/KVM.
+- `docker` installs Docker/Compose management and container terminals without QEMU/KVM or VM backup creation.
+- `virtualization-docker` installs the complete virtualization profile, including VM backups, plus Docker/Compose management.
 - `backup` installs only the paired backup receiver/archive-management surface. It cannot create, restore, migrate, or run VMs and does not install Docker.
 
 On Alpine, Debian, Ubuntu, or a Debian derivative:
@@ -189,10 +190,11 @@ On Alpine, Debian, Ubuntu, or a Debian derivative:
 ```bash
 sudo ./install.sh --profile virtualization --port 5186
 sudo ./install.sh --profile docker --port 5186
+sudo ./install.sh --profile virtualization-docker --port 5186
 sudo ./install.sh --profile backup --port 5186
 ```
 
-Running `sudo ./install.sh` interactively presents the three profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`. Existing `/etc/vmapi/vmapi.conf` storage paths and TLS settings are preserved when the installer is rerun.
+Running `sudo ./install.sh` interactively presents the four profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`. Existing `/etc/vmapi/vmapi.conf` storage paths and TLS settings are preserved when the installer is rerun.
 
 Add `--certbot` to install optional Certbot support. The Admin page can then issue, renew, or disable a certificate. Certificate issuance uses the ACME HTTP-01 standalone challenge on TCP port 80; DNS must resolve to the host and port 80 must be reachable during issuance. Once issued, LiteVMM serves HTTPS on the configured management port.
 

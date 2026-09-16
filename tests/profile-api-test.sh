@@ -48,4 +48,14 @@ for cap in ('qemu-kvm','backup','backup-create','vm-network'):
 assert 'docker' not in x['capabilities']
 PY
 
+
+combo=$(api virtualization-docker /api/ | json_body)
+python3 - "$combo" <<'PY2'
+import json,sys
+x=json.loads(sys.argv[1])
+assert x['profile']=='virtualization-docker'
+for cap in ('qemu-kvm','backup','backup-create','vm-network','docker','compose','container-terminal'):
+    assert cap in x['capabilities'], cap
+PY2
+
 echo 'profile API filtering: PASS'

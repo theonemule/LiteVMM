@@ -59,6 +59,7 @@ capabilities_json() {
   case "$VMAPI_PROFILE" in
     virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage files host-terminal);;
     docker) caps+=(docker compose container-terminal files host-terminal);;
+    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage docker compose container-terminal files host-terminal);;
     backup) caps+=(backup backup-receiver);;
   esac
   printf '['

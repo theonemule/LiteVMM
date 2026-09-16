@@ -32,12 +32,13 @@ INSTALL_CERTBOT=${VMAPI_INSTALL_CERTBOT:-false}
 
 usage() {
   cat <<'TXT'
-Usage: sudo ./install.sh [--profile virtualization|docker|backup] [--port PORT] [--certbot]
+Usage: sudo ./install.sh [--profile virtualization|docker|virtualization-docker|backup] [--port PORT] [--certbot]
 
 The LiteVMM API is always installed. Workload profiles are mutually exclusive:
   virtualization  QEMU/KVM, VM networking/consoles, and VM backups
-  docker          Docker/Compose management and container terminals
-  backup          paired backup receiver and archive management only
+  docker                  Docker/Compose management and container terminals
+  virtualization-docker   QEMU/KVM + backups + Docker/Compose
+  backup                  paired backup receiver and archive management only
 TXT
 }
 valid_port() { [[ ${1:-} =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535)); }
@@ -54,12 +55,12 @@ parse_args() {
 }
 choose_profile() {
   if [[ -z $PROFILE && -t 0 ]]; then
-    printf '%s\n' 'Select LiteVMM installation profile:' '  1) virtualization  QEMU/KVM + backups' '  2) docker          Docker/Compose' '  3) backup          backup receiver only'
+    printf '%s\n' 'Select LiteVMM installation profile:' '  1) virtualization         QEMU/KVM + backups' '  2) docker                 Docker/Compose' '  3) virtualization-docker  QEMU/KVM + backups + Docker/Compose' '  4) backup                 backup receiver only'
     read -r -p 'Profile [1]: ' choice
-    case ${choice:-1} in 1) PROFILE=virtualization;; 2) PROFILE=docker;; 3) PROFILE=backup;; *) die 'Invalid profile selection';; esac
+    case ${choice:-1} in 1) PROFILE=virtualization;; 2) PROFILE=docker;; 3) PROFILE=virtualization-docker;; 4) PROFILE=backup;; *) die 'Invalid profile selection';; esac
   fi
   PROFILE=${PROFILE:-virtualization}
-  [[ $PROFILE == virtualization || $PROFILE == docker || $PROFILE == backup ]] || die "Invalid profile: $PROFILE"
+  [[ $PROFILE == virtualization || $PROFILE == docker || $PROFILE == virtualization-docker || $PROFILE == backup ]] || die "Invalid profile: $PROFILE"
   valid_port "$HTTP_PORT" || die "Invalid management port: $HTTP_PORT (use 1024-65535)"
   [[ $INSTALL_CERTBOT == true || $INSTALL_CERTBOT == false ]] || die 'VMAPI_INSTALL_CERTBOT must be true or false'
 }
@@ -99,6 +100,7 @@ install_packages() {
       case $PROFILE in
         virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd;;
         docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd;;
+        virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd docker docker-openrc docker-cli-compose;;
         backup) :;;
       esac
       if [[ $INSTALL_CERTBOT == true ]]; then apk add --no-cache certbot lighttpd-mod_openssl; fi
@@ -110,6 +112,7 @@ install_packages() {
       case $PROFILE in
         virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd;;
         docker) apt-get install -y --no-install-recommends docker.io ttyd;;
+        virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd;;
         backup) :;;
       esac
       if [[ $INSTALL_CERTBOT == true ]]; then apt-get install -y --no-install-recommends certbot; fi
@@ -209,6 +212,18 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
         ;;
+      virtualization-docker)
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/netctl bridge-create *, /usr/local/bin/netctl bridge-update *, /usr/local/bin/netctl bridge-delete *, /usr/local/bin/netctl vm-tap-up *, /usr/local/bin/netctl vm-tap-down *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/consolectl start *, /usr/local/bin/consolectl info *, /usr/local/bin/consolectl touch *, /usr/local/bin/consolectl stop *, /usr/local/bin/consolectl gc'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/dockerexecctl start *, /usr/local/bin/dockerexecctl info *, /usr/local/bin/dockerexecctl touch *, /usr/local/bin/dockerexecctl stop *, /usr/local/bin/dockerexecctl gc'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/storagectl *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmctl delete *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl migrate *'
+        ;;
       backup)
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list, /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl receive *, /usr/local/bin/vmbackupctl delete *'
         ;;
@@ -243,7 +258,7 @@ configure_alpine() {
     hash=$(openssl passwd -apr1 "$password"); printf '%s:%s\n' "$ADMIN_USER" "$hash" > /etc/lighttpd/vmapi.htpasswd; unset password
   fi
   chmod 0640 /etc/lighttpd/vmapi.htpasswd; chown root:lighttpd /etc/lighttpd/vmapi.htpasswd
-  if [[ $PROFILE == virtualization ]]; then
+  if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then
     novnc_root=''
     for p in /usr/share/novnc /usr/share/webapps/novnc /usr/share/noVNC; do [[ -d $p ]] && { novnc_root=$p; break; }; done
     [[ -n $novnc_root ]] || die 'noVNC web root not found'
@@ -264,6 +279,10 @@ configure_alpine() {
       rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
       for svc in ttyd-vmapi ttyd-host-vmapi; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
       rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart;;
+    virtualization-docker)
+      rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
+      for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+      rc-service websockify-vmapi restart; rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
     backup) :;;
   esac
 }
@@ -271,7 +290,7 @@ configure_alpine() {
 configure_debian() {
   install -m 0644 "$BASE/systemd/fcgiwrap-vmapi.socket" /etc/systemd/system/fcgiwrap-vmapi.socket
   install -m 0644 "$BASE/systemd/fcgiwrap-vmapi.service" /etc/systemd/system/fcgiwrap-vmapi.service
-  case $PROFILE in virtualization) sed -i 's/^SupplementaryGroups=.*/SupplementaryGroups=kvm/' /etc/systemd/system/fcgiwrap-vmapi.service;; docker) sed -i 's/^SupplementaryGroups=.*/SupplementaryGroups=docker/' /etc/systemd/system/fcgiwrap-vmapi.service;; backup) sed -i 's/^SupplementaryGroups=.*/SupplementaryGroups=/' /etc/systemd/system/fcgiwrap-vmapi.service;; esac
+  case $PROFILE in virtualization) sed -i 's/^SupplementaryGroups=.*/SupplementaryGroups=kvm/' /etc/systemd/system/fcgiwrap-vmapi.service;; docker) sed -i 's/^SupplementaryGroups=.*/SupplementaryGroups=docker/' /etc/systemd/system/fcgiwrap-vmapi.service;; virtualization-docker) sed -i 's/^SupplementaryGroups=.*/SupplementaryGroups=kvm docker/' /etc/systemd/system/fcgiwrap-vmapi.service;; backup) sed -i 's/^SupplementaryGroups=.*/SupplementaryGroups=/' /etc/systemd/system/fcgiwrap-vmapi.service;; esac
   install -m 0644 "$BASE/systemd/vmapi-autostart.service" /etc/systemd/system/vmapi-autostart.service
   install -m 0644 "$BASE/systemd/vmapi-overlay.service" /etc/systemd/system/vmapi-overlay.service
   install -m 0644 "$BASE/systemd/vmapi-network.service" /etc/systemd/system/vmapi-network.service
@@ -291,6 +310,7 @@ configure_debian() {
   case $PROFILE in
     virtualization) systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service; systemctl enable --now ttyd-host-vmapi.service;;
     docker) systemctl enable --now docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
+    virtualization-docker) systemctl enable --now docker.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
     backup) :;;
   esac
   nginx -t && systemctl reload nginx
@@ -298,7 +318,7 @@ configure_debian() {
 
 finalize() {
   /usr/local/bin/peerctl sync-auth
-  if [[ $PROFILE == virtualization ]]; then
+  if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then
     /usr/local/bin/overlayctl migrate-config
     case $PLATFORM in
       alpine) /usr/local/bin/overlayctl render; rc-service vmapi-overlay restart;;
@@ -330,20 +350,21 @@ ensure_admin_user
 install_packages
 getent group vmapi-admin >/dev/null || groupadd --system vmapi-admin
 getent group vmapi >/dev/null || groupadd --system vmapi
-case $PROFILE in virtualization) getent group kvm >/dev/null || groupadd --system kvm;; docker) getent group docker >/dev/null || groupadd --system docker;; esac
+case $PROFILE in virtualization) getent group kvm >/dev/null || groupadd --system kvm;; docker) getent group docker >/dev/null || groupadd --system docker;; virtualization-docker) getent group kvm >/dev/null || groupadd --system kvm; getent group docker >/dev/null || groupadd --system docker;; esac
 id vmapi >/dev/null 2>&1 || useradd --system --gid vmapi --home-dir /var/lib/vmapi --create-home --shell "$( [[ $PLATFORM == alpine ]] && echo /sbin/nologin || echo /usr/sbin/nologin )" vmapi
 for stale_group in kvm qemu docker; do getent group "$stale_group" >/dev/null 2>&1 && gpasswd -d vmapi "$stale_group" >/dev/null 2>&1 || true; done
 case $PROFILE in
   virtualization) usermod -aG kvm vmapi; getent group qemu >/dev/null && usermod -aG qemu vmapi;;
   docker) usermod -aG docker vmapi;;
+  virtualization-docker) usermod -aG kvm,docker vmapi; getent group qemu >/dev/null && usermod -aG qemu vmapi;;
 esac
 [[ -z $ADMIN_USER ]] || usermod -aG vmapi-admin "$ADMIN_USER"
-if [[ $PROFILE == virtualization ]]; then ensure_tun; install_gost; fi
+if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then ensure_tun; install_gost; fi
 install_common_files
 write_sudoers
 case $PLATFORM in alpine) configure_alpine;; debian) configure_debian;; esac
 finalize
 if [[ $(awk -F= '$1=="VMAPI_TLS_ENABLED"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == true ]]; then /usr/local/bin/certctl apply; fi
-[[ $PROFILE == virtualization ]] && report_nested_hyperv_requirement || true
+[[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]] && report_nested_hyperv_requirement || true
 scheme=http; [[ $(awk -F= '$1=="VMAPI_TLS_ENABLED"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == true ]] && scheme=https
 echo "LiteVMM $PROFILE profile installed on $PLATFORM. Open $scheme://HOST:$HTTP_PORT/."

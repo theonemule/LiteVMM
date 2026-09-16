@@ -10,15 +10,15 @@ VMAPI_PROFILE=${VMAPI_PROFILE:-virtualization}
 VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
 VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
 
-valid_vmapi_profile() { [[ ${1:-} == virtualization || ${1:-} == docker || ${1:-} == backup ]]; }
+valid_vmapi_profile() { [[ ${1:-} == virtualization || ${1:-} == docker || ${1:-} == virtualization-docker || ${1:-} == backup ]]; }
 vmapi_has_capability() {
   local cap=${1:-}
   case "$cap" in
     api|system|metrics|cluster|admin) return 0;;
-    backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == backup ]];;
-    backup-create|qemu-kvm|vm-network|vm-console|storage) [[ $VMAPI_PROFILE == virtualization ]];;
-    docker|compose|container-terminal) [[ $VMAPI_PROFILE == docker ]];;
-    files|host-terminal) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker ]];;
+    backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ]];;
+    backup-create|qemu-kvm|vm-network|vm-console|storage) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker ]];;
+    docker|compose|container-terminal) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
+    files|host-terminal) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     *) return 1;;
   esac
 }
