@@ -6,6 +6,23 @@ set -Eeuo pipefail
 VMAPI_CONFIG=${VMAPI_CONFIG:-/etc/vmapi/vmapi.conf}
 [[ -r "$VMAPI_CONFIG" ]] && source "$VMAPI_CONFIG"
 
+VMAPI_PROFILE=${VMAPI_PROFILE:-virtualization}
+VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
+VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
+
+valid_vmapi_profile() { [[ ${1:-} == virtualization || ${1:-} == docker || ${1:-} == backup ]]; }
+vmapi_has_capability() {
+  local cap=${1:-}
+  case "$cap" in
+    api|system|metrics|cluster|admin) return 0;;
+    backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == backup ]];;
+    backup-create|qemu-kvm|vm-network|vm-console|storage) [[ $VMAPI_PROFILE == virtualization ]];;
+    docker|compose|container-terminal) [[ $VMAPI_PROFILE == docker ]];;
+    files|host-terminal) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker ]];;
+    *) return 1;;
+  esac
+}
+
 # VM_ROOT contains only VM configuration, firmware state, and transient runtime
 # sockets.  Virtual disks are deliberately kept on a separate filesystem tree so
 # they can be placed on storage with different performance or retention needs.

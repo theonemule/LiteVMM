@@ -7,6 +7,7 @@
   const state = {
     route: 'dashboard',
     service: null,
+    activeService: null,
     cache: {},
     busy: false,
     pollers: { dashboard: null, detail: null },
@@ -47,6 +48,14 @@
 
   const validNodeId = id => /^[a-f0-9]{32}$/i.test(String(id || ''));
   const usablePeer = peer => Boolean(peer?.url && peer?.api_auth === 'basic' && validNodeId(peer.node_id));
+  const hasCap = cap => Boolean((state.activeService || state.service)?.capabilities?.includes(cap));
+  const routeCapability = route => ({vms:'qemu-kvm',networks:'qemu-kvm',containers:'docker',compose:'docker',backups:'backup'}[route] || '');
+  const routeAllowed = route => !routeCapability(route) || hasCap(routeCapability(route));
+  function updateCapabilityUI() {
+    $$('[data-capability]').forEach(el=>el.classList.toggle('d-none',!hasCap(el.dataset.capability)));
+    const profile=(state.activeService||state.service)?.profile||'unknown';
+    const subtitle=$('#brandSubtitle'); if(subtitle) subtitle.textContent=profile==='virtualization'?'Virtualization platform':profile==='docker'?'Docker platform':profile==='backup'?'Backup receiver':'Minimal infrastructure';
+  }
   const abbreviatedNodeId = id => `${String(id || '').slice(0,12)}…`;
   const hostRouteHash = (route, peerId = '') => {
     const targetRoute = route === 'cluster' && peerId ? 'dashboard' : (routes[route] ? route : 'dashboard');
@@ -364,20 +373,20 @@
 
   async function loadDashboard() {
     const results = await Promise.allSettled([
-      request('/vms'), request('/docker/containers'), request('/images'), request('/docker/images'), request('/docker/networks'), request('/docker/volumes'), request('/metrics'), request('/system')
+      request('/vms'), request('/docker/containers'), request('/images'), request('/docker/images'), request('/docker/networks'), request('/docker/volumes'), request('/metrics'), request('/system'), request('/backups')
     ]);
     const val = i => results[i].status === 'fulfilled' ? results[i].value : [];
     state.cache.vms = val(0); state.cache.containers = val(1); state.cache.vmImages = val(2); state.cache.dockerImages = val(3); state.cache.dockerNetworks = val(4); state.cache.volumes = val(5);
     state.cache.hostMetrics = results[6].status === 'fulfilled' ? results[6].value : null;
     state.cache.systemInfo = results[7].status === 'fulfilled' ? results[7].value : null;
+    state.cache.backups = results[8].status === 'fulfilled' ? results[8].value : [];
     const runningVMs = state.cache.vms.filter(v => v.state === 'running').length;
     const runningContainers = state.cache.containers.filter(c => String(c.State || c.state || '').toLowerCase() === 'running').length;
     $('#view').innerHTML = `
       <div class="row g-3 mb-4">
-        ${metric('Virtual machines', state.cache.vms.length, `${runningVMs} running`)}
-        ${metric('Containers', state.cache.containers.length, `${runningContainers} running`)}
-        ${metric('VM images', state.cache.vmImages.length, 'shared install media')}
-        ${metric('Docker images', state.cache.dockerImages.length, 'daemon inventory')}
+        ${hasCap('qemu-kvm') ? `${metric('Virtual machines', state.cache.vms.length, `${runningVMs} running`)}${metric('VM images', state.cache.vmImages.length, 'shared install media')}${metric('Backups', state.cache.backups.length, 'local archives')}${metric('Profile', 'Virtualization', 'QEMU/KVM + backups')}` : ''}
+        ${hasCap('docker') ? `${metric('Containers', state.cache.containers.length, `${runningContainers} running`)}${metric('Docker images', state.cache.dockerImages.length, 'daemon inventory')}${metric('Docker networks', state.cache.dockerNetworks.length, 'daemon networks')}${metric('Volumes', state.cache.volumes.length, 'persistent volumes')}` : ''}
+        ${hasCap('backup-receiver') ? `${metric('Received backups', state.cache.backups.length, 'stored archives')}${metric('Paired hosts', state.hostCatalog.peers.length, 'trusted senders')}${metric('Profile', 'Backup', 'receiver-only node')}${metric('API port', (state.activeService||state.service)?.port||'', (state.activeService||state.service)?.tls_enabled?'HTTPS':'HTTP')}` : ''}
       </div>
       ${state.cache.hostMetrics?.virtualization?.kvm_available === false ? '<div id="kvmWarning" class="alert alert-warning mb-4"><strong>KVM acceleration is unavailable.</strong> New VMs will not start in slow software emulation unless you explicitly opt in. Expose <span class="mono">/dev/kvm</span> to this host for nested VM performance.</div>' : ''}
       <div class="mb-4">${card('Host resources', meterRow('host',[
@@ -387,11 +396,11 @@
         <div class="col-xl-7">${card('Compute', computeSummary())}</div>
         <div class="col-xl-5">${card('Platform', platformSummary())}</div>
       </div>
-      <div class="mt-4">${card('Host diagnostics', `<div class="d-flex flex-column flex-sm-row align-items-sm-center justify-content-between gap-3"><div><div class="fw-semibold">Administrative tools</div><div class="small text-secondary">Open a host shell, browse host files, or review service logs.</div></div><div class="d-flex flex-wrap gap-2"><button class="btn btn-primary" id="overviewHostTerminalBtn">Launch host terminal</button><button class="btn btn-outline-primary" id="overviewFileBrowserBtn">File browser</button><button class="btn btn-outline-secondary" id="overviewLogsBtn">View service logs</button></div></div>`)}</div>`;
+      <div class="mt-4">${card('Host diagnostics', `<div class="d-flex flex-column flex-sm-row align-items-sm-center justify-content-between gap-3"><div><div class="fw-semibold">Administrative tools</div><div class="small text-secondary">Review the tools enabled by this installation profile.</div></div><div class="d-flex flex-wrap gap-2">${hasCap('host-terminal')?'<button class="btn btn-primary" id="overviewHostTerminalBtn">Launch host terminal</button>':''}${hasCap('files')?'<button class="btn btn-outline-primary" id="overviewFileBrowserBtn">File browser</button>':''}<button class="btn btn-outline-secondary" id="overviewLogsBtn">View service logs</button></div></div>`)}</div>`;
     if (state.cache.hostMetrics) renderHostMetrics(state.cache.hostMetrics);
     startDashboardMetrics();
-    $('#overviewHostTerminalBtn').onclick=openHostTerminal;
-    $('#overviewFileBrowserBtn').onclick=()=>window.open('/files.html','vmapi-file-browser','noopener');
+    $('#overviewHostTerminalBtn')?.addEventListener('click',openHostTerminal);
+    $('#overviewFileBrowserBtn')?.addEventListener('click',()=>window.open('/files.html','vmapi-file-browser','noopener'));
     $('#overviewLogsBtn').onclick=openHostLogs;
   }
 
@@ -915,7 +924,7 @@
     const [identity, peers, pending] = await Promise.all([request('/cluster/identity',local), request('/cluster/peers',local), request('/cluster/pair/pending',local).catch(()=>null)]);
     state.hostCatalog = buildHostCatalog(identity, peers);
     renderHostSelector();
-    const rows = (peers || []).map(p => `<tr><td class="mono">${esc(p.name || '')}</td><td class="mono small">${esc(p.node_id || '')}</td><td><div class="mono small">${esc(p.url || 'Not configured')}</div><div class="small text-secondary">${esc(p.api_auth || 'basic')} · ${esc((p.public_key_fingerprint || '').slice(0,16))}…</div></td><td><div class="action-row"><button class="btn btn-sm btn-outline-primary" data-peer-manage="${esc(p.node_id || '')}">Manage</button><button class="btn btn-sm btn-outline-secondary" data-peer-url="${esc(p.node_id || '')}" data-peer-name="${esc(p.name || '')}" data-peer-current-url="${esc(p.url || '')}">Endpoint</button><button class="btn btn-sm btn-outline-secondary" data-peer-relay="${esc(p.node_id || '')}" data-peer-name="${esc(p.name || '')}">Relay</button><button class="btn btn-sm btn-outline-danger" data-peer-revoke="${esc(p.node_id || '')}">Revoke</button></div></td></tr>`);
+    const rows = (peers || []).map(p => `<tr><td class="mono">${esc(p.name || '')}</td><td class="mono small">${esc(p.node_id || '')}</td><td><div class="mono small">${esc(p.url || 'Not configured')}</div><div class="small text-secondary">${esc(p.api_auth || 'basic')} · ${esc((p.public_key_fingerprint || '').slice(0,16))}…</div></td><td><div class="action-row"><button class="btn btn-sm btn-outline-primary" data-peer-manage="${esc(p.node_id || '')}">Manage</button><button class="btn btn-sm btn-outline-secondary" data-peer-url="${esc(p.node_id || '')}" data-peer-name="${esc(p.name || '')}" data-peer-current-url="${esc(p.url || '')}">Endpoint</button>${hasCap('vm-network')?`<button class="btn btn-sm btn-outline-secondary" data-peer-relay="${esc(p.node_id || '')}" data-peer-name="${esc(p.name || '')}">Relay</button>`:''}<button class="btn btn-sm btn-outline-danger" data-peer-revoke="${esc(p.node_id || '')}">Revoke</button></div></td></tr>`);
     $('#view').innerHTML = card('Cluster peers', `<div class="small text-secondary mb-3">This node: <span class="mono">${esc(identity.name || '')}</span> · <span class="mono">${esc(identity.node_id || '')}</span>. Complete the pairing request and response exchange first. Each pair receives one HTTP Basic credential used for peer API requests and hub WebSocket upgrades.</div><div id="clusterFeedback" class="mb-3" aria-live="polite"></div><div id="clusterExportResult" class="mb-3"></div><div id="clusterResponseResult" class="mb-3"></div>${table(['Peer','Node ID','API endpoint / key',''], rows, 'No trusted peers.')}`, `<button class="btn btn-sm btn-primary" id="peerRequestBtn">Export pairing request</button><button class="btn btn-sm btn-outline-secondary ms-2" id="peerAcceptBtn">Import pairing request</button><button class="btn btn-sm btn-outline-secondary ms-2" id="peerCompleteBtn">Import pairing response</button>`);
     const detectedEndpoint=`${location.protocol}//${location.host}`;
     $('#peerRequestBtn').onclick=()=>modal({eyebrow:'Cluster trust',title:'Export pairing request',submitText:'Create request',size:'sm',body:`<form id="peerRequestForm"><label class="form-label">This host's pairing name</label><input name="name" class="form-control mono mb-2" value="${esc(identity.name||'')}" required maxlength="64" autofocus><div class="form-text mb-3">Detected from this host. Change it if you want the pairing credential to use a different label.</div><label class="form-label">This host's API endpoint</label><input name="endpoint" type="url" class="form-control mono" value="${esc(detectedEndpoint)}" required><div class="form-text">Detected from this browser URL. This signed endpoint lets the peer authenticate API calls after pairing.</div></form>`,onSubmit:async(el,m)=>{const form=new FormData($('#peerRequestForm',el));const bundle=await request('/cluster/pair/request',{method:'POST',form:{name:form.get('name'),endpoint:form.get('endpoint')},local:true});m.hide();setClusterFeedback('success','Pairing request created. Copy or download the credential below, then import it on the other host.');showClusterExport(bundle);}});
@@ -998,6 +1007,14 @@
   }
 
   async function loadBackups() {
+    if (!hasCap('backup-create')) {
+      const [backups, peers] = await Promise.all([request('/backups'), request('/cluster/peers')]);
+      const rows=(backups||[]).map(b=>`<tr><td class="mono">${esc(b.vm)}</td><td class="mono">${esc(b.archive)}</td><td>${bytes(b.bytes)}</td><td>${esc(b.modified||'')}</td><td><div class="action-row"><button class="btn btn-sm btn-outline-secondary" data-backup-download="${esc(b.vm)}" data-backup-archive="${esc(b.archive)}">Download</button><button class="btn btn-sm btn-outline-danger" data-backup-delete="${esc(b.vm)}" data-backup-archive="${esc(b.archive)}">Delete</button></div></td></tr>`);
+      $('#view').innerHTML=`<div class="mb-3 alert alert-info"><strong>Backup receiver profile.</strong> This node accepts archives from authenticated paired LiteVMM hosts. It does not create, restore, or run virtual machines.</div>${card('Received backups',table(['VM','Archive','Size','Modified',''],rows,'No backups have been received yet.'),`<span class="small text-secondary">${(peers||[]).length} paired host${(peers||[]).length===1?'':'s'}</span>`)}`;
+      $$('[data-backup-download]').forEach(b=>b.onclick=()=>downloadFile(`/backups/${encodeURIComponent(b.dataset.backupDownload)}/${encodeURIComponent(b.dataset.backupArchive)}`));
+      $$('[data-backup-delete]').forEach(b=>b.onclick=()=>confirmAction('Delete backup',`Delete ${b.dataset.backupArchive}?`,async()=>{await request(`/backups/${encodeURIComponent(b.dataset.backupDelete)}/${encodeURIComponent(b.dataset.backupArchive)}`,{method:'DELETE'});await loadBackups();}));
+      return;
+    }
     const [backups, schedules, vms, peers] = await Promise.all([request('/backups'), request('/backups/schedules'), request('/vms'), request('/cluster/peers')]);
     state.cache.backupPeers=(peers||[]).filter(usablePeer);
     const vmOptions = vms.map(vm=>`<option value="${esc(vm.name)}">${esc(vm.name)} (${esc(vm.state)})</option>`).join('');
@@ -1058,9 +1075,22 @@
     const form=$('#scheduleForm', $('#formModal')); const frequency=$('select[name="frequency"]',form); const sync=()=>{const custom=frequency.value==='custom';$('#scheduleWeekday',form).classList.toggle('d-none',frequency.value!=='weekly');$('#scheduleMonthday',form).classList.toggle('d-none',frequency.value!=='monthly');$('#scheduleCustom',form).classList.toggle('d-none',!custom);$('input[name="time"]',form).disabled=custom;}; frequency.onchange=sync; sync();
   }
 
+  async function loadAdmin() {
+    const status=await request('/admin');
+    const svc=state.activeService||state.service||{};
+    const tls=status.tls_enabled===true;
+    const certActions=status.certbot_available ? `<div class="d-flex flex-wrap gap-2"><button id="configureCertBtn" class="btn btn-primary">${tls?'Replace certificate':'Configure Certbot'}</button>${tls?'<button id="renewCertBtn" class="btn btn-outline-primary">Renew certificate</button><button id="disableTlsBtn" class="btn btn-outline-danger">Disable HTTPS</button>':''}</div>` : '<div class="alert alert-warning mb-0">Certbot is not installed on this host. Re-run <span class="mono">install.sh --certbot</span> to enable certificate management. Containerized backup receivers normally terminate TLS at a reverse proxy.</div>';
+    $('#view').innerHTML=`<div class="row g-3 mb-3"><div class="col-xl-6">${card('Installation',systemDl([['Profile',svc.profile||status.profile],['API version',svc.version],['Management port',svc.port||status.port],['Transport',tls?'HTTPS':'HTTP'],['Capabilities',(svc.capabilities||[]).join(', ')]]))}</div><div class="col-xl-6">${card('TLS certificate',systemDl([['Certbot',status.certbot_available?'Installed':'Not installed'],['Enabled',tls?'Yes':'No'],['Domain',status.domain||''],['Expires',status.expires||''],['Certificate',status.certificate||'',true]]))}</div></div>${card('Certificate management',`<div class="small text-secondary mb-3">Certbot uses the HTTP-01 standalone challenge on TCP port 80. DNS for the requested name must resolve to this host and port 80 must be reachable while a certificate is issued or renewed.</div>${certActions}`)}`;
+    $('#configureCertBtn')?.addEventListener('click',()=>modal({eyebrow:'Administration',title:'Configure Certbot certificate',submitText:'Issue certificate',body:`<form id="certForm"><label class="form-label">DNS name</label><input name="domain" class="form-control mono mb-3" value="${esc(status.domain||'')}" placeholder="litevmm.example.com" required><label class="form-label">ACME email</label><input name="email" type="email" class="form-control" required><div class="form-text mt-3">Successful issuance switches the configured LiteVMM management port to HTTPS using the new certificate.</div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#certForm',el));await request('/admin/certificates',{method:'POST',form:{domain:fd.get('domain'),email:fd.get('email')}});m.hide();toast('Certificate configured. Reload using HTTPS if the browser connection changes.');await loadAdmin();}}));
+    $('#renewCertBtn')?.addEventListener('click',async()=>{await request('/admin/certificates/renew',{method:'POST',form:{}});toast('Certificate renewal completed');await loadAdmin();});
+    $('#disableTlsBtn')?.addEventListener('click',()=>confirmAction('Disable HTTPS','Return the LiteVMM management endpoint to HTTP?',async()=>{await request('/admin/certificates',{method:'DELETE'});toast('HTTPS disabled');await loadAdmin();},false));
+  }
+
   const routes = {
     dashboard: {title:'Overview', eyebrow:'LiteVMM', load:loadDashboard},
     system: {title:'System information', eyebrow:'Host diagnostics', load:loadSystemInfo},
+    backups: {title:'Backups', eyebrow:'Archive management', load:loadBackups},
+    admin: {title:'Administration', eyebrow:'LiteVMM configuration', load:loadAdmin},
     vms: {title:'Virtual machines', eyebrow:'QEMU / KVM', load:loadVMs},
     containers: {title:'Containers', eyebrow:'Docker', load:loadContainers},
     compose: {title:'Compose', eyebrow:'Docker', load:loadCompose},
@@ -1078,6 +1108,9 @@
     state.route = routeName;
     if (!routes[state.route]) state.route='dashboard';
     if (state.route === 'cluster') state.remotePeerId='';
+    try { state.activeService=state.remotePeerId ? await request('/') : state.service; } catch { state.activeService=state.service; }
+    updateCapabilityUI();
+    if (!routeAllowed(state.route)) state.route='dashboard';
     const r=routes[state.route];
     $('#pageTitle').textContent=state.remotePeerId ? `Remote host · ${r.title}` : r.title;
     $('#pageEyebrow').textContent=state.remotePeerId ? `Paired node ${state.remotePeerId.slice(0,12)}…` : r.eyebrow;
@@ -1095,7 +1128,7 @@
     $('#hostSelector').onchange=event=>{ location.hash=hostRouteHash(state.route, event.target.value); };
     window.addEventListener('hashchange',renderRoute);
     $('#formModal').addEventListener('hidden.bs.modal',()=>stopPoller('detail'));
-    try { state.service=await request('/'); setConnection(true,state.service?.user); }
+    try { state.service=await request('/'); state.activeService=state.service; updateCapabilityUI(); setConnection(true,state.service?.user); }
     catch(e){ setConnection(false); }
     await loadHostCatalog();
     await renderRoute();

@@ -1,6 +1,6 @@
-# LiteVMM 0.5
+# LiteVMM 0.6
 
-LiteVMM is a deliberately minimalist QEMU/KVM hypervisor console with optional Docker management. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
+LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, or backup-receiver profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
 
 There is no application database, no libvirt dependency, no Python/Node backend, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. Existing `vmapi` command, path, environment-variable, and API identifiers are retained for compatibility.
 
@@ -34,7 +34,7 @@ The CGI layer does not reimplement lifecycle logic. It invokes the same shell AP
 VMAPI includes a static single-page console at the HTTP root:
 
 ```text
-http://127.0.0.1:8080/
+http://127.0.0.1:5186/
 ```
 
 The console covers:
@@ -65,13 +65,13 @@ Because HTTP Basic credentials are only encoded, not encrypted, keep the default
 Run the black-box regression suite from any Linux machine with `bash`, `curl`, and `python3`. It authenticates exactly like the portal, exercises the public HTTP API, validates every response, creates uniquely named VMAPI/Docker/Compose/file fixtures, and removes them when it exits.
 
 ```bash
-./tests/api-regression-curl.sh http://10.0.4.62:8080 alice
+./tests/api-regression-curl.sh http://10.0.4.62:5186 alice
 ```
 
 On an installed VMAPI host, the same non-root command is available globally:
 
 ```bash
-vmapi-api-regression http://10.0.4.62:8080 alice
+vmapi-api-regression http://10.0.4.62:5186 alice
 ```
 
 The script prompts for the portal password without echoing it. For CI, provide it through `VMAPI_PASSWORD`:
@@ -94,8 +94,8 @@ before removing every test resource.
 ```bash
 HUB_PASSWORD='...' SPOKE_PASSWORD='...' \
   ./tests/overlay-pair-curl.sh \
-  http://hub.example:8080 hub-user \
-  http://spoke.example:8080 spoke-use
+  http://hub.example:5186 hub-user \
+  http://spoke.example:5186 spoke-use
 ```
 
 The installed command is `vmapi-overlay-pair-test` and accepts the same fou
@@ -108,8 +108,8 @@ peer API, run:
 ```bash
 SOURCE_PASSWORD='...' DESTINATION_PASSWORD='...' \
   vmapi-backup-pair-test \
-  http://source.example:8080 source-user \
-  http://destination.example:8080 destination-use
+  http://source.example:5186 source-user \
+  http://destination.example:5186 destination-use
 ```
 
 The test creates a disposable stopped VM, confirms that a peer-targeted backup
@@ -176,17 +176,43 @@ itself is always rejected.
 
 The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI validates a project with `docker compose config`, stores it at `/var/lib/vmapi/compose/PROJECT/compose.yaml`, and deploys it with `docker compose -p PROJECT up -d --remove-orphans`. Projects can be reviewed, deployed again, stopped with `down`, or deleted from the UI. Compose files can define the full Docker Compose surface, including images, networks, volumes, ports, environment values, and bind mounts, so only trusted administrators should deploy them.
 
-## Installation
+## Installation profiles
 
-On Alpine, Debian, Ubuntu, or a Debian derivative, use the same command:
+The LiteVMM API and console are always installed. Choose exactly one workload profile:
+
+- `virtualization` installs QEMU/KVM, VM networking and consoles, GOST overlays, and the backup sender/receiver.
+- `docker` installs Docker/Compose management and container terminals without QEMU/KVM.
+- `backup` installs only the paired backup receiver/archive-management surface. It cannot create, restore, migrate, or run VMs and does not install Docker.
+
+On Alpine, Debian, Ubuntu, or a Debian derivative:
 
 ```bash
-sudo ./install.sh
+sudo ./install.sh --profile virtualization --port 5186
+sudo ./install.sh --profile docker --port 5186
+sudo ./install.sh --profile backup --port 5186
 ```
 
-The installer detects the platform, installs all required packages (including CA certificates, QEMU/KVM, Docker, GOST v3, the web server, and service manager integration), configures web authentication, migrates overlay definitions, and starts VMAPI. It uses the account that invoked `sudo` as the local administrator. On a new Alpine install it securely prompts for the HTTP Basic password; set `VMAPI_HTTP_USER` and `VMAPI_HTTP_PASSWORD` only for a noninteractive installation.
+Running `sudo ./install.sh` interactively presents the three profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`. Existing `/etc/vmapi/vmapi.conf` storage paths and TLS settings are preserved when the installer is rerun.
 
-Debian uses Nginx on `127.0.0.1:8080`; use an SSH tunnel while experimenting. Alpine uses Lighttpd on port 8080 and is the supported authenticated GOST overlay hub.
+Add `--certbot` to install optional Certbot support. The Admin page can then issue, renew, or disable a certificate. Certificate issuance uses the ACME HTTP-01 standalone challenge on TCP port 80; DNS must resolve to the host and port 80 must be reachable during issuance. Once issued, LiteVMM serves HTTPS on the configured management port.
+
+Debian uses Nginx on `127.0.0.1:5186` by default, so an SSH tunnel remains useful during testing. Alpine uses Lighttpd on the configured management port.
+
+### Containerized backup receiver
+
+The repository root `Dockerfile` builds the backup-only profile. It persists pairing identity, peer state, and archives under `/var/lib/vmapi` and exposes port `5186` by default:
+
+```bash
+docker build -t litevmm-backup .
+docker run -d --name litevmm-backup \
+  -p 5186:5186 \
+  -e VMAPI_HTTP_USER=admin \
+  -e VMAPI_HTTP_PASSWORD='choose-a-strong-password' \
+  -v litevmm-backup-data:/var/lib/vmapi \
+  litevmm-backup
+```
+
+The container is intended to sit behind an HTTPS reverse proxy. Certbot management is therefore reported as unavailable inside the backup image rather than installing an ACME client into the container.
 
 ### Deploy to Alpine hosts from Windows
 
@@ -597,15 +623,15 @@ Example:
 curl -u alice -X POST \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   --data 'name=web&image=nginx:latest&restart=unless-stopped&cpus=2&memory=1g&publish_0=8080:80' \
-  http://127.0.0.1:8080/api/docker/containers
+  http://127.0.0.1:5186/api/docker/containers
 
 curl -u alice -X POST \
-  http://127.0.0.1:8080/api/docker/containers/web/start
+  http://127.0.0.1:5186/api/docker/containers/web/start
 
 curl -u alice -X PATCH \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   --data 'field=memory&value=2g' \
-  http://127.0.0.1:8080/api/docker/containers/web
+  http://127.0.0.1:5186/api/docker/containers/web
 ```
 
 ### Docker image endpoints

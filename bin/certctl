@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Manage optional Certbot certificates for the LiteVMM management endpoint.
+set -Eeuo pipefail
+VMAPI_CONFIG=${VMAPI_CONFIG:-/etc/vmapi/vmapi.conf}
+[[ -r "$VMAPI_CONFIG" ]] && source "$VMAPI_CONFIG"
+VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
+VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
+VMAPI_TLS_DOMAIN=${VMAPI_TLS_DOMAIN:-}
+VMAPI_TLS_CERT_FILE=${VMAPI_TLS_CERT_FILE:-}
+VMAPI_TLS_KEY_FILE=${VMAPI_TLS_KEY_FILE:-}
+
+die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+json_escape(){ local s=${1-}; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; printf '%s' "$s"; }
+valid_domain(){ [[ ${1:-} =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ && ${1:-} == *.* ]] || die 'Invalid DNS name'; }
+valid_email(){ [[ ${1:-} =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Invalid email address'; }
+require_root(){ [[ $EUID -eq 0 ]] || die 'Certificate changes require root privileges'; }
+set_config(){
+  local key=$1 value=${2-} tmp
+  [[ $key =~ ^VMAPI_[A-Z0-9_]+$ ]] || die 'Invalid configuration key'
+  tmp=$(mktemp)
+  if [[ -r $VMAPI_CONFIG ]]; then
+    awk -v k="$key" -v v="$value" 'BEGIN{done=0} index($0,k"=")==1 {if(!done){print k"="v;done=1};next} {print} END{if(!done)print k"="v}' "$VMAPI_CONFIG" > "$tmp"
+  else
+    printf '%s=%s\n' "$key" "$value" > "$tmp"
+  fi
+  install -m 0644 "$tmp" "$VMAPI_CONFIG"; rm -f "$tmp"
+}
+detect_platform(){
+  if command -v nginx >/dev/null 2>&1 && [[ -f /etc/nginx/sites-available/vmapi ]]; then printf debian
+  elif command -v lighttpd >/dev/null 2>&1; then printf alpine
+  else printf unsupported; fi
+}
+rewrite_nginx(){
+  local file=/etc/nginx/sites-available/vmapi tmp ssl=''
+  [[ -f $file ]] || die 'LiteVMM Nginx configuration is missing'
+  [[ $VMAPI_TLS_ENABLED == true ]] && ssl=' ssl'
+  sed -i -E "s|listen 127\\.0\\.0\\.1:[0-9]+( ssl)?;|listen 127.0.0.1:${VMAPI_HTTP_PORT}${ssl};|" "$file"
+  tmp=$(mktemp)
+  awk -v enabled="$VMAPI_TLS_ENABLED" -v cert="$VMAPI_TLS_CERT_FILE" -v key="$VMAPI_TLS_KEY_FILE" '
+    /# VMAPI TLS BEGIN/ {skip=1; next}
+    /# VMAPI TLS END/ {skip=0; next}
+    skip {next}
+    {print}
+    /server_name _;/ && enabled=="true" {
+      print "    # VMAPI TLS BEGIN"
+      print "    ssl_certificate " cert ";"
+      print "    ssl_certificate_key " key ";"
+      print "    ssl_protocols TLSv1.2 TLSv1.3;"
+      print "    # VMAPI TLS END"
+    }
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"; rm -f "$tmp"
+  nginx -t >/dev/null
+  if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx; fi
+}
+rewrite_lighttpd(){
+  local conf=/etc/lighttpd/conf.d/vmapi-tls.conf pem=/etc/lighttpd/vmapi-tls.pem
+  if [[ $VMAPI_TLS_ENABLED == true ]]; then
+    [[ -r $VMAPI_TLS_CERT_FILE && -r $VMAPI_TLS_KEY_FILE ]] || die 'Certificate files are missing'
+    cat "$VMAPI_TLS_KEY_FILE" "$VMAPI_TLS_CERT_FILE" > "$pem"; chmod 0600 "$pem"
+    cat > "$conf" <<CFG
+server.modules += ( "mod_openssl" )
+ssl.engine = "enable"
+ssl.pemfile = "$pem"
+CFG
+  else
+    rm -f "$conf" "$pem"
+  fi
+  lighttpd -tt -f /etc/lighttpd/lighttpd.conf >/dev/null
+  if command -v rc-service >/dev/null 2>&1; then rc-service lighttpd restart >/dev/null; fi
+}
+apply_web_tls(){
+  case $(detect_platform) in debian) rewrite_nginx;; alpine) rewrite_lighttpd;; *) die 'No supported LiteVMM web server was detected';; esac
+}
+status(){
+  local available=false expiry='' platform
+  command -v certbot >/dev/null 2>&1 && available=true
+  if [[ -n $VMAPI_TLS_CERT_FILE && -r $VMAPI_TLS_CERT_FILE ]]; then expiry=$(openssl x509 -in "$VMAPI_TLS_CERT_FILE" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || true); fi
+  platform=$(detect_platform)
+  printf '{"profile":"%s","port":%s,"certbot_available":%s,"tls_enabled":%s,"domain":"%s","certificate":"%s","private_key":"%s","expires":"%s","platform":"%s"}\n' \
+    "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$available" "$VMAPI_TLS_ENABLED" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$expiry")" "$platform"
+}
+issue(){
+  require_root; local domain=${1:?domain required} email=${2:?email required}; valid_domain "$domain"; valid_email "$email"
+  command -v certbot >/dev/null 2>&1 || die 'Certbot is not installed. Re-run install.sh with --certbot.'
+  certbot certonly --standalone --non-interactive --agree-tos --keep-until-expiring --preferred-challenges http --email "$email" -d "$domain"
+  local cert="/etc/letsencrypt/live/$domain/fullchain.pem" key="/etc/letsencrypt/live/$domain/privkey.pem"
+  [[ -r $cert && -r $key ]] || die 'Certbot completed but the expected certificate files were not found'
+  set_config VMAPI_TLS_ENABLED true; set_config VMAPI_TLS_DOMAIN "$domain"; set_config VMAPI_TLS_CERT_FILE "$cert"; set_config VMAPI_TLS_KEY_FILE "$key"
+  VMAPI_TLS_ENABLED=true; VMAPI_TLS_DOMAIN=$domain; VMAPI_TLS_CERT_FILE=$cert; VMAPI_TLS_KEY_FILE=$key
+  apply_web_tls; status
+}
+renew(){
+  require_root; [[ -n $VMAPI_TLS_DOMAIN ]] || die 'No Certbot-managed domain is configured'; command -v certbot >/dev/null 2>&1 || die 'Certbot is not installed'
+  certbot renew --non-interactive --cert-name "$VMAPI_TLS_DOMAIN"
+  apply_web_tls; status
+}
+disable(){
+  require_root
+  set_config VMAPI_TLS_ENABLED false; VMAPI_TLS_ENABLED=false
+  apply_web_tls; status
+}
+case ${1:-status} in
+  status) status;;
+  apply) require_root; apply_web_tls; status;;
+  issue) shift; issue "$@";;
+  renew) renew;;
+  disable) disable;;
+  *) die 'Usage: certctl status | apply | issue DOMAIN EMAIL | renew | disable';;
+esac

@@ -33,6 +33,7 @@ PEERCTL=${PEERCTL:-/usr/local/bin/peerctl}
 BACKUPCTL=${BACKUPCTL:-/usr/local/bin/vmbackupctl}
 FILECTL=${FILECTL:-/usr/local/bin/filectl}
 STORAGECTL=${STORAGECTL:-/usr/local/bin/storagectl}
+CERTCTL=${CERTCTL:-/usr/local/bin/certctl}
 declare -A FORM=()
 # peer-api.cgi sets this before executing us. This survives Lighttpd's internal
 # rewrite, which otherwise makes the original /peer-api route indistinguishable
@@ -49,6 +50,24 @@ cors_headers() {
 header() { printf 'Status: %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n' "$1"; cors_headers; printf '\r\n'; }
 reply() { header "$1"; printf '%s\n' "$2"; exit 0; }
 error_reply() { local code=$1 msg=$2; reply "$code" "{\"error\":\"$(json_escape "$msg")\"}"; }
+require_capability() {
+  local cap=$1
+  vmapi_has_capability "$cap" || error_reply '404 Not Found' "Capability is not installed for the $VMAPI_PROFILE profile: $cap"
+}
+capabilities_json() {
+  local caps=(api system metrics cluster admin) cap first=true
+  case "$VMAPI_PROFILE" in
+    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage files host-terminal);;
+    docker) caps+=(docker compose container-terminal files host-terminal);;
+    backup) caps+=(backup backup-receiver);;
+  esac
+  printf '['
+  for cap in "${caps[@]}"; do $first || printf ','; first=false; printf '"%s"' "$cap"; done
+  printf ']'
+}
+cert_cmd() {
+  if command -v sudo >/dev/null 2>&1; then sudo -n "$CERTCTL" "$@"; else "$CERTCTL" "$@"; fi
+}
 cgi_require_vm() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] && [[ -f "$VM_ROOT/$1/vm.conf" ]] || error_reply '404 Not Found' 'VM not found'; }
 
 url_decode() {
@@ -210,6 +229,18 @@ if [[ $PEER_API_REQUEST == true ]]; then
   out=$(peer_cmd authorize-user "$REMOTE_USER" 2>&1) || error_reply '401 Unauthorized' "$out"
 fi
 
+# Deployment profiles are an API boundary, not just a UI preference. Reject
+# routes whose backing platform is not installed on this host.
+case "${P[0]-}" in
+  backups) require_capability backup;;
+  vms|images|migrations|storage|networks|overlays) require_capability qemu-kvm;;
+  docker|compose) require_capability docker;;
+  files) require_capability files;;
+  host) require_capability host-terminal;;
+  ''|cluster|logs|metrics|system|admin) :;;
+  *) :;;
+esac
+
 # A local console session can manage a paired host through this same-origin
 # proxy. Its paired credential remains on the local host; the browser never receives
 # it and never needs the remote host's user login. The request body is streamed
@@ -259,11 +290,15 @@ fi
 read_params
 
 if [[ -z $route ]]; then
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":5,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":[\"qemu-kvm\",\"docker\",\"web-console\",\"metrics\"]}"
+  caps=$(capabilities_json)
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":6,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
 fi
 
 case "${P[0]-}" in
   backups)
+    if [[ $VMAPI_PROFILE == backup ]]; then
+      case "${P[1]-}" in schedules|schedule|unschedule|create|start|jobs|restore) error_reply '404 Not Found' 'Backup creation, scheduling, and restore require the virtualization profile';; esac
+    fi
     case "${P[1]-}" in
       '')
         [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
@@ -342,6 +377,7 @@ case "${P[0]-}" in
           reply '200 OK' "$out"
         fi
         if [[ ${P[3]-} == overlay-credentials && -z ${P[4]-} ]]; then
+          require_capability vm-network
           [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
           out=$(peer_cmd overlay-credentials "${P[2]}" 2>&1) || error_reply '400 Bad Request' "$out"
           reply '200 OK' "$out"
@@ -352,6 +388,7 @@ case "${P[0]-}" in
         [[ $method == PATCH ]] || error_reply '405 Method Not Allowed' 'Use PATCH'
         run_cmd peer_cmd set-url "$(param node_id)" "$(param url)" >/dev/null; reply '200 OK' '{"updated":true}';;
       migrate)
+        require_capability qemu-kvm
         [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
         out=$(peer_cmd migrate "$(param vm)" "$(param node_id)" 2>&1) || error_reply '400 Bad Request' "$out"
         reply '200 OK' "$out";;
@@ -390,6 +427,27 @@ case "${P[0]-}" in
           *) error_reply '404 Not Found' 'Unknown cluster pairing endpoint';;
         esac;;
       *) error_reply '404 Not Found' 'Unknown cluster endpoint';;
+    esac;;
+
+  admin)
+    case "${P[1]-}" in
+      '')
+        [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
+        raw_json_reply '200 OK' cert_cmd status;;
+      certificates)
+        case "${P[2]-}" in
+          '')
+            case "$method" in
+              POST) domain=$(param domain); email=$(param email); [[ -n $domain && -n $email ]] || error_reply '400 Bad Request' 'domain and email are required'; raw_json_reply '200 OK' cert_cmd issue "$domain" "$email";;
+              DELETE) raw_json_reply '200 OK' cert_cmd disable;;
+              *) error_reply '405 Method Not Allowed' 'Use POST or DELETE';;
+            esac;;
+          renew)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            raw_json_reply '200 OK' cert_cmd renew;;
+          *) error_reply '404 Not Found' 'Unknown certificate endpoint';;
+        esac;;
+      *) error_reply '404 Not Found' 'Unknown admin endpoint';;
     esac;;
 
   host)

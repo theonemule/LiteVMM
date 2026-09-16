@@ -8,6 +8,12 @@ title: Configuration reference
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `VMAPI_PROFILE` | `virtualization` | Installed workload surface: `virtualization`, `docker`, or `backup`. The CGI rejects endpoints outside the selected profile. |
+| `VMAPI_HTTP_PORT` | `5186` | LiteVMM management HTTP/HTTPS port. |
+| `VMAPI_TLS_ENABLED` | `false` | Whether the management listener uses the configured TLS certificate. Managed by `certctl`. |
+| `VMAPI_TLS_DOMAIN` | empty | Certbot-managed DNS name. |
+| `VMAPI_TLS_CERT_FILE` | empty | Full-chain PEM used by the web server. |
+| `VMAPI_TLS_KEY_FILE` | empty | Private key used by the web server. |
 | `VM_ROOT` | `/var/lib/vmapi/vms` | Parent directory for VM configuration, NVRAM, and transient runtime files. |
 | `DISK_ROOT` | `/var/lib/vmapi/disks` | Parent directory for per-VM virtual-disk folders. |
 | `ISO_ROOT` | `/var/lib/vmapi/isos` | Shared, read-only ISO and installer-image library. |
