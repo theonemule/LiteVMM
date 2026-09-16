@@ -72,7 +72,7 @@ install_packages() {
       apt-get install -y --no-install-recommends \
         bash coreutils findutils gawk grep sed passwd util-linux \
         iproute2 iputils-ping iptables nftables socat curl openssl ca-certificates sudo kmod tar gzip tcpdump \
-        qemu-system-x86 qemu-utils ovmf docker.io nginx fcgiwrap libnginx-mod-http-auth-pam zip
+        qemu-system-x86 qemu-utils ovmf docker.io nginx fcgiwrap libnginx-mod-http-auth-pam ttyd zip
       ;;
   esac
   update-ca-certificates 2>/dev/null || true
@@ -118,13 +118,14 @@ install_common_files() {
   install -d -m 0700 /var/lib/vmapi/peers /etc/vmapi/identity
   install -m 0644 "$BASE/etc/vmapi.conf" /etc/vmapi/vmapi.conf
   install -m 0644 "$BASE/lib/common.sh" /usr/local/lib/vmapi/common.sh
+  install -m 0644 "$BASE/VERSION" /usr/share/vmapi/VERSION
   for tool in vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl metricsctl consolectl peerctl vmbackupctl filectl storagectl overlayctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
     need_source "bin/$tool"; install -m 0755 "$BASE/bin/$tool" "/usr/local/bin/$tool"
   done
   install -m 0755 "$BASE/cgi/api.cgi" /usr/lib/vmapi/cgi/api.cgi
   install -m 0755 "$BASE/cgi/peer-api.cgi" /usr/lib/vmapi/cgi/peer-api.cgi
   while IFS= read -r -d '' asset; do relative=${asset#"$BASE/www/"}; install -D -m 0644 "$asset" "/usr/share/vmapi/www/$relative"; done < <(find "$BASE/www" -type f -print0)
-  for spec in 'vm-list list' 'vm-show show' 'vm-status status' 'vm-create create' 'vm-set set' 'vm-start start' 'vm-stop stop' 'vm-reboot reboot' 'vm-delete delete' 'vm-disk-add disk-add' 'vm-disk-remove disk-remove' 'vm-disk-resize disk-resize' 'vm-disk-set disk-set' 'vm-nic-add nic-add' 'vm-nic-remove nic-remove' 'vm-nic-set nic-set' 'vm-pci-add pci-add' 'vm-pci-remove pci-remove' 'vm-console-info console-info' 'vm-command command'; do
+  for spec in 'vm-list list' 'vm-show show' 'vm-status status' 'vm-create create' 'vm-set set' 'vm-start start' 'vm-stop stop' 'vm-shutdown shutdown' 'vm-reboot reboot' 'vm-restart restart' 'vm-delete delete' 'vm-disk-add disk-add' 'vm-disk-remove disk-remove' 'vm-disk-resize disk-resize' 'vm-disk-set disk-set' 'vm-nic-add nic-add' 'vm-nic-remove nic-remove' 'vm-nic-set nic-set' 'vm-pci-add pci-add' 'vm-pci-remove pci-remove' 'vm-console-info console-info' 'vm-command command'; do
     set -- $spec; wrapper=$1; sub=$2
     printf '#!/usr/bin/env bash\nexec /usr/local/bin/vmctl %s "$@"\n' "$sub" > "/usr/local/bin/$wrapper"; chmod 0755 "/usr/local/bin/$wrapper"
   done
@@ -139,11 +140,14 @@ install_common_files() {
 write_sudoers() {
   install -d -m 0750 /etc/sudoers.d
   cat > /etc/sudoers.d/vmapi <<'SUDOERS'
-vmapi ALL=(root) NOPASSWD: /usr/local/bin/netctl bridge-create *, /usr/local/bin/netctl bridge-update *, /usr/local/bin/netctl bridge-delete *
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/netctl bridge-create *, /usr/local/bin/netctl bridge-update *, /usr/local/bin/netctl bridge-delete *, /usr/local/bin/netctl vm-tap-up *, /usr/local/bin/netctl vm-tap-down *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/consolectl start *, /usr/local/bin/consolectl info *, /usr/local/bin/consolectl touch *, /usr/local/bin/consolectl stop *, /usr/local/bin/consolectl gc
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/dockerexecctl start *, /usr/local/bin/dockerexecctl info *, /usr/local/bin/dockerexecctl touch *, /usr/local/bin/dockerexecctl stop *, /usr/local/bin/dockerexecctl gc
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/logctl *
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl *
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/storagectl *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmctl delete *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl identity, /usr/local/bin/peerctl request, /usr/local/bin/peerctl request *, /usr/local/bin/peerctl pending, /usr/local/bin/peerctl cancel-pending, /usr/local/bin/peerctl accept *, /usr/local/bin/peerctl complete *, /usr/local/bin/peerctl list, /usr/local/bin/peerctl set-url *, /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl authorize-user *, /usr/local/bin/peerctl cors-origin *, /usr/local/bin/peerctl proxy *, /usr/local/bin/peerctl migrate *, /usr/local/bin/peerctl revoke *
@@ -193,7 +197,11 @@ configure_debian() {
   install -m 0644 "$BASE/systemd/vmapi-autostart.service" /etc/systemd/system/vmapi-autostart.service
   install -m 0644 "$BASE/systemd/vmapi-overlay.service" /etc/systemd/system/vmapi-overlay.service
   install -m 0644 "$BASE/systemd/vmapi-network.service" /etc/systemd/system/vmapi-network.service
+  install -m 0644 "$BASE/systemd/ttyd-vmapi.service" /etc/systemd/system/ttyd-vmapi.service
+  install -m 0644 "$BASE/systemd/ttyd-host-vmapi.service" /etc/systemd/system/ttyd-host-vmapi.service
   install -m 0644 "$BASE/pam/nginx-vmapi" /etc/pam.d/nginx-vmapi
+  install -d -o vmapi -g vmapi -m 0755 /run/vmapi /run/vmapi/docker-exec
+  install -d -o root -g root -m 0700 /run/vmapi/host-exec
   install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
   install -m 0644 "$BASE/nginx/vmapi.conf" /etc/nginx/sites-available/vmapi
   ln -sfn /etc/nginx/sites-available/vmapi /etc/nginx/sites-enabled/vmapi
@@ -203,6 +211,7 @@ configure_debian() {
   systemctl try-restart fcgiwrap-vmapi.service >/dev/null 2>&1 || true
   systemctl enable --now vmapi-network.service
   systemctl enable vmapi-autostart.service
+  systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service
   nginx -t && systemctl reload nginx
 }
 

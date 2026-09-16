@@ -4,6 +4,8 @@ title: Using the LiteVMM console
 ---
 # Using the LiteVMM console
 
+The **System information** page is the detailed host inventory. It shows operating-system and kernel identity, CPU/RAM, primary IP and gateway, every interface and route, mounted filesystems and block devices, service state, installed component versions, and the raw JSON inventory for troubleshooting.
+
 This is the administrator's guide to the LiteVMM web console. It describes what you see after signing in, what each action changes, and when not to use an action. It does not require API knowledge. Use the dedicated pages for [virtual machines](/virtual-machines/), [containers and Compose](/containers-and-compose/), [images and storage](/images-and-storage/), [networks](/networking/), and [cluster pairing](/cluster/). For every field and submit button inside those dialogs, use the [console modal reference](/modal-reference/).
 
 ## Understand the screen before changing anything
@@ -22,7 +24,7 @@ The Overview page is a read-first landing page. It shows counts for virtual mach
 |---|---|---|
 | **Refresh** | Reloads summary and live measurements. | Safe; no host change. |
 | **Logs** | Opens a modal for system, overlay/GOST, Docker, CGI, terminal, or console-broker logs. | Use a smaller line limit first; logs may contain service details. |
-| **Host terminal** | Creates a short-lived terminal session in a new tab. | This is an administrator shell on the host. Treat every command as host-level. |
+| **Host terminal** | Creates a short-lived terminal session in a new tab. | This is an administrator shell on the host. Treat every command as host-level. Debian/Ubuntu and Alpine both proxy the loopback-only ttyd broker through the authenticated web endpoint. |
 | **File browser** | Opens a separate file-management tab. | It operates within the configured file root; deletes are recursive. |
 
 ### The file browser
@@ -44,7 +46,7 @@ Open **Virtual machines** and select **Create VM**. The name becomes part of the
 | **Firmware** | Your guest needs UEFI. | UEFI requires OVMF support on the host. |
 | **Network** | The guest needs connectivity. | NAT is the safe default; bridge connects the guest to a host bridge. |
 
-After creation, use the row actions: **Start**, **Stop**, **Reboot**, **Details**, **Console**, **Backups**, **Migrate**, and **Delete**. Stop is graceful; a force option appears only where the guest does not stop normally. Delete removes the VM directory and its disks—back up first.
+After creation, use the row actions: **Start**, **Shutdown**, **Restart**, **Power off**, **Reset**, **Edit**, **Console**, **Backups**, **Migrate**, and **Delete**. **Shutdown** asks the guest to power down through ACPI, and **Restart** waits for that graceful shutdown before starting it again. **Power off** terminates QEMU from the host and **Reset** sends an immediate virtual hardware reset; use those two only when a graceful guest operation is inappropriate or has failed. Delete removes the VM configuration and disks, so back up first.
 
 ### VM details modal
 

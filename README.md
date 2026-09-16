@@ -1,4 +1,4 @@
-# LiteVMM 0.4
+# LiteVMM 0.5
 
 LiteVMM is a deliberately minimalist QEMU/KVM hypervisor console with optional Docker management. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
 
@@ -50,6 +50,7 @@ The console covers:
 - named GOST TAP-over-WebSocket Layer-2 overlays for paired peers
 - Docker volume create/list/inspect/remove
 - five-second host, VM and container resource monitoring with rolling in-browser graphs
+- a System information view with OS, kernel, CPU/RAM, IP addressing, routes, disks, mounts, service state, and installed component versions
 
 The UI is plain HTML, CSS and JavaScript using a vendored Bootstrap 5 bundle. It does not require Internet access and there is no npm or front-end build step on the host.
 
@@ -248,6 +249,9 @@ vm-create server01 \
 
 ### VM lifecycle and editing
 
+Running guests expose both graceful and immediate lifecycle actions. `vm-shutdown` sends QMP `system_powerdown` and waits for the guest to exit; `vm-restart` performs the same graceful shutdown before starting it again. `vm-stop` remains the immediate host-side power-off path, while `vm-reboot` sends QMP `system_reset` for an immediate virtual reset. Guests need working ACPI support for graceful shutdown.
+
+
 ```bash
 vm-list
 vm-show debian01
@@ -404,7 +408,7 @@ Docker container metrics use the Docker daemon's own runtime statistics for CPU,
 
 ## Host networking for VMs
 
-QEMU NAT uses QEMU user-mode networking, so no host bridge is required. Bridged VM NICs use QEMU's bridge backend and an existing Linux bridge such as `br0`.
+QEMU NAT uses QEMU user-mode networking, so no host bridge is required. Bridged VM NICs use an existing Linux bridge such as `br0`. An optional VLAN ID (1-4094) turns a bridged VM NIC into an access port: LiteVMM creates a managed TAP device, assigns the selected VLAN as its untagged/PVID VLAN, and permits that VLAN on the bridge's non-VM uplink ports. The physical switch/uplink must carry the VLAN.
 
 ```bash
 netctl interfaces
@@ -488,11 +492,14 @@ Stale sessions are groomed by `vmapi-console-gc`, an OpenRC service that runs `c
 
 The HTTP server passes `/api/` to one Bash CGI router through the dedicated fcgiwrap service. Forms use `application/x-www-form-urlencoded`. VM installation-media upload uses the raw request body.
 
-### Host metrics endpoint
+### Host metrics and system information endpoints
 
 ```text
 GET     /api/metrics
+GET     /api/system
 ```
+
+`/api/system` returns the host/OS/kernel identity, CPU and RAM inventory, IP interfaces and routes, storage devices and mounted filesystems, LiteVMM/QEMU/Docker/GOST/web-server/tool versions, and service state.
 
 The web console polls this endpoint every five seconds while the Overview page is visible.
 
@@ -505,8 +512,10 @@ GET     /api/vms/{name}
 PATCH   /api/vms/{name}
 DELETE  /api/vms/{name}
 POST    /api/vms/{name}/start
-POST    /api/vms/{name}/stop
-POST    /api/vms/{name}/reboot
+POST    /api/vms/{name}/stop             # immediate power off
+POST    /api/vms/{name}/shutdown         # graceful ACPI shutdown
+POST    /api/vms/{name}/reboot           # immediate virtual reset
+POST    /api/vms/{name}/restart          # graceful shutdown + start
 GET     /api/vms/{name}/console
 GET     /api/vms/{name}/console/session
 POST    /api/vms/{name}/console/session
@@ -562,7 +571,7 @@ DELETE  /api/docker/containers/{name}/exec/session
 
 Container logs are returned as `text/plain`. The web console can either fetch the current tail or stream `docker logs --follow` until the user stops the stream or closes the modal.
 
-Interactive container terminals use Alpine's packaged `ttyd`, bound to `127.0.0.1:7681` and proxied by lighttpd at `/docker/terminal/`. VMAPI creates short-lived exec tokens through `dockerexecctl`; the terminal launches `docker exec -it CONTAINER /bin/sh` only when a valid token is supplied.
+Interactive container terminals use `ttyd`, bound to `127.0.0.1:7681` and proxied through the platform web server at `/docker/terminal/`. VMAPI creates short-lived exec tokens through `dockerexecctl`; the terminal launches `docker exec -it CONTAINER /bin/sh` only when a valid token is supplied.
 
 Snapshot image creation maps to `docker container commit` and creates a Docker image from the selected container.
 

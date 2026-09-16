@@ -1,0 +1,13 @@
+[Unit]
+Description=LiteVMM Docker terminal broker
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ttyd --interface 127.0.0.1 --port 7681 --writable --url-arg --base-path /docker/terminal --client-option titleFixed=LiteVMM --client-option disableLeaveAlert=true /usr/local/bin/dockerexecctl attach
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

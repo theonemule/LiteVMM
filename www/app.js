@@ -172,7 +172,7 @@
     const parts = ['/usr/local/bin/vmctl', 'create', o.name || 'NAME'];
     const opts = [
       ['--memory', o.memory_mb], ['--cpus', o.vcpus], ['--disk', o.disk_size], ['--disk-format', o.disk_format], ['--disk-bus', o.disk_bus],
-      ['--iso', o.iso], ['--network', o.network], ['--bridge', o.network === 'bridge' ? o.bridge : ''], ['--nic-model', o.nic_model],
+      ['--iso', o.iso], ['--network', o.network], ['--bridge', o.network === 'bridge' ? o.bridge : ''], ['--overlay', o.network === 'overlay' ? o.overlay : ''], ['--vlan', ['bridge','overlay'].includes(o.network) ? o.vlan : ''], ['--nic-model', o.nic_model],
       ['--autostart', o.autostart], ['--firmware', o.firmware], ['--machine', o.machine], ['--cpu', o.cpu], ['--vnc-display', o.vnc_display],
       ['--vnc-bind', o.vnc_bind], ['--display', o.display], ['--boot', o.boot]
     ];
@@ -232,6 +232,7 @@
 
   const percent = n => `${Math.max(0, Number(n || 0)).toFixed(1)}%`;
   const rateBytes = n => `${bytes(Math.max(0, Number(n || 0)))}/s`;
+  const duration = seconds => { let n=Math.max(0,Number(seconds||0)); const d=Math.floor(n/86400); n%=86400; const h=Math.floor(n/3600); n%=3600; const m=Math.floor(n/60); return [d?`${d}d`:'',h?`${h}h`:'',m?`${m}m`:''].filter(Boolean).join(' ') || '<1m'; };
 
   function stopPoller(name) {
     if (state.pollers[name]) clearInterval(state.pollers[name]);
@@ -363,11 +364,12 @@
 
   async function loadDashboard() {
     const results = await Promise.allSettled([
-      request('/vms'), request('/docker/containers'), request('/images'), request('/docker/images'), request('/docker/networks'), request('/docker/volumes'), request('/metrics')
+      request('/vms'), request('/docker/containers'), request('/images'), request('/docker/images'), request('/docker/networks'), request('/docker/volumes'), request('/metrics'), request('/system')
     ]);
     const val = i => results[i].status === 'fulfilled' ? results[i].value : [];
     state.cache.vms = val(0); state.cache.containers = val(1); state.cache.vmImages = val(2); state.cache.dockerImages = val(3); state.cache.dockerNetworks = val(4); state.cache.volumes = val(5);
     state.cache.hostMetrics = results[6].status === 'fulfilled' ? results[6].value : null;
+    state.cache.systemInfo = results[7].status === 'fulfilled' ? results[7].value : null;
     const runningVMs = state.cache.vms.filter(v => v.state === 'running').length;
     const runningContainers = state.cache.containers.filter(c => String(c.State || c.state || '').toLowerCase() === 'running').length;
     $('#view').innerHTML = `
@@ -425,16 +427,40 @@
   }
 
   function platformSummary() {
-    const svc = state.service || {};
-    return `<dl class="row mb-0 small">
-      <dt class="col-5 text-secondary">Service</dt><dd class="col-7 mono">${esc(svc.service || 'vmapi')}</dd>
-      <dt class="col-5 text-secondary">Version</dt><dd class="col-7">${esc(svc.version || '')}</dd>
-      <dt class="col-5 text-secondary">Authentication</dt><dd class="col-7">HTTP Basic</dd>
-      <dt class="col-5 text-secondary">VM backend</dt><dd class="col-7">QEMU/KVM</dd>
-      <dt class="col-5 text-secondary">Container backend</dt><dd class="col-7">Docker daemon</dd>
-      <dt class="col-5 text-secondary">Docker networks</dt><dd class="col-7">${(state.cache.dockerNetworks || []).length}</dd>
-      <dt class="col-5 text-secondary">Docker volumes</dt><dd class="col-7 mb-0">${(state.cache.volumes || []).length}</dd>
-    </dl>`;
+    const svc = state.service || {}; const sys=state.cache.systemInfo||{}; const host=sys.host||{}; const os=sys.os||{}; const net=sys.network||{}; const comp=sys.components||{};
+    return `<dl class="row mb-3 small">
+      <dt class="col-5 text-secondary">Host</dt><dd class="col-7 mono">${esc(host.hostname || '')}</dd>
+      <dt class="col-5 text-secondary">Operating system</dt><dd class="col-7">${esc(os.pretty_name || '')}</dd>
+      <dt class="col-5 text-secondary">Kernel</dt><dd class="col-7 mono">${esc(host.kernel || '')}</dd>
+      <dt class="col-5 text-secondary">Primary IP</dt><dd class="col-7 mono">${esc(net.primary_ipv4 || '')}</dd>
+      <dt class="col-5 text-secondary">LiteVMM</dt><dd class="col-7 mono">${esc(comp.litevmm || svc.version || '')}</dd>
+      <dt class="col-5 text-secondary">QEMU</dt><dd class="col-7 text-truncate" title="${esc(comp.qemu||'')}">${esc(comp.qemu || 'Unavailable')}</dd>
+      <dt class="col-5 text-secondary">Docker</dt><dd class="col-7 text-truncate" title="${esc(comp.docker||'')}">${esc(comp.docker || 'Unavailable')}</dd>
+      <dt class="col-5 text-secondary">Uptime</dt><dd class="col-7 mb-0">${duration(host.uptime_seconds)}</dd>
+    </dl><a class="btn btn-sm btn-outline-primary" href="#system${state.remotePeerId?`?peer=${encodeURIComponent(state.remotePeerId)}`:''}">Full system information</a>`;
+  }
+
+  function systemDl(rows) {
+    return `<dl class="row small mb-0">${rows.map(([k,v,mono=false])=>`<dt class="col-md-4 text-secondary">${esc(k)}</dt><dd class="col-md-8 ${mono?'mono text-break':''}">${esc(v ?? '')}</dd>`).join('')}</dl>`;
+  }
+
+  async function loadSystemInfo() {
+    const info=await request('/system'); state.cache.systemInfo=info;
+    const host=info.host||{}, os=info.os||{}, hw=info.hardware||{}, net=info.network||{}, storage=info.storage||{}, comp=info.components||{}, services=info.services||{};
+    const interfaces=(net.interfaces||[]).map(i=>{const addrs=(i.addr_info||[]).map(a=>`${a.local||''}/${a.prefixlen??''} (${a.family||''})`).join('<br>');return `<tr><td class="mono">${esc(i.ifname||'')}</td><td>${esc(i.operstate||'')}</td><td class="mono small">${addrs||'—'}</td><td class="mono small">${esc(i.address||'')}</td><td>${esc(i.mtu||'')}</td></tr>`;});
+    const routes=(net.routes||[]).map(r=>`<tr><td class="mono">${esc(r.dst||'default')}</td><td class="mono">${esc(r.gateway||'')}</td><td class="mono">${esc(r.dev||'')}</td><td>${esc(r.metric??'')}</td></tr>`);
+    const mounts=(storage.mounts?.filesystems||[]).map(m=>`<tr><td class="mono text-break">${esc(m.target||'')}</td><td class="mono text-break">${esc(m.source||'')}</td><td>${esc(m.fstype||'')}</td><td>${bytes(m.size)}</td><td>${bytes(m.used)}</td><td>${bytes(m.avail)}</td></tr>`);
+    const disks=(storage.block_devices?.blockdevices||[]).map(d=>`<tr><td class="mono">${esc(d.name||'')}</td><td>${esc(d.type||'')}</td><td>${bytes(d.size)}</td><td>${esc(d.model||'')}</td><td class="mono">${esc((d.mountpoints||[]).filter(Boolean).join(', '))}</td></tr>`);
+    const components=Object.entries(comp).map(([k,v])=>`<tr><td>${esc(k.replaceAll('_',' '))}</td><td class="mono small text-break">${esc(v||'Not installed')}</td></tr>`);
+    const serviceRows=Object.entries(services).map(([k,v])=>`<tr><td class="mono">${esc(k)}</td><td>${stateBadge(v)}</td></tr>`);
+    $('#view').innerHTML=`<div class="row g-3 mb-3"><div class="col-xl-6">${card('Host and operating system',systemDl([['Hostname',host.hostname,true],['FQDN',host.fqdn,true],['Operating system',os.pretty_name],['Kernel',host.kernel,true],['Architecture',host.architecture],['Timezone',host.timezone],['Virtualization host',host.virtualization_type||'bare metal'],['Uptime',duration(host.uptime_seconds)],['Machine ID',host.machine_id,true]]))}</div><div class="col-xl-6">${card('Hardware',systemDl([['CPU',hw.cpu_model],['Logical CPUs',hw.logical_cpus],['Sockets',hw.sockets],['Cores per socket',hw.cores_per_socket],['Threads per core',hw.threads_per_core],['RAM',bytes(hw.memory_total_bytes)],['Available RAM',bytes(hw.memory_available_bytes)],['Swap',bytes(hw.swap_total_bytes)],['KVM acceleration',hw.kvm_available?'Available':'Unavailable']]))}</div></div>
+      <div class="row g-3 mb-3"><div class="col-xl-6">${card('Network summary',systemDl([['Primary IPv4',net.primary_ipv4,true],['Default gateway',net.default_gateway,true],['DNS',(net.dns||[]).join(', '),true]]))}</div><div class="col-xl-6">${card('Storage roots',systemDl([['VM configuration',storage.vm_root,true],['Virtual disks',storage.disk_root,true],['ISO media',storage.iso_root,true]]))}</div></div>
+      <div class="mb-3">${card('Network interfaces',table(['Interface','State','Addresses','MAC','MTU'],interfaces,'No interfaces detected.'))}</div>
+      <div class="mb-3">${card('Routes',table(['Destination','Gateway','Interface','Metric'],routes,'No routes detected.'))}</div>
+      <div class="mb-3">${card('Filesystems',table(['Mount','Source','Type','Size','Used','Available'],mounts,'No mounted filesystems detected.'))}</div>
+      <div class="mb-3">${card('Block devices',table(['Device','Type','Size','Model','Mounts'],disks,'No block devices detected.'))}</div>
+      <div class="row g-3 mb-3"><div class="col-xl-7">${card('Component versions',table(['Component','Version'],components,'No component versions reported.'))}</div><div class="col-xl-5">${card('Service state',table(['Service','State'],serviceRows,'No service state reported.'))}</div></div>
+      <div>${card('Technical dump',`<div class="small text-secondary mb-2">Raw system inventory returned by the host API.</div><pre class="code-panel mb-0" style="max-height:32rem;overflow:auto">${esc(JSON.stringify(info,null,2))}</pre>`)}</div>`;
   }
 
   async function loadVMs() {
@@ -445,7 +471,7 @@
       const c = v.config || {};
       return `<tr><td><div class="resource-name">${esc(v.name)}</div><div class="small text-secondary mono">${esc(c.UUID || '')}</div></td><td>${stateBadge(v.state)}</td><td>${esc(c.VCPUS ?? '')}</td><td>${c.MEMORY_MB ? `${esc(c.MEMORY_MB)} MB` : ''}</td><td>${esc(c.FIRMWARE || '')}</td><td><div class="action-row">
         <button class="btn btn-sm btn-outline-secondary" data-vm-details="${esc(v.name)}">Edit</button><button class="btn btn-sm btn-outline-secondary" data-vm-backups="${esc(v.name)}">Backups</button>
-        ${v.state === 'running' ? `<button class="btn btn-sm btn-outline-primary" data-vm-console="${esc(v.name)}">Console</button><button class="btn btn-sm btn-outline-warning" data-vm-stop="${esc(v.name)}">Stop</button><button class="btn btn-sm btn-outline-secondary" data-vm-reboot="${esc(v.name)}">Reboot</button>` : `<button class="btn btn-sm btn-outline-success" data-vm-start="${esc(v.name)}">Start</button><button class="btn btn-sm btn-outline-secondary" data-vm-migrate="${esc(v.name)}">Migrate</button>`}
+        ${v.state === 'running' ? `<button class="btn btn-sm btn-outline-primary" data-vm-console="${esc(v.name)}">Console</button><button class="btn btn-sm btn-outline-success" data-vm-shutdown="${esc(v.name)}">Shutdown</button><button class="btn btn-sm btn-outline-secondary" data-vm-restart="${esc(v.name)}">Restart</button><button class="btn btn-sm btn-outline-warning" data-vm-stop="${esc(v.name)}">Power off</button><button class="btn btn-sm btn-outline-danger" data-vm-reboot="${esc(v.name)}">Reset</button>` : `<button class="btn btn-sm btn-outline-success" data-vm-start="${esc(v.name)}">Start</button><button class="btn btn-sm btn-outline-secondary" data-vm-migrate="${esc(v.name)}">Migrate</button>`}
         <button class="btn btn-sm btn-outline-danger" data-vm-delete="${esc(v.name)}">Delete</button>
       </div></td></tr>`;
     });
@@ -456,6 +482,8 @@
     $('#storageLocationsBtn').onclick = openStorageLocations;
     $$('[data-vm-start]').forEach(b => b.onclick = () => lifecycleVM(b.dataset.vmStart, 'start'));
     $$('[data-vm-stop]').forEach(b => b.onclick = () => lifecycleVM(b.dataset.vmStop, 'stop'));
+    $$('[data-vm-shutdown]').forEach(b => b.onclick = () => lifecycleVM(b.dataset.vmShutdown, 'shutdown'));
+    $$('[data-vm-restart]').forEach(b => b.onclick = () => lifecycleVM(b.dataset.vmRestart, 'restart'));
     $$('[data-vm-reboot]').forEach(b => b.onclick = () => lifecycleVM(b.dataset.vmReboot, 'reboot'));
     $$('[data-vm-console]').forEach(b => b.onclick = () => openConsole(b.dataset.vmConsole));
     $$('[data-vm-migrate]').forEach(b => b.onclick = () => openMigrateVM(b.dataset.vmMigrate));
@@ -465,8 +493,8 @@
   }
 
   async function lifecycleVM(name, action) {
-    const verb = action === 'start' ? 'Starting' : action === 'stop' ? 'Stopping' : 'Restarting';
-    const button = $$(`[data-vm-${action}]`).find(candidate => candidate.dataset.vmStart === name || candidate.dataset.vmStop === name || candidate.dataset.vmReboot === name);
+    const verbs={start:'Starting',stop:'Powering off',shutdown:'Shutting down',restart:'Restarting',reboot:'Resetting'}; const verb=verbs[action]||'Working';
+    const button = $$(`[data-vm-${action}]`).find(candidate => candidate.getAttribute(`data-vm-${action}`) === name);
     const originalLabel = button?.textContent || '';
     const unlock = lockActionItem(button, verb);
     toast(`${name}: ${verb.toLowerCase()}...`, 'VM action in progress');
@@ -520,6 +548,7 @@
           <div class="col-md-4" id="vmBridgeWrap"><label class="form-label">Bridge</label><select name="bridge" id="vmBridge" class="form-select"><option value="">Select bridge</option>${bridges}</select></div>
           <div class="col-md-4 d-none" id="vmOverlayWrap"><label class="form-label">Overlay network</label><select name="overlay" id="vmOverlay" class="form-select"><option value="">Select overlay</option>${overlayOptions}</select><div class="form-text">Only paired-node Layer-2 overlays appear here.</div></div>
           <div class="col-md-4"><label class="form-label">NIC model</label><select name="nic_model" class="form-select"><option>virtio-net-pci</option><option>e1000e</option><option>e1000</option><option>rtl8139</option></select></div>
+          <div class="col-md-4" id="vmVlanWrap"><label class="form-label">VLAN ID</label><input name="vlan" type="number" min="1" max="4094" class="form-control" placeholder="Untagged"><div class="form-text">Optional access VLAN on a bridge or overlay.</div></div>
           <div class="col-md-4"><label class="form-label">Display</label><select name="display" class="form-select"><option value="vnc">VNC</option><option value="none">None</option></select></div>
           <div class="col-md-4"><label class="form-label">VNC bind</label><input name="vnc_bind" class="form-control" value="127.0.0.1"></div>
           <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch mb-2"><input name="autostart" class="form-check-input" type="checkbox" id="vmAuto"><label class="form-check-label" for="vmAuto">Start at host boot</label></div></div>
@@ -536,6 +565,7 @@
         const f = new FormData($('#vmCreateForm', el)); const o = Object.fromEntries(f.entries()); o.autostart = f.has('autostart') ? 'true' : 'false'; o.emulation = f.has('emulation') ? 'true' : 'false';
         if (o.network !== 'bridge') delete o.bridge;
         if (o.network !== 'overlay') delete o.overlay;
+        if (!['bridge','overlay'].includes(o.network)) delete o.vlan;
         await request('/vms', {method:'POST', form:o}); m.hide(); toast(`${o.name} created`); await renderRoute();
       }});
     const form = $('#vmCreateForm', $('#formModal'));
@@ -547,6 +577,8 @@
       $('#vmBridge', form).disabled = !bridged;
       $('#vmOverlayWrap', form).classList.toggle('d-none', !overlay);
       $('#vmOverlay', form).disabled = !overlay;
+      $('#vmVlanWrap', form).classList.toggle('d-none', !(bridged||overlay));
+      form.vlan.disabled = !(bridged||overlay);
       setPreview('#vmCreatePreview', vmCreateCommand(o));
     };
     form.addEventListener('input', syncVmForm); form.addEventListener('change', syncVmForm); syncVmForm();
@@ -558,7 +590,7 @@
     ]);
     const c = vm.config || {};
     const disks = indexedConfig(c, 'DISK', ['FILE','FORMAT','BUS']);
-    const nics = indexedConfig(c, 'NIC', ['MODE','MODEL','MAC','BRIDGE']);
+    const nics = indexedConfig(c, 'NIC', ['MODE','MODEL','MAC','BRIDGE','VLAN']);
     const pci = indexedConfig(c, 'PCI', ['BDF']);
     const imgOpts = [`<option value="">None</option>`, ...images.map(i=>`<option ${i.name===c.ISO?'selected':''} value="${esc(i.name)}">${esc(i.name)}</option>`)].join('');
     const bridgeOpts = (nets.bridges || []).map(b=>`<option value="${esc(b)}">${esc(b)}</option>`).join('');
@@ -577,7 +609,7 @@
           <div class="col-12"><div class="form-check form-switch"><input name="emulation" id="editEmulation" class="form-check-input" type="checkbox" ${String(c.ALLOW_TCG)==='true'?'checked':''}><label class="form-check-label" for="editEmulation">Allow software emulation when KVM is unavailable</label></div></div>
         </div>${vm.state === 'running' ? '<div class="alert alert-warning small mt-3 mb-0">Hardware settings can only be changed while the VM is stopped.</div>' : ''}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Disks <button type="button" class="btn btn-sm btn-outline-primary" id="addDiskBtn">Add disk</button></div>${resourceList(disks, d=>`<strong>disk${d.index}</strong> · ${esc(d.FILE || '')} · ${esc(d.FORMAT || '')} · ${esc(d.BUS || '')}`, 'disk')}</div>
-        <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Network adapters <button type="button" class="btn btn-sm btn-outline-primary" id="addNicBtn">Add NIC</button></div>${resourceList(nics, n=>`<strong>nic${n.index}</strong> · ${esc(n.MODE || '')}${n.BRIDGE ? ` / ${esc(n.BRIDGE)}`:''} · ${esc(n.MODEL || '')} · <span class="mono">${esc(n.MAC || '')}</span>`, 'nic')}</div>
+        <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Network adapters <button type="button" class="btn btn-sm btn-outline-primary" id="addNicBtn">Add NIC</button></div>${resourceList(nics, n=>`<strong>nic${n.index}</strong> · ${esc(n.MODE || '')}${n.BRIDGE ? ` / ${esc(n.BRIDGE)}`:''} · ${esc(n.MODEL || '')}${n.VLAN ? ` · VLAN ${esc(n.VLAN)}` : ''} · <span class="mono">${esc(n.MAC || '')}</span>`, 'nic')}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">PCI passthrough <button type="button" class="btn btn-sm btn-outline-primary" id="addPciBtn">Add device</button></div>${resourceList(pci, p=>`<strong>pci${p.index}</strong> · <span class="mono">${esc(p.BDF || '')}</span>`, 'pci')}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Console ${vm.state === 'running' && c.DISPLAY === 'vnc' ? `<button type="button" class="btn btn-sm btn-outline-primary" id="openConsoleBtn">Open noVNC</button>` : ''}</div>${consoleInfo ? `<div class="row g-2 small"><div class="col-md-6"><div class="border rounded-3 p-3"><div class="text-secondary">VNC</div><div class="mono mt-1">${esc(consoleInfo.vnc_host || consoleInfo.vnc_bind || '')}${consoleInfo.vnc_port ? ':'+esc(consoleInfo.vnc_port) : ''}</div></div></div><div class="col-md-6"><div class="border rounded-3 p-3"><div class="text-secondary">Serial / QMP</div><div class="mono mt-1 text-break">${esc(consoleInfo.serial_socket || consoleInfo.qmp_socket || '')}</div></div></div></div>` : '<div class="text-secondary small">Console information unavailable.</div>'}</div>
       </form>`, onSubmit: async (el,m) => {
@@ -618,7 +650,7 @@
     modal({eyebrow:name,title:'Add virtual disk',submitText:'Add disk',size:'sm',body:`<form id="subForm"><label class="form-label">Size</label><input name="size" value="20G" class="form-control mb-3"><label class="form-label">Format</label><select name="format" class="form-select mb-3"><option>qcow2</option><option>raw</option></select><label class="form-label">Bus</label><select name="bus" class="form-select"><option>virtio</option><option>sata</option><option>scsi</option></select></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());await request(`/vms/${encodeURIComponent(name)}/disks`,{method:'POST',form:f});m.hide();await openVMDetails(name);}});
   }
   function subModalAddNic(name, bridgeOpts){
-    modal({eyebrow:name,title:'Add network adapter',submitText:'Add NIC',size:'sm',body:`<form id="subForm"><label class="form-label">Mode</label><select name="mode" id="nicAddMode" class="form-select mb-3"><option value="nat">NAT</option><option value="bridge">Bridge</option></select><div id="nicAddBridgeWrap"><label class="form-label">Bridge</label><select name="bridge" class="form-select mb-3"><option value="">None</option>${bridgeOpts}</select></div><label class="form-label">Model</label><select name="model" class="form-select"><option>virtio-net-pci</option><option>e1000e</option><option>e1000</option><option>rtl8139</option></select></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());if(f.mode!=='bridge')delete f.bridge;await request(`/vms/${encodeURIComponent(name)}/nics`,{method:'POST',form:f});m.hide();await openVMDetails(name);}});
+    modal({eyebrow:name,title:'Add network adapter',submitText:'Add NIC',size:'sm',body:`<form id="subForm"><label class="form-label">Mode</label><select name="mode" id="nicAddMode" class="form-select mb-3"><option value="nat">NAT</option><option value="bridge">Bridge</option></select><div id="nicAddBridgeWrap"><label class="form-label">Bridge</label><select name="bridge" class="form-select mb-3"><option value="">None</option>${bridgeOpts}</select><label class="form-label">VLAN ID</label><input name="vlan" type="number" min="1" max="4094" class="form-control mb-3" placeholder="Untagged"><div class="form-text mb-3">Optional 802.1Q access VLAN. The physical bridge uplink must carry this VLAN.</div></div><label class="form-label">Model</label><select name="model" class="form-select"><option>virtio-net-pci</option><option>e1000e</option><option>e1000</option><option>rtl8139</option></select></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());if(f.mode!=='bridge'){delete f.bridge;delete f.vlan;}await request(`/vms/${encodeURIComponent(name)}/nics`,{method:'POST',form:f});m.hide();await openVMDetails(name);}});
     const form = $('#subForm', $('#formModal'));
     const syncNicAddForm = () => {
       $('#nicAddBridgeWrap', form).classList.toggle('d-none', form.mode.value !== 'bridge');
@@ -626,7 +658,7 @@
     form.addEventListener('change', syncNicAddForm); syncNicAddForm();
   }
   function subModalEditNic(name, nic, bridgeOpts){
-    modal({eyebrow:name,title:`Edit NIC ${nic.index}`,submitText:'Save NIC',size:'sm',body:`<form id="subForm"><label class="form-label">Mode</label><select name="mode" id="nicEditMode" class="form-select mb-3"><option value="nat" ${nic.MODE==='nat'?'selected':''}>NAT</option><option value="bridge" ${nic.MODE==='bridge'?'selected':''}>Bridge</option></select><div id="nicEditBridgeWrap"><label class="form-label">Bridge</label><select name="bridge" class="form-select mb-3"><option value="">None</option>${bridgeOpts.replace(`value="${esc(nic.BRIDGE)}"`, `value="${esc(nic.BRIDGE)}" selected`)}</select></div><label class="form-label">Model</label><select name="model" class="form-select mb-3">${nicModelOptions(nic.MODEL)}</select><label class="form-label">MAC address</label><input class="form-control mono" value="${esc(nic.MAC)}" readonly></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());for(const [field,value] of Object.entries(f)){if(field==='bridge'&&f.mode!=='bridge')continue;await request(`/vms/${encodeURIComponent(name)}/nics/${nic.index}`,{method:'PATCH',form:{field,value}});}m.hide();toast(`${name}: NIC ${nic.index} updated`);await openVMDetails(name);}});
+    modal({eyebrow:name,title:`Edit NIC ${nic.index}`,submitText:'Save NIC',size:'sm',body:`<form id="subForm"><label class="form-label">Mode</label><select name="mode" id="nicEditMode" class="form-select mb-3"><option value="nat" ${nic.MODE==='nat'?'selected':''}>NAT</option><option value="bridge" ${nic.MODE==='bridge'?'selected':''}>Bridge</option></select><div id="nicEditBridgeWrap"><label class="form-label">Bridge</label><select name="bridge" class="form-select mb-3"><option value="">None</option>${bridgeOpts.replace(`value="${esc(nic.BRIDGE)}"`, `value="${esc(nic.BRIDGE)}" selected`)}</select><label class="form-label mt-3">VLAN ID</label><input name="vlan" type="number" min="1" max="4094" class="form-control mb-2" value="${esc(nic.VLAN||'')}" placeholder="Untagged"><div class="form-text mb-3">Optional 802.1Q access VLAN.</div></div><label class="form-label">Model</label><select name="model" class="form-select mb-3">${nicModelOptions(nic.MODEL)}</select><label class="form-label">MAC address</label><input class="form-control mono" value="${esc(nic.MAC)}" readonly></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());for(const [field,value] of Object.entries(f)){if((field==='bridge'||field==='vlan')&&f.mode!=='bridge')continue;await request(`/vms/${encodeURIComponent(name)}/nics/${nic.index}`,{method:'PATCH',form:{field,value}});}m.hide();toast(`${name}: NIC ${nic.index} updated`);await openVMDetails(name);}});
     const form = $('#subForm', $('#formModal'));
     const syncNicEditForm = () => {
       $('#nicEditBridgeWrap', form).classList.toggle('d-none', form.mode.value !== 'bridge');
@@ -972,7 +1004,7 @@
     const rows = backups.map(b=>`<tr><td class="mono">${esc(b.vm)}</td><td class="mono">${esc(b.archive)}</td><td>${bytes(b.bytes)}</td><td><div class="action-row"><a class="btn btn-sm btn-outline-secondary" href="${API}/backups/${encodeURIComponent(b.vm)}/${encodeURIComponent(b.archive)}">Download</a><button class="btn btn-sm btn-outline-danger" data-backup-delete="${esc(b.vm)}" data-backup-archive="${esc(b.archive)}">Delete</button></div></td></tr>`);
     const scheduleRows = schedules.map(s=>`<tr><td class="mono">${esc(s.vm)}</td><td class="mono">${esc(s.cron)}</td><td>${esc(s.label)}</td><td><button class="btn btn-sm btn-outline-danger" data-backup-unschedule="${esc(s.vm)}">Remove</button></td></tr>`);
     $('#view').innerHTML=`<div class="row g-3"><div class="col-xl-8">${card('VM backups',table(['VM','Archive','Size',''],rows,'No backups found.'),'<button class="btn btn-sm btn-primary" id="createBackupBtn">Create backup</button>')}</div><div class="col-xl-4">${card('Schedules',table(['VM','Cron','Label',''],scheduleRows,'No scheduled backups.'),'<button class="btn btn-sm btn-outline-primary" id="scheduleBackupBtn">Schedule backup</button>')}</div></div>`;
-    $('#createBackupBtn').onclick=()=>{modal({eyebrow:'VM backup',title:'Create backup',submitText:'Create',body:`<form id="backupForm"><label class="form-label">Virtual machine</label><select name="name" class="form-select mb-3" required><option value="">Select a VM</option>${vmOptions}</select><label class="form-label">Label</label><input name="label" class="form-control mb-3" value="manual">${backupTargetFields()}<div class="form-check form-switch mt-3"><input name="live" id="liveBackup" class="form-check-input" type="checkbox"><label class="form-check-label" for="liveBackup">Live backup</label></div><div class="form-text">Uses QMP full disk copies while the VM runs.</div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#backupForm',el));const target=backupTargetData(fd);if(!fd.get('name'))throw new Error('Select a virtual machine.');await request('/backups/create',{method:'POST',form:{name:fd.get('name'),...target}});m.hide();toast(`${fd.get('name')}: backup created`);await loadBackups();}});bindBackupTarget($('#formModal'));};
+    $('#createBackupBtn').onclick=()=>{modal({eyebrow:'VM backup',title:'Create backup',body:`<form id="backupForm"><label class="form-label">Virtual machine</label><select name="name" class="form-select mb-3" required><option value="">Select a VM</option>${vmOptions}</select><label class="form-label">Label</label><input name="label" class="form-control mb-3" value="manual">${backupTargetFields()}<div class="form-check form-switch mt-3"><input name="live" id="liveBackup" class="form-check-input" type="checkbox"><label class="form-check-label" for="liveBackup">Live backup</label></div><div class="form-text">Uses QMP full disk copies while the VM runs. A stopped VM uses an ordinary consistent file copy.</div><button id="vmBackupNowBtn" type="button" class="btn btn-primary mt-3">Backup now</button><div id="vmBackupProgress" class="mt-3 d-none" role="status"><div class="d-flex justify-content-between small mb-1"><span id="vmBackupProgressLabel">Queued</span><span id="vmBackupProgressValue">0%</span></div><div class="progress" style="height:0.5rem"><div id="vmBackupProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div></div></form>`});const root=$('#formModal');bindBackupTarget(root);$('#vmBackupNowBtn',root).onclick=async()=>{const fd=new FormData($('#backupForm',root));const name=fd.get('name');if(!name){toast('Select a virtual machine.','Backup not started');return;}let target;try{target=backupTargetData(fd);}catch(error){toast(error.message,'Backup not started');return;}const button=$('#vmBackupNowBtn',root);button.disabled=true;button.textContent='Backup queued';try{const job=await request('/backups/start',{method:'POST',form:{name,...target}});watchBackupJob(job,root,name,async()=>{bootstrap.Modal.getInstance(root)?.hide();await loadBackups();});}catch(error){button.disabled=false;button.textContent='Backup now';$('#vmBackupProgress',root).classList.remove('d-none');$('#vmBackupProgressLabel',root).textContent=`Backup could not start: ${error.message}`;$('#vmBackupProgressBar',root).className='progress-bar bg-danger';toast(error.message,'Backup not started');}};};
     $('#scheduleBackupBtn').onclick=()=>openBackupSchedule(vmOptions);
     $$('[data-backup-delete]').forEach(b=>b.onclick=()=>confirmAction('Delete backup',`Delete ${b.dataset.backupArchive}?`,async()=>{await request(`/backups/${encodeURIComponent(b.dataset.backupDelete)}/${encodeURIComponent(b.dataset.backupArchive)}`,{method:'DELETE'});await loadBackups();}));
     $$('[data-backup-unschedule]').forEach(b=>b.onclick=()=>confirmAction('Remove schedule',`Remove the ${b.dataset.backupUnschedule} schedule?`,async()=>{await request('/backups/unschedule',{method:'DELETE',form:{name:b.dataset.backupUnschedule}});await loadBackups();}));
@@ -1028,6 +1060,7 @@
 
   const routes = {
     dashboard: {title:'Overview', eyebrow:'LiteVMM', load:loadDashboard},
+    system: {title:'System information', eyebrow:'Host diagnostics', load:loadSystemInfo},
     vms: {title:'Virtual machines', eyebrow:'QEMU / KVM', load:loadVMs},
     containers: {title:'Containers', eyebrow:'Docker', load:loadContainers},
     compose: {title:'Compose', eyebrow:'Docker', load:loadCompose},

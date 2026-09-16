@@ -1,0 +1,12 @@
+[Unit]
+Description=LiteVMM host terminal broker
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ttyd --interface 127.0.0.1 --port 7682 --writable --url-arg --base-path /host/terminal --client-option titleFixed=LiteVMM-Host /usr/local/bin/hostexecctl attach
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

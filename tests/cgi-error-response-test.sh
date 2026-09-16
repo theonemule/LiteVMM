@@ -21,7 +21,7 @@ response=$(printf 'name=testvm' | env \
   VMAPI_LIB="$ROOT/lib/common.sh" VMCTL="$tmp/failing-vmctl" \
   VM_ROOT="$tmp/vms" IMAGE_ROOT="$tmp/images" \
   REQUEST_METHOD=POST PATH_INFO=/vms CONTENT_TYPE=application/x-www-form-urlencoded CONTENT_LENGTH=11 \
-  "$ROOT/cgi/api.cgi") || cgi_status=$?
+  bash "$ROOT/cgi/api.cgi") || cgi_status=$?
 
 [[ ${cgi_status:-0} -ne 0 ]]
 [[ $response == *'Status: 400 Bad Request'* ]]

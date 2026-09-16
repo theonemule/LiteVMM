@@ -259,7 +259,7 @@ fi
 read_params
 
 if [[ -z $route ]]; then
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":4,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":[\"qemu-kvm\",\"docker\",\"web-console\",\"metrics\"]}"
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":5,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":[\"qemu-kvm\",\"docker\",\"web-console\",\"metrics\"]}"
 fi
 
 case "${P[0]-}" in
@@ -405,6 +405,9 @@ case "${P[0]-}" in
   metrics)
     [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
     raw_json_reply '200 OK' "$METRICSCTL" host;;
+  system)
+    [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
+    raw_json_reply '200 OK' "$METRICSCTL" system;;
 
   vms)
     if [[ -z ${P[1]-} ]]; then
@@ -424,6 +427,7 @@ case "${P[0]-}" in
           [[ -n $(param bridge) ]] && args+=(--bridge "$(param bridge)")
           [[ -n $(param overlay) ]] && args+=(--overlay "$(param overlay)")
           [[ -n $(param nic_model) ]] && args+=(--nic-model "$(param nic_model)")
+          [[ -n $(param vlan) ]] && args+=(--vlan "$(param vlan)")
           [[ -n $(param autostart) ]] && args+=(--autostart "$(param autostart)")
           [[ -n $(param firmware) ]] && args+=(--firmware "$(param firmware)")
           [[ -n $(param machine) ]] && args+=(--machine "$(param machine)")
@@ -457,10 +461,18 @@ case "${P[0]-}" in
         [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
         args=(stop "$name"); [[ $(param force false) == true ]] && args+=(--force)
         run_cmd "$VMCTL" "${args[@]}" >/dev/null; reply '200 OK' '{"state":"stopped"}';;
+      shutdown)
+        [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+        args=(shutdown "$name"); [[ -n $(param timeout) ]] && args+=(--timeout "$(param timeout)"); [[ $(param force false) == true ]] && args+=(--force)
+        run_cmd "$VMCTL" "${args[@]}" >/dev/null; reply '200 OK' '{"state":"stopped","graceful":true}';;
       reboot)
         [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
         args=(reboot "$name"); [[ $(param force false) == true ]] && args+=(--force)
-        run_cmd "$VMCTL" "${args[@]}" >/dev/null; reply '200 OK' '{"rebooted":true}';;
+        run_cmd "$VMCTL" "${args[@]}" >/dev/null; reply '200 OK' '{"rebooted":true,"graceful":false}';;
+      restart)
+        [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+        args=(restart "$name"); [[ -n $(param timeout) ]] && args+=(--timeout "$(param timeout)"); [[ $(param force false) == true ]] && args+=(--force)
+        run_cmd "$VMCTL" "${args[@]}" >/dev/null; reply '200 OK' '{"restarted":true,"graceful":true}';;
       metrics)
         [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
         raw_json_reply '200 OK' "$METRICSCTL" vm "$name";;
@@ -526,6 +538,7 @@ case "${P[0]-}" in
           [[ -n $(param overlay) ]] && args+=(--overlay "$(param overlay)")
           [[ -n $(param model) ]] && args+=(--model "$(param model)")
           [[ -n $(param mac) ]] && args+=(--mac "$(param mac)")
+          [[ -n $(param vlan) ]] && args+=(--vlan "$(param vlan)")
           idx=$(run_cmd "$VMCTL" "${args[@]}"); reply '201 Created' "{\"index\":$idx}"
         else
           case "$method" in

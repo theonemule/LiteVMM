@@ -9,8 +9,9 @@ All browser API paths begin with `/api` and require the same HTTP Basic authenti
 | Resource | Operations |
 |---|---|
 | Service | `GET /` returns service metadata and capabilities. |
+| System inventory | `GET /system` returns host, OS, hardware, network, storage, component-version, and service-state inventory. |
 | Metrics/logs | `GET /metrics`, `GET /logs?source=&limit=`. |
-| VMs | `GET, POST /vms`; `GET, PATCH, DELETE /vms/{name}`; lifecycle, metrics, console, disks, NICs, and PCI subresources. |
+| VMs | `GET, POST /vms`; `GET, PATCH, DELETE /vms/{name}`; lifecycle includes graceful `/shutdown` and `/restart` plus immediate `/stop` and `/reboot`; metrics, console, disks, NICs (including optional VLAN ID), and PCI subresources. |
 | VM images | `GET /images`; `PUT, DELETE /images/{filename}`. |
 | Docker | Containers, images, networks, and volumes under `/docker/...`; container subresources include lifecycle, metrics, logs, commit, and exec sessions. |
 | Compose | `GET /compose/projects`; `PUT, GET, DELETE /compose/projects/{name}`; `POST .../deploy` and `.../down`. |

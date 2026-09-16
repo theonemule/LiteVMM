@@ -56,3 +56,7 @@ LiteVMM does not automatically attach a Docker bridge network to a TAP overlay. 
 ## Choose the right one
 
 Use a **Linux bridge** when a VM must join a local physical/LAN segment. Use a **Docker network** for container-to-container application connectivity on one Docker host. Use an **overlay** only when you need Layer-2 connectivity between paired LiteVMM hosts; it depends on the bridge underneath it and has more failure modes than a local network. Use **NAT** on a VM when it only needs ordinary outbound access and does not need to be a direct LAN peer.
+
+## VM access VLANs
+
+For a bridged VM NIC, an optional VLAN ID from 1 through 4094 creates a managed TAP access port. Traffic is untagged at the guest-facing TAP and associated with the selected 802.1Q VLAN on the Linux bridge. LiteVMM enables bridge VLAN filtering and permits that VLAN on the bridge uplink ports; the upstream switch or nested virtualization network still has to carry the VLAN. Leave VLAN blank when the guest should use the bridge without access-VLAN filtering.

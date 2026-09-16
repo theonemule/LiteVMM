@@ -15,6 +15,7 @@ metricsctl - lightweight host, VM and Docker resource metrics
 
 Commands:
   host
+  system
   vm NAME
   container NAME
 
@@ -97,6 +98,92 @@ cmd_host() {
   printf '"disk":{"path":"%s","used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s},' "$(json_escape "$disk_path")" "$du" "$dt" "$da" "$(num_pct "$du" "$dt")"
   printf '"network":{"rx_bytes":%s,"tx_bytes":%s},' "$rx" "$tx"
   printf '"uptime_seconds":%s' "$up"
+  printf '}\n'
+}
+
+component_version() {
+  local name=$1 out=''
+  case "$name" in
+    litevmm)
+      for p in /usr/share/vmapi/VERSION "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/VERSION"; do
+        [[ -r $p ]] && { head -n1 "$p"; return; }
+      done
+      ;;
+    qemu) [[ -x $QEMU_BIN ]] && out=$("$QEMU_BIN" --version 2>/dev/null | head -n1 || true);;
+    qemu_img) [[ -x $QEMU_IMG ]] && out=$("$QEMU_IMG" --version 2>/dev/null | head -n1 || true);;
+    docker) command -v "$DOCKER_BIN" >/dev/null 2>&1 && out=$("$DOCKER_BIN" --version 2>/dev/null | head -n1 || true);;
+    gost) command -v gost >/dev/null 2>&1 && out=$(gost -V 2>&1 | head -n1 || true);;
+    nginx) command -v nginx >/dev/null 2>&1 && out=$(nginx -v 2>&1 | head -n1 || true);;
+    lighttpd) command -v lighttpd >/dev/null 2>&1 && out=$(lighttpd -v 2>&1 | head -n1 || true);;
+    ttyd) command -v ttyd >/dev/null 2>&1 && out=$(ttyd -v 2>&1 | head -n1 || true);;
+    socat) command -v socat >/dev/null 2>&1 && out=$(socat -V 2>&1 | head -n1 || true);;
+    bash) out=$(bash --version 2>/dev/null | head -n1 || true);;
+  esac
+  printf '%s' "$out"
+}
+
+service_state() {
+  local svc=$1 out='unknown'
+  if command -v systemctl >/dev/null 2>&1; then
+    out=$(systemctl is-active "$svc" 2>/dev/null || true)
+    [[ -n $out ]] || out=inactive
+  elif command -v rc-service >/dev/null 2>&1; then
+    if rc-service "$svc" status >/dev/null 2>&1; then out=active; else out=inactive; fi
+  fi
+  printf '%s' "$out"
+}
+
+cmd_system() {
+  local pretty='' os_id='' version_id='' version_codename='' cpu_model='' sockets='' cores='' threads='' virt_type='' mt mu ma swap_total swap_free primary_ip='' gateway='' timezone='' machine_id='' boot_id=''
+  if [[ -r /etc/os-release ]]; then
+    PRETTY_NAME='' ID='' VERSION_ID='' VERSION_CODENAME=''
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    pretty=${PRETTY_NAME:-}; os_id=${ID:-}; version_id=${VERSION_ID:-}; version_codename=${VERSION_CODENAME:-}
+  fi
+  cpu_model=$(awk -F: '/^(model name|Hardware)[[:space:]]*:/ {sub(/^[[:space:]]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+  sockets=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\):/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' || true)
+  cores=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' || true)
+  threads=$(lscpu 2>/dev/null | awk -F: '/^Thread\(s\) per core:/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' || true)
+  read -r mt mu ma < <(memory_values)
+  read -r swap_total swap_free < <(awk '/^SwapTotal:/ {t=$2*1024} /^SwapFree:/ {f=$2*1024} END{printf "%.0f %.0f\n",t+0,f+0}' /proc/meminfo)
+  primary_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+  gateway=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3; exit}' || true)
+  if command -v systemd-detect-virt >/dev/null 2>&1; then virt_type=$(systemd-detect-virt 2>/dev/null || true); fi
+  if command -v timedatectl >/dev/null 2>&1; then timezone=$(timedatectl show -p Timezone --value 2>/dev/null || true); fi
+  [[ -n $timezone ]] || timezone=$(cat /etc/timezone 2>/dev/null || true)
+  machine_id=$(cat /etc/machine-id 2>/dev/null || true)
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+  local ip_json route_json block_json mount_json dns_json='[' first=true ns svc
+  ip_json=$(ip -j -details address show 2>/dev/null || printf '[]')
+  route_json=$(ip -j route show table main 2>/dev/null || printf '[]')
+  block_json=$(lsblk --json --bytes -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL,ROTA,TRAN 2>/dev/null || printf '{"blockdevices":[]}')
+  mount_json=$(findmnt --json --bytes -o TARGET,SOURCE,FSTYPE,SIZE,USED,AVAIL,USE% 2>/dev/null || printf '{"filesystems":[]}')
+  while read -r ns; do
+    [[ -n $ns ]] || continue
+    $first || dns_json+=','; first=false
+    dns_json+="\"$(json_escape "$ns")\""
+  done < <(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null)
+  dns_json+=']'
+
+  printf '{'
+  printf '"timestamp":%s,' "$(date +%s)"
+  printf '"host":{"hostname":"%s","fqdn":"%s","machine_id":"%s","boot_id":"%s","architecture":"%s","kernel":"%s","uptime_seconds":%s,"timezone":"%s","virtualization_type":"%s"},' \
+    "$(json_escape "$(hostname 2>/dev/null || true)")" "$(json_escape "$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)")" "$(json_escape "$machine_id")" "$(json_escape "$boot_id")" "$(json_escape "$(uname -m)")" "$(json_escape "$(uname -r)")" "$(uptime_seconds)" "$(json_escape "$timezone")" "$(json_escape "$virt_type")"
+  printf '"os":{"pretty_name":"%s","id":"%s","version_id":"%s","codename":"%s"},' "$(json_escape "$pretty")" "$(json_escape "$os_id")" "$(json_escape "$version_id")" "$(json_escape "$version_codename")"
+  printf '"hardware":{"cpu_model":"%s","logical_cpus":%s,"sockets":"%s","cores_per_socket":"%s","threads_per_core":"%s","memory_total_bytes":%s,"memory_available_bytes":%s,"swap_total_bytes":%s,"swap_free_bytes":%s,"kvm_available":%s},' \
+    "$(json_escape "$cpu_model")" "$(host_cpu_count)" "$(json_escape "$sockets")" "$(json_escape "$cores")" "$(json_escape "$threads")" "$mt" "$ma" "$swap_total" "$swap_free" "$([[ -r $KVM_DEVICE && -w $KVM_DEVICE ]] && printf true || printf false)"
+  printf '"network":{"primary_ipv4":"%s","default_gateway":"%s","dns":%s,"interfaces":%s,"routes":%s},' "$(json_escape "$primary_ip")" "$(json_escape "$gateway")" "$dns_json" "$ip_json" "$route_json"
+  printf '"storage":{"vm_root":"%s","disk_root":"%s","iso_root":"%s","block_devices":%s,"mounts":%s},' "$(json_escape "$VM_ROOT")" "$(json_escape "$DISK_ROOT")" "$(json_escape "$ISO_ROOT")" "$block_json" "$mount_json"
+  printf '"components":{"litevmm":"%s","qemu":"%s","qemu_img":"%s","docker":"%s","gost":"%s","nginx":"%s","lighttpd":"%s","ttyd":"%s","socat":"%s","bash":"%s"},' \
+    "$(json_escape "$(component_version litevmm)")" "$(json_escape "$(component_version qemu)")" "$(json_escape "$(component_version qemu_img)")" "$(json_escape "$(component_version docker)")" "$(json_escape "$(component_version gost)")" "$(json_escape "$(component_version nginx)")" "$(json_escape "$(component_version lighttpd)")" "$(json_escape "$(component_version ttyd)")" "$(json_escape "$(component_version socat)")" "$(json_escape "$(component_version bash)")"
+  printf '"services":{'
+  first=true
+  for svc in docker nginx lighttpd fcgiwrap-vmapi vmapi-network vmapi-overlay ttyd-vmapi ttyd-host-vmapi; do
+    $first || printf ','; first=false
+    printf '"%s":"%s"' "$(json_escape "$svc")" "$(json_escape "$(service_state "$svc")")"
+  done
+  printf '}'
   printf '}\n'
 }
 
@@ -251,6 +338,7 @@ cmd_container() {
 
 case "${1:-help}" in
   host) shift; cmd_host "$@";;
+  system) shift; cmd_system "$@";;
   vm) shift; cmd_vm "$@";;
   container) shift; cmd_container "$@";;
   help|-h|--help) usage;;

@@ -18,8 +18,10 @@ Commands:
   create NAME [options]
   set NAME FIELD VALUE
   start NAME
-  stop NAME [--force]
-  reboot NAME [--force]
+  stop NAME [--force]             Immediate host-side power off
+  shutdown NAME [--timeout SEC] [--force]  Request ACPI shutdown
+  reboot NAME [--force]           Immediate virtual reset
+  restart NAME [--timeout SEC] [--force]   Graceful shutdown then start
   delete NAME
   disk-add NAME --size SIZE [--file FILE] [--format qcow2|raw] [--bus virtio|sata|scsi]
   disk-import-stdin NAME FILE [--format qcow2|raw|vmdk] [--bus virtio|sata|scsi]
@@ -27,9 +29,9 @@ Commands:
   disk-remove NAME INDEX [--delete-file]
   disk-resize NAME INDEX SIZE
   disk-set NAME INDEX bus virtio|sata|scsi
-  nic-add NAME --mode nat|bridge|overlay [--bridge BR|--overlay NAME] [--model MODEL] [--mac MAC]
+  nic-add NAME --mode nat|bridge|overlay [--bridge BR|--overlay NAME] [--model MODEL] [--mac MAC] [--vlan VID]
   nic-remove NAME INDEX
-  nic-set NAME INDEX mode|bridge|model|mac VALUE
+  nic-set NAME INDEX mode|bridge|model|mac|vlan VALUE
   pci-add NAME BDF
   pci-remove NAME INDEX
   console-info NAME
@@ -46,6 +48,7 @@ Create options:
   --bridge BR       required when network=bridge
   --overlay NAME    required when network=overlay (a named VMAPI L2 overlay)
   --nic-model M     virtio-net-pci|e1000|e1000e|rtl8139
+  --vlan VID        802.1Q access VLAN 1-4094 for bridge/overlay NICs
   --autostart B     true|false
   --firmware F      bios|uefi
   --machine M       q35|pc (or another QEMU machine name)
@@ -63,6 +66,8 @@ valid_disk_format() { [[ $1 == qcow2 || $1 == raw || $1 == vmdk ]] || die "Unsup
 valid_disk_bus() { [[ $1 == virtio || $1 == sata || $1 == scsi ]] || die "Unsupported disk bus: $1"; }
 valid_mac() { [[ $1 =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || die "Invalid MAC address: $1"; }
 valid_bridge() { [[ $1 =~ ^[A-Za-z0-9_.:-]{1,31}$ ]] || die "Invalid bridge name: $1"; }
+valid_vlan() { [[ ${1:-} =~ ^[0-9]{1,4}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 4094 )) || die "Invalid VLAN ID: ${1:-}; expected 1-4094"; }
+vm_tap_name() { local n; n=$(printf '%s' "$1:$2" | cksum | awk '{print $1}'); printf 'tap%s' "$n"; }
 valid_overlay() { [[ $1 =~ ^[a-z][a-z0-9-]{0,10}$ ]] || die "Invalid overlay name: $1"; }
 overlay_bridge() { local name=$1 file=${VMAPI_OVERLAY_ROOT:-/etc/vmapi/overlays}/$name.conf; valid_overlay "$name"; [[ -r $file ]] || die "Overlay not found: $name"; local NAME='' BRIDGE=''; source "$file"; valid_bridge "$BRIDGE"; printf '%s' "$BRIDGE"; }
 valid_pci_bdf() { [[ $1 =~ ^([0-9A-Fa-f]{4}:)?[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] || die "Invalid PCI BDF: $1"; }
@@ -84,14 +89,14 @@ cmd_create() {
   [[ ! -e "$VM_ROOT/$name" && ! -e "$DISK_ROOT/$name" ]] || die "VM already exists: $name"
 
   local memory=$DEFAULT_MEMORY_MB cpus=$DEFAULT_VCPUS disk='' disk_format=$DEFAULT_DISK_FORMAT disk_bus=$DEFAULT_DISK_BUS
-  local iso='' network=nat bridge='' overlay='' nic_model=$DEFAULT_NIC_MODEL autostart=false firmware=bios
+  local iso='' network=nat bridge='' overlay='' vlan='' nic_model=$DEFAULT_NIC_MODEL autostart=false firmware=bios
   local machine=$DEFAULT_MACHINE cpu=$DEFAULT_CPU allow_tcg=false vnc_display='' vnc_bind=$DEFAULT_VNC_BIND display=vnc boot=c
   while (($#)); do
     case "$1" in
       --memory) memory=${2:?}; shift 2;; --cpus) cpus=${2:?}; shift 2;; --disk) disk=${2:?}; shift 2;;
       --disk-format) disk_format=${2:?}; shift 2;; --disk-bus) disk_bus=${2:?}; shift 2;;
       --iso) iso=${2:?}; shift 2;; --network) network=${2:?}; shift 2;; --bridge) bridge=${2:?}; shift 2;; --overlay) overlay=${2:?}; shift 2;;
-      --nic-model) nic_model=${2:?}; shift 2;; --autostart) autostart=${2:?}; shift 2;;
+      --nic-model) nic_model=${2:?}; shift 2;; --vlan) vlan=${2:?}; shift 2;; --autostart) autostart=${2:?}; shift 2;;
       --firmware) firmware=${2:?}; shift 2;; --machine) machine=${2:?}; shift 2;; --cpu) cpu=${2:?}; shift 2;; --emulation) allow_tcg=${2:?}; shift 2;;
       --vnc-display) vnc_display=${2:?}; shift 2;; --vnc-bind) vnc_bind=${2:?}; shift 2;;
       --display) display=${2:?}; shift 2;; --boot) boot=${2:?}; shift 2;;
@@ -103,6 +108,7 @@ cmd_create() {
   [[ $network == nat || $network == bridge || $network == overlay || $network == none ]] || die "network must be nat, bridge, overlay, or none"
   [[ $network != bridge ]] || { [[ -n "$bridge" ]] || die "--bridge is required for bridged networking"; valid_bridge "$bridge"; }
   [[ $network != overlay ]] || { [[ -n "$overlay" ]] || die "--overlay is required for overlay networking"; bridge=$(overlay_bridge "$overlay"); }
+  if [[ -n $vlan ]]; then valid_vlan "$vlan"; [[ $network == bridge || $network == overlay ]] || die "--vlan requires bridge or overlay networking"; fi
   [[ $firmware == bios || $firmware == uefi ]] || die "firmware must be bios or uefi"
   [[ $display == vnc || $display == none ]] || die "display must be vnc or none"
   [[ $boot =~ ^[acdn]{1,4}$ ]] || die "Invalid QEMU boot order: $boot"
@@ -158,6 +164,7 @@ NIC_0_MODEL=$nic_model
 NIC_0_MAC=$mac
 NIC_0_BRIDGE=$bridge
 NIC_0_OVERLAY=$overlay
+NIC_0_VLAN=$vlan
 CFG
   fi
   printf '%s\n' "$name"
@@ -251,15 +258,16 @@ cmd_disk_set() {
 
 cmd_nic_add() {
   local name=${1:?}; shift; require_vm "$name"; require_stopped "$name"
-  local mode='' bridge='' overlay='' model=$DEFAULT_NIC_MODEL mac=''
+  local mode='' bridge='' overlay='' vlan='' model=$DEFAULT_NIC_MODEL mac=''
   while (($#)); do case "$1" in
-    --mode) mode=${2:?}; shift 2;; --bridge) bridge=${2:?}; shift 2;; --overlay) overlay=${2:?}; shift 2;; --model) model=${2:?}; shift 2;; --mac) mac=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+    --mode) mode=${2:?}; shift 2;; --bridge) bridge=${2:?}; shift 2;; --overlay) overlay=${2:?}; shift 2;; --model) model=${2:?}; shift 2;; --mac) mac=${2:?}; shift 2;; --vlan) vlan=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
   [[ $mode == nat || $mode == bridge || $mode == overlay ]] || die "--mode must be nat, bridge, or overlay"; valid_nic_model "$model"
   if [[ $mode == bridge ]]; then [[ -n $bridge ]] || die "--bridge is required"; valid_bridge "$bridge"; fi
   if [[ $mode == overlay ]]; then [[ -n $overlay ]] || die "--overlay is required"; bridge=$(overlay_bridge "$overlay"); fi
+  if [[ -n $vlan ]]; then valid_vlan "$vlan"; [[ $mode == bridge || $mode == overlay ]] || die "--vlan requires bridge or overlay mode"; fi
   [[ -n $mac ]] || mac=$(random_mac); valid_mac "$mac"
   local conf; conf=$(vm_conf "$name"); local idx; idx=$(next_index "$conf" NIC)
-  cfg_set_file "$conf" "NIC_${idx}_MODE" "$mode"; cfg_set_file "$conf" "NIC_${idx}_MODEL" "$model"; cfg_set_file "$conf" "NIC_${idx}_MAC" "$mac"; cfg_set_file "$conf" "NIC_${idx}_BRIDGE" "$bridge"; cfg_set_file "$conf" "NIC_${idx}_OVERLAY" "$overlay"
+  cfg_set_file "$conf" "NIC_${idx}_MODE" "$mode"; cfg_set_file "$conf" "NIC_${idx}_MODEL" "$model"; cfg_set_file "$conf" "NIC_${idx}_MAC" "$mac"; cfg_set_file "$conf" "NIC_${idx}_BRIDGE" "$bridge"; cfg_set_file "$conf" "NIC_${idx}_OVERLAY" "$overlay"; cfg_set_file "$conf" "NIC_${idx}_VLAN" "$vlan"
   printf '%s\n' "$idx"
 }
 cmd_nic_remove() {
@@ -278,6 +286,7 @@ cmd_nic_set() {
     bridge) [[ -z $value ]] || valid_bridge "$value"; cfg_set_file "$conf" "NIC_${idx}_BRIDGE" "$value";;
     model) valid_nic_model "$value"; cfg_set_file "$conf" "NIC_${idx}_MODEL" "$value";;
     mac) valid_mac "$value"; cfg_set_file "$conf" "NIC_${idx}_MAC" "$value";;
+    vlan) [[ -z $value ]] || valid_vlan "$value"; cfg_set_file "$conf" "NIC_${idx}_VLAN" "$value";;
     *) die "Unsupported NIC field: $field";;
   esac
 }
@@ -347,12 +356,19 @@ build_qemu_args() {
   if [[ -n $iso ]]; then local ipath; ipath=$(resolve_image "$iso"); QEMU_ARGS+=(-drive "file=$ipath,media=cdrom,readonly=on"); fi
   QEMU_ARGS+=(-boot "order=$(cfg_get_file "$conf" BOOT_ORDER c)")
 
-  local mode model mac br
+  local mode model mac br vlan tap
   while read -r idx; do
-    mode=$(cfg_get_file "$conf" "NIC_${idx}_MODE" nat); model=$(cfg_get_file "$conf" "NIC_${idx}_MODEL" "$DEFAULT_NIC_MODEL"); mac=$(cfg_get_file "$conf" "NIC_${idx}_MAC" ''); br=$(cfg_get_file "$conf" "NIC_${idx}_BRIDGE" '')
+    mode=$(cfg_get_file "$conf" "NIC_${idx}_MODE" nat); model=$(cfg_get_file "$conf" "NIC_${idx}_MODEL" "$DEFAULT_NIC_MODEL"); mac=$(cfg_get_file "$conf" "NIC_${idx}_MAC" ''); br=$(cfg_get_file "$conf" "NIC_${idx}_BRIDGE" ''); vlan=$(cfg_get_file "$conf" "NIC_${idx}_VLAN" '')
     case "$mode" in
       nat) QEMU_ARGS+=(-netdev "user,id=net$idx" -device "$model,netdev=net$idx,mac=$mac");;
-      bridge|overlay) valid_bridge "$br"; QEMU_ARGS+=(-netdev "bridge,id=net$idx,br=$br" -device "$model,netdev=net$idx,mac=$mac");;
+      bridge|overlay)
+        valid_bridge "$br"
+        if [[ -n $vlan ]]; then
+          valid_vlan "$vlan"; tap=$(vm_tap_name "$name" "$idx")
+          QEMU_ARGS+=(-netdev "tap,id=net$idx,ifname=$tap,script=no,downscript=no" -device "$model,netdev=net$idx,mac=$mac")
+        else
+          QEMU_ARGS+=(-netdev "bridge,id=net$idx,br=$br" -device "$model,netdev=net$idx,mac=$mac")
+        fi;;
       *) die "Unsupported NIC mode in config: $mode";;
     esac
   done < <(indexes_for "$conf" NIC)
@@ -370,14 +386,39 @@ build_qemu_args() {
 }
 
 cmd_command() { build_qemu_args "$1"; printf '%q ' "${QEMU_ARGS[@]}"; printf '\n'; }
+netctl_priv() {
+  local tool=${NETCTL:-/usr/local/bin/netctl}
+  if [[ $EUID -eq 0 ]]; then "$tool" "$@"; else sudo -n "$tool" "$@"; fi
+}
+prepare_vlan_taps() {
+  local name=$1 conf idx mode br vlan tap
+  conf=$(vm_conf "$name")
+  while read -r idx; do
+    mode=$(cfg_get_file "$conf" "NIC_${idx}_MODE" nat); vlan=$(cfg_get_file "$conf" "NIC_${idx}_VLAN" '')
+    [[ -n $vlan && ( $mode == bridge || $mode == overlay ) ]] || continue
+    br=$(cfg_get_file "$conf" "NIC_${idx}_BRIDGE" ''); valid_bridge "$br"; valid_vlan "$vlan"; tap=$(vm_tap_name "$name" "$idx")
+    netctl_priv vm-tap-up "$tap" "$br" --vlan "$vlan" >/dev/null
+  done < <(indexes_for "$conf" NIC)
+}
+cleanup_vlan_taps() {
+  local name=$1 conf idx vlan tap
+  conf=$(vm_conf "$name")
+  while read -r idx; do
+    vlan=$(cfg_get_file "$conf" "NIC_${idx}_VLAN" ''); [[ -n $vlan ]] || continue
+    tap=$(vm_tap_name "$name" "$idx"); netctl_priv vm-tap-down "$tap" >/dev/null 2>&1 || true
+  done < <(indexes_for "$conf" NIC)
+}
 cmd_start() {
   local name=${1:?}; require_vm "$name"; [[ $(vm_state "$name") == stopped ]] || die "VM is already running: $name"
   need_cmd "$QEMU_BIN"; mkdir -p "$(vm_dir "$name")/runtime"; rm -f -- "$(vm_dir "$name")/runtime/"{qemu.pid,qmp.sock,serial.sock}
+  prepare_vlan_taps "$name"
+  trap 'cleanup_vlan_taps "$name"' ERR
   build_qemu_args "$name"
   QEMU_ARGS+=(-daemonize -pidfile "$(vm_dir "$name")/runtime/qemu.pid")
   "${QEMU_ARGS[@]}"
   sleep 0.15
   require_running "$name"
+  trap - ERR
   vm_pid "$name"
 }
 
@@ -401,6 +442,39 @@ cmd_stop() {
   if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; sleep 1; fi
   kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
   rm -f -- "$(vm_dir "$name")/runtime/"{qemu.pid,qmp.sock,serial.sock}
+  cleanup_vlan_taps "$name"
+}
+wait_for_vm_exit() {
+  local name=$1 timeout=$2 pid i ticks
+  pid=$(vm_pid "$name") || return 0; ticks=$((timeout*2))
+  for ((i=0;i<ticks;i++)); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    [[ $(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) == Z ]] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+cmd_shutdown() {
+  local name=${1:?}; shift || true; require_vm "$name"; require_running "$name"
+  local timeout=$STOP_TIMEOUT force=false
+  while (($#)); do case "$1" in --timeout) timeout=${2:?}; shift 2;; --force) force=true; shift;; *) die "Unknown option: $1";; esac; done
+  validate_positive_int "$timeout"; (( timeout <= 600 )) || die "Shutdown timeout must be 600 seconds or less"
+  if ! qmp_exec "$name" system_powerdown; then
+    $force && { cmd_stop "$name" --force; return; }
+    die "Could not request ACPI shutdown; use force power off if the guest has no working ACPI path"
+  fi
+  if wait_for_vm_exit "$name" "$timeout"; then
+    rm -f -- "$(vm_dir "$name")/runtime/"{qemu.pid,qmp.sock,serial.sock}; cleanup_vlan_taps "$name"; return
+  fi
+  $force && { cmd_stop "$name" --force; return; }
+  die "Guest did not shut down within ${timeout}s; use force power off if required"
+}
+cmd_restart() {
+  local name=${1:?}; shift || true; local timeout=$STOP_TIMEOUT force=false
+  while (($#)); do case "$1" in --timeout) timeout=${2:?}; shift 2;; --force) force=true; shift;; *) die "Unknown option: $1";; esac; done
+  local args=("$name" --timeout "$timeout"); $force && args+=(--force)
+  cmd_shutdown "${args[@]}"
+  cmd_start "$name" >/dev/null
 }
 cmd_reboot() {
   local name=${1:?}; shift || true; require_vm "$name"; require_running "$name"
@@ -432,7 +506,7 @@ main() {
   local cmd=${1:-help}; shift || true
   case "$cmd" in
     help|-h|--help) usage;; list) cmd_list "$@";; show) cmd_show "$@";; status) cmd_status "$@";; create) cmd_create "$@";; set) cmd_set "$@";;
-    start) cmd_start "$@";; stop) cmd_stop "$@";; reboot) cmd_reboot "$@";; delete) cmd_delete "$@";;
+    start) cmd_start "$@";; stop) cmd_stop "$@";; shutdown) cmd_shutdown "$@";; reboot) cmd_reboot "$@";; restart) cmd_restart "$@";; delete) cmd_delete "$@";;
     disk-add) cmd_disk_add "$@";; disk-import-stdin) cmd_disk_import_stdin "$@";; disk-download) cmd_disk_download "$@";; disk-remove) cmd_disk_remove "$@";; disk-resize) cmd_disk_resize "$@";; disk-set) cmd_disk_set "$@";; nic-add) cmd_nic_add "$@";; nic-remove) cmd_nic_remove "$@";; nic-set) cmd_nic_set "$@";;
     pci-add) cmd_pci_add "$@";; pci-remove) cmd_pci_remove "$@";; console-info) cmd_console_info "$@";; command) cmd_command "$@";;
     *) usage >&2; die "Unknown command: $cmd";;

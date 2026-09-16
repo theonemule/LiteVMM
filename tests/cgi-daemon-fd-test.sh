@@ -22,7 +22,7 @@ cat > "$tmp/vms/demo/vm.conf" <<'EOF'
 NAME=demo
 EOF
 
-response=$(timeout 1 bash -c 'REQUEST_METHOD=POST PATH_INFO=/vms/demo/start VMAPI_LIB="$1/lib/common.sh" VMCTL="$2/daemon-vmctl" VM_ROOT="$2/vms" IMAGE_ROOT="$2/images" "$1/cgi/api.cgi"' _ "$ROOT" "$tmp")
+response=$(timeout 1 bash -c 'REQUEST_METHOD=POST PATH_INFO=/vms/demo/start VMAPI_LIB="$1/lib/common.sh" VMCTL="$2/daemon-vmctl" VM_ROOT="$2/vms" IMAGE_ROOT="$2/images" bash "$1/cgi/api.cgi"' _ "$ROOT" "$tmp")
 [[ $response == *'Status: 200 OK'* ]]
 [[ $response == *'"state":"running"'* ]]
 echo 'cgi daemon FD: PASS'

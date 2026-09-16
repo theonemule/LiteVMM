@@ -12,8 +12,10 @@ Open **Virtual machines** from the left menu to see one row per QEMU/KVM guest. 
 | **Edit** | Opens the VM hardware and device editor. | Hardware fields are saved for the next boot; stop the VM first. |
 | **Backups** | Opens backups and the backup schedule for this VM. | A backup archive may be local or sent to a paired host. |
 | **Start** | Starts a stopped guest. | The guest consumes its configured CPU and memory on the host. |
-| **Stop** | Requests a graceful shutdown of a running guest. | Wait for the state to become stopped before hardware edits. |
-| **Reboot** | Restarts a running guest. | Interrupts applications inside the guest. |
+| **Shutdown** | Requests an ACPI power-down and waits for the guest to stop. | Preferred for normal guest shutdown. |
+| **Restart** | Gracefully shuts down and then starts the guest. | Preferred for an orderly restart. |
+| **Power off** | Terminates QEMU from the host. | Immediate; use when graceful shutdown is unsuitable or fails. |
+| **Reset** | Sends QMP `system_reset`. | Immediate virtual hardware reset; interrupts applications. |
 | **Console** | Opens a short-lived browser noVNC session. | Available only for a running VM with VNC display enabled. |
 | **Migrate** | Copies a stopped VM to a paired host. | The source is removed only after the destination import succeeds. |
 | **Delete** | Removes the VM configuration and per-VM disk folder. | This removes its disks; make a backup first. |
@@ -65,3 +67,7 @@ Open **Backups** from the VM row. **Backup now** queues an archive job and shows
 **Configure plan** creates daily, weekly, and monthly retention tiers. Each enabled tier has a keep count and schedule time. Removing a plan only stops future backups; it does not delete existing archives. Local archives can be **Download**ed, **Restore**d, or **Delete**d; peer-held archives appear in a separate paired-host inventory and can be downloaded from there. Restore requires that the VM name does not already exist.
 
 For a host move, stop the VM, select **Migrate**, and choose a paired peer that has a configured endpoint. LiteVMM transfers and imports it remotely first. Only a successful import causes the source to be removed.
+
+## VLAN-tagged VM adapters
+
+A bridged NIC can optionally specify a **VLAN ID** from 1 through 4094. LiteVMM presents the VM-side TAP as an untagged access port in that VLAN and allows the VLAN on non-VM bridge ports. The upstream physical or virtual switch must carry that VLAN. Leave the field blank for an ordinary untagged bridged NIC. NAT adapters do not accept a VLAN ID.

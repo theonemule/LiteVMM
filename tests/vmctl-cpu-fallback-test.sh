@@ -25,14 +25,14 @@ EOF
 # nested installers unusable, so the normal VM start path identifies the
 # missing KVM device instead.
 if VMAPI_CONFIG=/dev/null VMAPI_LIB="$ROOT/lib/common.sh" VM_ROOT="$tmp/vms" IMAGE_ROOT="$tmp/images" \
-  QEMU_BIN=/usr/bin/qemu-system-x86_64 KVM_DEVICE="$tmp/no-kvm" "$ROOT/bin/vmctl" command demo >"$tmp/out" 2>"$tmp/error"; then
+  QEMU_BIN=/usr/bin/qemu-system-x86_64 KVM_DEVICE="$tmp/no-kvm" bash "$ROOT/bin/vmctl" command demo >"$tmp/out" 2>"$tmp/error"; then
   echo 'expected unavailable KVM to reject implicit software emulation' >&2
   exit 1
 fi
 grep -Fq 'KVM acceleration is unavailable' "$tmp/error"
 printf 'ALLOW_TCG=true\n' >> "$tmp/vms/demo/vm.conf"
 command=$(VMAPI_CONFIG=/dev/null VMAPI_LIB="$ROOT/lib/common.sh" VM_ROOT="$tmp/vms" IMAGE_ROOT="$tmp/images" \
-  QEMU_BIN=/usr/bin/qemu-system-x86_64 KVM_DEVICE="$tmp/no-kvm" "$ROOT/bin/vmctl" command demo)
+  QEMU_BIN=/usr/bin/qemu-system-x86_64 KVM_DEVICE="$tmp/no-kvm" bash "$ROOT/bin/vmctl" command demo)
 [[ $command == *'-cpu max'* ]]
 [[ $command != *'-cpu host'* ]]
 [[ $command == *'-accel tcg\,thread=multi'* ]]
