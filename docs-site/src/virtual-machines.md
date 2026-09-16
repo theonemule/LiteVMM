@@ -42,13 +42,13 @@ Open **Virtual machines** from the left menu to see one row per QEMU/KVM guest. 
 | **Network: None** | Gives the VM no NIC. Useful for isolated appliance work. |
 | **NIC model** | `virtio-net-pci` is normal for modern guests. `e1000e`, `e1000`, and `rtl8139` are compatibility choices. |
 | **Display / VNC bind** | **VNC** enables the browser console; the default bind address keeps VNC local to the host. **None** creates no graphical console. |
-| **Start at host boot** | Starts the VM when the TinyVisor host starts. Use it only for guests that should recover automatically. |
+| **Start at host boot** | Starts the VM when the LiteVMM host starts. Use it only for guests that should recover automatically. |
 
 ## Edit a VM safely
 
 Select **Edit**. The dialog starts with live CPU, memory, disk-allocation, and network measurements. Those charts refresh every five seconds and are a quick health check, not guest monitoring.
 
-The **Hardware** section edits vCPUs, memory, CPU model, machine type, ISO, boot order, display, and autostart. If the guest is running, TinyVisor warns that hardware values cannot be changed until it is stopped. Save after reviewing all fields.
+The **Hardware** section edits vCPUs, memory, CPU model, machine type, ISO, boot order, display, and autostart. If the guest is running, LiteVMM warns that hardware values cannot be changed until it is stopped. Save after reviewing all fields.
 
 The **Disks** section lists every disk. **Add disk** asks for capacity, format, and bus. The VM overview's **Disk storage** modal also uploads QCOW2, RAW, and VMDK files directly into the selected VM's disk folder and attaches them as data disks. The remove control deletes the disk image as well as disconnecting it, so back up data before using it.
 
@@ -64,4 +64,4 @@ Open **Backups** from the VM row. **Backup now** queues an archive job and shows
 
 **Configure plan** creates daily, weekly, and monthly retention tiers. Each enabled tier has a keep count and schedule time. Removing a plan only stops future backups; it does not delete existing archives. Local archives can be **Download**ed, **Restore**d, or **Delete**d; peer-held archives appear in a separate paired-host inventory and can be downloaded from there. Restore requires that the VM name does not already exist.
 
-For a host move, stop the VM, select **Migrate**, and choose a paired peer that has a configured endpoint. TinyVisor transfers and imports it remotely first. Only a successful import causes the source to be removed.
+For a host move, stop the VM, select **Migrate**, and choose a paired peer that has a configured endpoint. LiteVMM transfers and imports it remotely first. Only a successful import causes the source to be removed.

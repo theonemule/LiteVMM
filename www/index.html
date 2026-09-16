@@ -1,11 +1,11 @@
 <!doctype html>
-<!-- TinyVisor's primary single-page administration console. app.js renders the selected route into this static shell. -->
+<!-- LiteVMM's primary single-page administration console. app.js renders the selected route into this static shell. -->
 <html lang="en" data-bs-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>TinyVisor Console</title>
+  <title>LiteVMM Console</title>
   <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
   <link rel="stylesheet" href="/app.css">
 </head>
@@ -14,7 +14,7 @@
     <aside class="sidebar d-none d-lg-flex flex-column p-3">
       <a class="brand d-flex align-items-center gap-3 text-decoration-none" href="#dashboard" data-route="dashboard">
         <span class="brand-mark">V</span>
-          <span><strong>TinyVisor</strong><small class="d-block">Minimalist hypervisor</small></span>
+          <span><strong>LiteVMM</strong><small class="d-block">Minimalist hypervisor</small></span>
       </a>
       <nav class="nav nav-pills flex-column gap-1 mt-4" id="sideNav">
         <a class="nav-link active" href="#dashboard" data-route="dashboard">Overview</a>
@@ -36,7 +36,7 @@
       <header class="topbar border-bottom px-3 px-md-4 d-flex align-items-center gap-3 sticky-top">
         <button class="btn btn-sm btn-outline-secondary d-lg-none" data-bs-toggle="offcanvas" data-bs-target="#mobileNav" aria-label="Open navigation">Menu</button>
         <div>
-          <div id="pageEyebrow" class="small text-uppercase text-secondary fw-semibold">TinyVisor</div>
+          <div id="pageEyebrow" class="small text-uppercase text-secondary fw-semibold">LiteVMM</div>
           <h1 id="pageTitle" class="h5 mb-0">Overview</h1>
         </div>
         <div class="host-switcher ms-md-auto">
@@ -57,7 +57,7 @@
 
   <div class="offcanvas offcanvas-start" tabindex="-1" id="mobileNav">
     <div class="offcanvas-header">
-        <div><strong>TinyVisor</strong><div class="small text-secondary">Minimalist hypervisor</div></div>
+        <div><strong>LiteVMM</strong><div class="small text-secondary">Minimalist hypervisor</div></div>
       <button type="button" class="btn-close" data-bs-dismiss="offcanvas"></button>
     </div>
     <div class="offcanvas-body">
@@ -86,7 +86,7 @@
 
   <div class="toast-container position-fixed bottom-0 end-0 p-3">
     <div id="appToast" class="toast" role="status" aria-live="polite">
-  <div class="toast-header"><strong id="toastTitle" class="me-auto">TinyVisor</strong><button type="button" class="btn-close" data-bs-dismiss="toast"></button></div>
+  <div class="toast-header"><strong id="toastTitle" class="me-auto">LiteVMM</strong><button type="button" class="btn-close" data-bs-dismiss="toast"></button></div>
       <div id="toastBody" class="toast-body"></div>
     </div>
   </div>

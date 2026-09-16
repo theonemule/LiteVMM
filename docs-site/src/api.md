@@ -4,7 +4,7 @@ title: API reference
 ---
 # API reference
 
-All browser API paths begin with `/api` and require the same HTTP Basic authentication as the console. Forms use `application/x-www-form-urlencoded`; image/file/Compose uploads stream raw request bodies. Responses are JSON unless downloading content, logs, archives, or pairing bundles. The service identity returned from `GET /api/` is `tinyvisor`; the established `vmapi` command and filesystem identifiers remain compatible.
+All browser API paths begin with `/api` and require the same HTTP Basic authentication as the console. Forms use `application/x-www-form-urlencoded`; image/file/Compose uploads stream raw request bodies. Responses are JSON unless downloading content, logs, archives, or pairing bundles. The service identity returned from `GET /api/` is `litevmm`; the established `vmapi` command and filesystem identifiers remain compatible.
 
 | Resource | Operations |
 |---|---|

@@ -4,7 +4,7 @@ title: Console modal reference
 ---
 # Console modal reference
 
-This is the field-by-field reference for every operator modal in TinyVisor. The main task guides explain *when* to use a workflow; this page explains precisely what is in each dialog, what buttons are available, and what saving it changes.
+This is the field-by-field reference for every operator modal in LiteVMM. The main task guides explain *when* to use a workflow; this page explains precisely what is in each dialog, what buttons are available, and what saving it changes.
 
 ## General modal controls
 
@@ -109,7 +109,7 @@ In **Snapshot**, set an **Image tag**, optional **Message**, and decide whether 
 
 ### Deploy Compose project
 
-Set a unique **Project name**. Choose a Compose file to copy its contents into the editor, or paste YAML into **Compose YAML**. Select **Deploy** to save the YAML and apply it. In the project list, **View** is read-only, **Deploy** reapplies saved YAML, **Stop** runs the project down operation, and **Delete** stops it and removes the saved TinyVisor project definition.
+Set a unique **Project name**. Choose a Compose file to copy its contents into the editor, or paste YAML into **Compose YAML**. Select **Deploy** to save the YAML and apply it. In the project list, **View** is read-only, **Deploy** reapplies saved YAML, **Stop** runs the project down operation, and **Delete** stops it and removes the saved LiteVMM project definition.
 
 ## Image, volume, and network modals
 

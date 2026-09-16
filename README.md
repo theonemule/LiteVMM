@@ -1,6 +1,6 @@
-# TinyVisor 0.4
+# LiteVMM 0.4
 
-TinyVisor is a deliberately minimalist QEMU/KVM hypervisor console with optional Docker management. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. TinyVisor includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
+LiteVMM is a deliberately minimalist QEMU/KVM hypervisor console with optional Docker management. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, Python, PHP, application server, or front-end build runtime.
 
 There is no application database, no libvirt dependency, no Python/Node backend, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. Existing `vmapi` command, path, environment-variable, and API identifiers are retained for compatibility.
 
@@ -424,7 +424,7 @@ bridge definitions. A guest installed from an Alpine ISO should choose DHCP for
 its own `eth0` during `setup-alpine`; that guest configuration then survives
 its reboot and installation.
 
-If the TinyVisor host is itself a Hyper-V VM, the parent Hyper-V host must
+If the LiteVMM host is itself a Hyper-V VM, the parent Hyper-V host must
 allow the nested QEMU guest MAC addresses:
 
 ```powershell

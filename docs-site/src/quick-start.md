@@ -6,7 +6,7 @@ title: Quick start
 
 ## 1. Choose a disposable development host
 
-Use a Linux host with hardware virtualization available for VMs. Docker features require a running local Docker daemon. TinyVisor's default listener is local-only on Debian; use an SSH tunnel until TLS is configured.
+Use a Linux host with hardware virtualization available for VMs. Docker features require a running local Docker daemon. LiteVMM's default listener is local-only on Debian; use an SSH tunnel until TLS is configured.
 
 ## 2. Install
 
@@ -34,4 +34,4 @@ Open <http://127.0.0.1:8080/> and complete the HTTP Basic challenge. The same au
 VMAPI_PASSWORD='...' ./tests/api-regression-curl.sh http://127.0.0.1:8080 YOUR_LOGIN
 ```
 
-This creates uniquely named, recoverable TinyVisor/Docker/Compose/file fixtures and removes them. Add `--destructive` only on a disposable development host to test temporary host bridge and paired-overlay operations.
+This creates uniquely named, recoverable LiteVMM/Docker/Compose/file fixtures and removes them. Add `--destructive` only on a disposable development host to test temporary host bridge and paired-overlay operations.

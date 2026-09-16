@@ -4,7 +4,7 @@ title: Cluster pairing
 ---
 # Cluster and pairing
 
-The **Cluster** menu establishes trust between TinyVisor hosts you administer. Pairing allows a host to manage a selected peer, migrate stopped VMs, send backups to it, and create paired-host overlays. It does not turn unrelated machines into one shared filesystem or automatically expose their management interfaces.
+The **Cluster** menu establishes trust between LiteVMM hosts you administer. Pairing allows a host to manage a selected peer, migrate stopped VMs, send backups to it, and create paired-host overlays. It does not turn unrelated machines into one shared filesystem or automatically expose their management interfaces.
 
 ## Pair two hosts
 

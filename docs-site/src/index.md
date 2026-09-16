@@ -2,9 +2,9 @@
 layout: layout.njk
 title: Overview
 ---
-# TinyVisor documentation
+# LiteVMM documentation
 
-TinyVisor is a minimalist QEMU/KVM hypervisor console with optional Docker management. Its purpose is to make a small set of host virtualization operations understandable, inspectable, and directly operable without a heavyweight control plane. The host filesystem stores VM state; Docker remains authoritative for its own objects. A static Bootstrap console calls a Bash CGI API through Nginx/fcgiwrap on Debian or lighttpd/fcgiwrap on Alpine.
+LiteVMM is a minimalist QEMU/KVM hypervisor console with optional Docker management. Its purpose is to make a small set of host virtualization operations understandable, inspectable, and directly operable without a heavyweight control plane. The host filesystem stores VM state; Docker remains authoritative for its own objects. A static Bootstrap console calls a Bash CGI API through Nginx/fcgiwrap on Debian or lighttpd/fcgiwrap on Alpine.
 
 ## Start here
 
@@ -25,4 +25,4 @@ Browser or curl → Nginx/lighttpd → fcgiwrap → cgi/api.cgi
 
 The CGI router validates HTTP input and delegates work to narrowly focused shell tools. Those tools are also usable directly over SSH. There is no database, libvirt dependency, application server, or frontend build step in the runtime product.
 
-<div class="callout">Treat access to TinyVisor as host-administrator access. In particular, Docker socket access is effectively root-equivalent. Internal commands, paths, and API routes retain the <code>vmapi</code> name for compatibility.</div>
+<div class="callout">Treat access to LiteVMM as host-administrator access. In particular, Docker socket access is effectively root-equivalent. Internal commands, paths, and API routes retain the <code>vmapi</code> name for compatibility.</div>

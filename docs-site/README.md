@@ -1,6 +1,6 @@
-# TinyVisor documentation site
+# LiteVMM documentation site
 
-This is a standalone [Eleventy](https://www.11ty.dev/) site. It does not ship to, or run on, a TinyVisor host.
+This is a standalone [Eleventy](https://www.11ty.dev/) site. It does not ship to, or run on, a LiteVMM host.
 
 ```bash
 cd docs-site

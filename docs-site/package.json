@@ -1,9 +1,9 @@
 {
-  "name": "tinyvisor-documentation",
+  "name": "litevmm-documentation",
   "private": true,
   "type": "module",
   "version": "0.1.0",
-  "description": "Standalone Eleventy documentation site for TinyVisor",
+  "description": "Standalone Eleventy documentation site for LiteVMM",
   "scripts": {
     "build": "eleventy",
     "start": "eleventy --serve",

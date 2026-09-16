@@ -259,7 +259,7 @@ fi
 read_params
 
 if [[ -z $route ]]; then
-  reply '200 OK' "{\"service\":\"tinyvisor\",\"version\":4,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":[\"qemu-kvm\",\"docker\",\"web-console\",\"metrics\"]}"
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":4,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":[\"qemu-kvm\",\"docker\",\"web-console\",\"metrics\"]}"
 fi
 
 case "${P[0]-}" in

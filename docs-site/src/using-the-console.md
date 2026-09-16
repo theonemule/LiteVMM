@@ -1,10 +1,10 @@
 ---
 layout: layout.njk
-title: Using the TinyVisor console
+title: Using the LiteVMM console
 ---
-# Using the TinyVisor console
+# Using the LiteVMM console
 
-This is the administrator's guide to the TinyVisor web console. It describes what you see after signing in, what each action changes, and when not to use an action. It does not require API knowledge. Use the dedicated pages for [virtual machines](/virtual-machines/), [containers and Compose](/containers-and-compose/), [images and storage](/images-and-storage/), [networks](/networking/), and [cluster pairing](/cluster/). For every field and submit button inside those dialogs, use the [console modal reference](/modal-reference/).
+This is the administrator's guide to the LiteVMM web console. It describes what you see after signing in, what each action changes, and when not to use an action. It does not require API knowledge. Use the dedicated pages for [virtual machines](/virtual-machines/), [containers and Compose](/containers-and-compose/), [images and storage](/images-and-storage/), [networks](/networking/), and [cluster pairing](/cluster/). For every field and submit button inside those dialogs, use the [console modal reference](/modal-reference/).
 
 ## Understand the screen before changing anything
 
@@ -70,13 +70,13 @@ The Details modal is the hardware editor. Save settings only while the VM is sto
 
 **Create container** opens a form with name, image, optional hostname, restart policy, CPU/memory limits, network, user, working directory, entrypoint, read-only filesystem, environment entries, published ports, volumes, labels, and command arguments.
 
-Use Docker syntax: a port is `8080:80`, an environment entry is `NAME=value`, and a volume is `volume-name:/path`. The **Command arguments** box is one argument per line. Avoid shell quoting there; TinyVisor passes each line as one argument.
+Use Docker syntax: a port is `8080:80`, an environment entry is `NAME=value`, and a volume is `volume-name:/path`. The **Command arguments** box is one argument per line. Avoid shell quoting there; LiteVMM passes each line as one argument.
 
 Per-container actions are **Start**, **Stop**, **Restart**, **Inspect**, **Edit resources**, **Logs**, **Terminal**, **Snapshot**, and **Delete**. Snapshot creates a Docker image from the current container; choose a clear image tag and leave **pause while committing** enabled unless you have a reason not to. The terminal command defaults to `/bin/sh` and must exist inside the container.
 
 ### Compose page
 
-**Deploy Compose project** accepts a project name plus pasted YAML or a `.yaml`/`.yml` file. TinyVisor validates it before deployment. Use the project name as a stable application identifier, for example `blog-stack`. **View** shows the stored YAML; **Deploy** applies it again; **Down** stops the stack; **Delete** stops it and removes TinyVisor's stored project file. Review YAML carefully: Compose can mount host files and expose ports.
+**Deploy Compose project** accepts a project name plus pasted YAML or a `.yaml`/`.yml` file. LiteVMM validates it before deployment. Use the project name as a stable application identifier, for example `blog-stack`. **View** shows the stored YAML; **Deploy** applies it again; **Down** stops the stack; **Delete** stops it and removes LiteVMM's stored project file. Review YAML carefully: Compose can mount host files and expose ports.
 
 ## Images, networks, and volumes
 
@@ -100,7 +100,7 @@ A Docker network modal asks for name, driver, subnet, gateway, and **internal-on
 
 ## Cluster page
 
-Use Cluster only when connecting TinyVisor hosts you administer. The normal flow is **Export pairing request** on host A, **Import pairing request** on host B, then **Import pairing response** on host A. Pairing bundles are secrets: transfer them through a trusted channel and never paste them into tickets or chat logs. Compare the displayed host name and fingerprint before accepting.
+Use Cluster only when connecting LiteVMM hosts you administer. The normal flow is **Export pairing request** on host A, **Import pairing request** on host B, then **Import pairing response** on host A. Pairing bundles are secrets: transfer them through a trusted channel and never paste them into tickets or chat logs. Compare the displayed host name and fingerprint before accepting.
 
 After pairing, use **Endpoint** to set the peer's public HTTPS base address—not an `/api` suffix. **Manage** switches the active host. **Relay** displays the pair-specific overlay credential; use it only while configuring the matching overlay. **Revoke** permanently removes trust and should be used before decommissioning a peer.
 

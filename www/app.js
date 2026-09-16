@@ -1,5 +1,5 @@
 (() => {
-  // TinyVisor single-page console. This module owns client-side routing, rendering, and API calls.
+  // LiteVMM single-page console. This module owns client-side routing, rendering, and API calls.
   // Server state remains authoritative: UI actions call the Bash CGI API and re-render from its response.
   'use strict';
 
@@ -145,7 +145,7 @@
     window.open(target, '_blank', 'noopener');
   }
 
-  function toast(message, title = 'TinyVisor') {
+  function toast(message, title = 'LiteVMM') {
     $('#toastTitle').textContent = title;
     $('#toastBody').textContent = message;
     bootstrap.Toast.getOrCreateInstance($('#appToast'), { delay: 3500 }).show();
@@ -730,7 +730,7 @@
   }
 
   function openCommitContainer(name) {
-    modal({eyebrow:'Docker snapshot',title:`Snapshot ${name}`,submitText:'Create image',body:`<form id="commitForm"><label class="form-label">Image tag</label><input name="image" class="form-control mono mb-3" placeholder="local/${esc(name)}:snapshot" required><label class="form-label">Message</label><input name="message" class="form-control mb-3" placeholder="Snapshot from TinyVisor"><div class="form-check form-switch"><input name="pause" id="commitPause" class="form-check-input" type="checkbox" checked><label class="form-check-label" for="commitPause">Pause container while committing</label></div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#commitForm',el));const image=fd.get('image');await request(`/docker/containers/${encodeURIComponent(name)}/commit`,{method:'POST',form:{image,message:fd.get('message'),pause:fd.has('pause')?'true':'false'}});m.hide();toast(`${image} created`);await renderRoute();}});
+    modal({eyebrow:'Docker snapshot',title:`Snapshot ${name}`,submitText:'Create image',body:`<form id="commitForm"><label class="form-label">Image tag</label><input name="image" class="form-control mono mb-3" placeholder="local/${esc(name)}:snapshot" required><label class="form-label">Message</label><input name="message" class="form-control mb-3" placeholder="Snapshot from LiteVMM"><div class="form-check form-switch"><input name="pause" id="commitPause" class="form-check-input" type="checkbox" checked><label class="form-check-label" for="commitPause">Pause container while committing</label></div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#commitForm',el));const image=fd.get('image');await request(`/docker/containers/${encodeURIComponent(name)}/commit`,{method:'POST',form:{image,message:fd.get('message'),pause:fd.has('pause')?'true':'false'}});m.hide();toast(`${image} created`);await renderRoute();}});
   }
 
   async function openCreateContainer(){
@@ -1027,7 +1027,7 @@
   }
 
   const routes = {
-    dashboard: {title:'Overview', eyebrow:'TinyVisor', load:loadDashboard},
+    dashboard: {title:'Overview', eyebrow:'LiteVMM', load:loadDashboard},
     vms: {title:'Virtual machines', eyebrow:'QEMU / KVM', load:loadVMs},
     containers: {title:'Containers', eyebrow:'Docker', load:loadContainers},
     compose: {title:'Compose', eyebrow:'Docker', load:loadCompose},

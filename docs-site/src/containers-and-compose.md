@@ -29,7 +29,7 @@ An image is only the container filesystem template; it is not a backup of extern
 
 ## Deploy a Compose project
 
-Select **Deploy Compose** on the Containers page. Enter a stable **project name**, then paste Compose YAML or choose a `.yaml`/`.yml` file. TinyVisor validates it before deployment. The project name groups the services and is the name you return to for later operations.
+Select **Deploy Compose** on the Containers page. Enter a stable **project name**, then paste Compose YAML or choose a `.yaml`/`.yml` file. LiteVMM validates it before deployment. The project name groups the services and is the name you return to for later operations.
 
 After a project exists, its controls mean:
 
@@ -38,6 +38,6 @@ After a project exists, its controls mean:
 | **View** | Displays the YAML stored for that project. |
 | **Deploy** | Applies the saved YAML again, creating or reconciling its services. |
 | **Down** | Stops the Compose stack. Use it before planned changes or removal. |
-| **Delete** | Stops the stack and removes TinyVisor's stored project file. Review the confirmation carefully. |
+| **Delete** | Stops the stack and removes LiteVMM's stored project file. Review the confirmation carefully. |
 
 Compose YAML can publish host ports, mount host paths, create networks, and choose restart policies. Treat it as infrastructure configuration: review it before deployment and keep the source YAML in version control as well as in the console.

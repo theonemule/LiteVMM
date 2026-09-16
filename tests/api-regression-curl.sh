@@ -69,7 +69,7 @@ request() {
 }
 
 echo "VMAPI black-box regression target: $base"
-request GET / 200 'd.get("service") == "tinyvisor"'
+request GET / 200 'd.get("service") == "litevmm"'
 request POST /vms 400 'bool(d.get("error"))' --data ''
 request POST /networks 400 'bool(d.get("error"))' --data ''
 request GET /does-not-exist 404 'bool(d.get("error"))'

@@ -11,7 +11,7 @@ The **Networks** menu is a single inventory for physical host adapters, Linux br
 | **Interface** | A physical or host network adapter detected by Linux. | A component used to build a bridge; it is managed by the operating system. |
 | **Linux bridge** | A host Layer-2 software switch. | Put VM NICs and a physical adapter on the same LAN segment. |
 | **Docker network** | A Docker-managed network namespace and IPAM network. | Let containers communicate by name on an isolated application network. |
-| **GOST TAP overlay** | A Layer-2 Ethernet tunnel between paired TinyVisor hosts, carried over authenticated WebSockets. | Extend a VM network between hosts you control. |
+| **GOST TAP overlay** | A Layer-2 Ethernet tunnel between paired LiteVMM hosts, carried over authenticated WebSockets. | Extend a VM network between hosts you control. |
 
 ## Create a Linux bridge
 
@@ -37,7 +37,7 @@ Select **Create network**, choose **Docker network**, then set:
 
 ## Create a GOST TAP overlay
 
-An overlay is not Docker Swarm overlay networking. In TinyVisor it is a Layer-2 TAP tunnel over the paired hosts' existing HTTP(S)/WebSocket route. It allows attached VM interfaces to behave as though they are on the same Ethernet segment across hosts, including ARP and DHCP broadcasts.
+An overlay is not Docker Swarm overlay networking. In LiteVMM it is a Layer-2 TAP tunnel over the paired hosts' existing HTTP(S)/WebSocket route. It allows attached VM interfaces to behave as though they are on the same Ethernet segment across hosts, including ARP and DHCP broadcasts.
 
 Before creating one, pair the hosts in **Cluster**, set each peer endpoint, and make sure the peers show a usable relay configuration. Then select **Create network** → **GOST TAP overlay** and set:
 
@@ -51,8 +51,8 @@ Before creating one, pair the hosts in **Cluster**, set each peer endpoint, and 
 
 Editing an overlay recreates its transport. Disconnect attached workloads first. Deleting it also requires attached workloads to be disconnected. Use **Validate** in the Networks table to confirm that GOST is alive, the local device is a TAP device, its link is up, and it is attached to the selected bridge. An **Incomplete overlay** row means a previous operation stopped mid-way; its **Delete** button removes the leftover overlay network and bridge together after confirmation.
 
-TinyVisor does not automatically attach a Docker bridge network to a TAP overlay. Docker bridge IPAM is host-local; putting the same Docker gateway/subnet on every host would conflict within the shared Ethernet segment. Use the overlay for VM NICs, or use a distributed Docker network driver for multi-host containers.
+LiteVMM does not automatically attach a Docker bridge network to a TAP overlay. Docker bridge IPAM is host-local; putting the same Docker gateway/subnet on every host would conflict within the shared Ethernet segment. Use the overlay for VM NICs, or use a distributed Docker network driver for multi-host containers.
 
 ## Choose the right one
 
-Use a **Linux bridge** when a VM must join a local physical/LAN segment. Use a **Docker network** for container-to-container application connectivity on one Docker host. Use an **overlay** only when you need Layer-2 connectivity between paired TinyVisor hosts; it depends on the bridge underneath it and has more failure modes than a local network. Use **NAT** on a VM when it only needs ordinary outbound access and does not need to be a direct LAN peer.
+Use a **Linux bridge** when a VM must join a local physical/LAN segment. Use a **Docker network** for container-to-container application connectivity on one Docker host. Use an **overlay** only when you need Layer-2 connectivity between paired LiteVMM hosts; it depends on the bridge underneath it and has more failure modes than a local network. Use **NAT** on a VM when it only needs ordinary outbound access and does not need to be a direct LAN peer.

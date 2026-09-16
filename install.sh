@@ -1,5 +1,5 @@
 #!/bin/sh
-# TinyVisor's single, idempotent installer for Alpine and Debian-family hosts.
+# LiteVMM's single, idempotent installer for Alpine and Debian-family hosts.
 # This POSIX shell prelude exists so a stock Alpine image can start the installer
 # before Bash itself has been installed. It re-executes this same file in Bash.
 if [ "${VMAPI_INSTALL_BASH:-}" != 1 ]; then
@@ -221,9 +221,9 @@ report_nested_hyperv_requirement() {
     [[ -e $driver ]] || continue
     [[ $(readlink -f "$driver") == */hv_netvsc ]] || continue
     cat <<'MESSAGE'
-Nested Hyper-V uplink detected. A bridged TinyVisor guest needs MAC address
+Nested Hyper-V uplink detected. A bridged LiteVMM guest needs MAC address
 spoofing enabled on this VM's adapter at the parent Hyper-V host:
-  Set-VMNetworkAdapter -VMName <TinyVisor-VM> -MacAddressSpoofing On
+  Set-VMNetworkAdapter -VMName <LiteVMM-VM> -MacAddressSpoofing On
 This parent-host setting survives Alpine guest reinstallation.
 MESSAGE
     return
@@ -247,4 +247,4 @@ write_sudoers
 case $PLATFORM in alpine) configure_alpine;; debian) configure_debian;; esac
 finalize
 report_nested_hyperv_requirement
-echo "TinyVisor installed on $PLATFORM. Open the management UI on port 8080."
+echo "LiteVMM installed on $PLATFORM. Open the management UI on port 8080."
