@@ -1,0 +1,16 @@
+[Unit]
+Description=LiteVMM peer-backed FUSE volume mounts
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c '/usr/local/bin/remote-volumectl resume-all || true'
+ExecStart=/usr/local/bin/remote-volumectl daemon
+ExecStop=/usr/local/bin/remote-volumectl suspend
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

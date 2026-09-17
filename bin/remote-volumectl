@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# LiteVMM peer-backed Docker volumes over a direct FUSE-over-WSS session.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+FUSE_CLIENT=${VMAPI_REMOTE_FUSE_CLIENT:-/usr/local/bin/litevmm-remote-fuse.py}
+HOSTED_ROOT=${VMAPI_REMOTE_VOLUME_ROOT:-/var/lib/vmapi/remote-volumes}
+SHARE_ROOT=${VMAPI_REMOTE_VOLUME_SHARE_ROOT:-/var/lib/vmapi/remote-volume-shares}
+MOUNT_ROOT=${VMAPI_REMOTE_MOUNT_ROOT:-/var/lib/vmapi/remote-mounts}
+MOUNT_STATE_ROOT=${VMAPI_REMOTE_MOUNT_STATE_ROOT:-/var/lib/vmapi/remote-volume-mounts}
+RUN_ROOT=${VMAPI_REMOTE_VOLUME_RUN_ROOT:-/run/vmapi-remote-volumes}
+DAEMON_INTERVAL=${VMAPI_REMOTE_VOLUME_DAEMON_INTERVAL:-15}
+WEB_USER=${VMAPI_REMOTE_FS_USER:-}
+
+valid_name(){ [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "Invalid remote volume name: ${1:-}"; }
+valid_owner(){ [[ ${1:-} =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid remote volume owner'; }
+valid_peer(){ [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
+valid_id(){ [[ ${1:-} =~ ^[a-f0-9]{24}$ ]] || die 'Invalid remote volume id'; }
+share_file(){ valid_id "$1"; printf '%s/%s.json\n' "$SHARE_ROOT" "$1"; }
+mount_file(){ valid_name "$1"; printf '%s/%s.conf\n' "$MOUNT_STATE_ROOT" "$1"; }
+web_user(){
+  if [[ -n $WEB_USER ]]; then id "$WEB_USER" >/dev/null 2>&1 || die "Remote filesystem web user does not exist: $WEB_USER"; printf '%s\n' "$WEB_USER"; return; fi
+  id lighttpd >/dev/null 2>&1 && { printf '%s\n' lighttpd; return; }
+  return 1
+}
+ensure_dirs(){
+  install -d -m 0750 "$HOSTED_ROOT" "$SHARE_ROOT" "$MOUNT_STATE_ROOT"
+  local wu=''; wu=$(web_user 2>/dev/null || true)
+  [[ -z $wu ]] || { local wg; wg=$(id -gn "$wu"); chown "root:$wg" "$HOSTED_ROOT" "$SHARE_ROOT" 2>/dev/null || true; }
+  install -d -m 0755 "$MOUNT_ROOT"; install -d -m 0700 "$RUN_ROOT"
+}
+json_get(){ python3 - "$1" "$2" <<'PY'
+import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2],''))
+except Exception: pass
+PY
+}
+json_bool_set(){ python3 - "$1" "$2" "$3" <<'PY'
+import json,os,sys,tempfile
+p,k,v=sys.argv[1],sys.argv[2],sys.argv[3].lower()=='true'; d=json.load(open(p)); d[k]=v
+fd,tmp=tempfile.mkstemp(prefix='.remote-volume.',dir=os.path.dirname(p)); os.close(fd)
+with open(tmp,'w') as f: json.dump(d,f,separators=(',',':')); f.write('\n')
+os.chmod(tmp,0o640); os.replace(tmp,p)
+PY
+}
+write_share(){
+  local file=$1 id=$2 owner=$3 name=$4 token=$5 data=$6
+  python3 - "$file" "$id" "$owner" "$name" "$token" "$data" <<'PY'
+import json,os,sys
+p,id,owner,name,token,data=sys.argv[1:]
+with open(p,'w') as f: json.dump({'id':id,'owner':owner,'name':name,'token':token,'data':data,'active':True},f,separators=(',',':')); f.write('\n')
+os.chmod(p,0o640)
+PY
+}
+share_show(){
+  local owner=${1:?} id=${2:?} f; valid_owner "$owner"; f=$(share_file "$id"); [[ -r $f ]] || die 'Remote volume share not found'
+  python3 - "$f" "$owner" <<'PY'
+import json,os,sys
+p,owner=sys.argv[1:]; d=json.load(open(p))
+if d.get('owner')!=owner: raise SystemExit('Remote volume share does not belong to this peer')
+size=0
+for root,dirs,files in os.walk(d['data']):
+    for n in files:
+        try:size+=os.lstat(os.path.join(root,n)).st_size
+        except OSError:pass
+print(json.dumps({'id':d['id'],'name':d['name'],'active':bool(d.get('active',True)),'bytes':size,'path':'/remote-fs/'+d['token']},separators=(',',':')))
+PY
+}
+share_create(){
+  ensure_dirs; local owner=${1:?} name=${2:?}; valid_owner "$owner"; valid_name "$name"; need_cmd python3; need_cmd openssl
+  local f id token data existing_owner existing_name
+  shopt -s nullglob
+  for f in "$SHARE_ROOT"/*.json; do existing_owner=$(json_get "$f" owner); existing_name=$(json_get "$f" name); [[ $existing_owner == "$owner" && $existing_name == "$name" ]] || continue; id=$(basename "$f" .json); json_bool_set "$f" active true; share_show "$owner" "$id"; shopt -u nullglob; return; done
+  shopt -u nullglob
+  id=$(openssl rand -hex 12); token=$(openssl rand -hex 24); data="$HOSTED_ROOT/$owner/$name"
+  local wu=''; wu=$(web_user 2>/dev/null || true)
+  if [[ -n $wu ]]; then
+    local wg; wg=$(id -gn "$wu"); install -d -o "$wu" -g "$wg" -m 0770 "$HOSTED_ROOT/$owner" "$data"
+  else
+    install -d -m 0770 "$HOSTED_ROOT/$owner" "$data"
+  fi
+  write_share "$(share_file "$id")" "$id" "$owner" "$name" "$token" "$data"
+  if [[ -n $wu && $EUID -eq 0 ]]; then chown "root:$wg" "$(share_file "$id")"; fi
+  share_show "$owner" "$id"
+}
+share_list(){ local owner=${1:-} f first=true id o; [[ -z $owner ]] || valid_owner "$owner"; printf '['; shopt -s nullglob; for f in "$SHARE_ROOT"/*.json; do id=$(basename "$f" .json); o=$(json_get "$f" owner); [[ -z $owner || $o == "$owner" ]] || continue; $first || printf ','; first=false; if [[ -n $owner ]]; then share_show "$owner" "$id"; else python3 - "$f" <<'PY'
+import json,os,sys
+d=json.load(open(sys.argv[1])); size=0
+for root,dirs,files in os.walk(d['data']):
+  for n in files:
+    try:size+=os.lstat(os.path.join(root,n)).st_size
+    except OSError:pass
+print(json.dumps({'id':d['id'],'owner':d['owner'],'name':d['name'],'active':bool(d.get('active',True)),'bytes':size,'data':d['data']},separators=(',',':')),end='')
+PY
+fi; done; shopt -u nullglob; printf ']\n'; }
+share_start(){ local owner=$1 id=$2 f; valid_owner "$owner"; f=$(share_file "$id"); [[ $(json_get "$f" owner) == "$owner" ]] || die 'Remote volume share does not belong to this peer'; json_bool_set "$f" active true; share_show "$owner" "$id"; }
+share_stop(){ local owner=$1 id=$2 f; valid_owner "$owner"; f=$(share_file "$id"); [[ $(json_get "$f" owner) == "$owner" ]] || die 'Remote volume share does not belong to this peer'; json_bool_set "$f" active false; share_show "$owner" "$id"; }
+share_stop_admin(){ local id=$1 f owner; f=$(share_file "$id"); [[ -r $f ]] || die 'Remote volume share not found'; owner=$(json_get "$f" owner); valid_owner "$owner"; json_bool_set "$f" active false; share_show "$owner" "$id"; }
+share_purge(){ local id=$1 delete_data=${2:-false} f data active; validate_bool "$delete_data"; f=$(share_file "$id"); [[ -r $f ]] || die 'Remote volume share not found'; active=$(json_get "$f" active); [[ $active != True && $active != true ]] || die 'Stop the remote volume before purging it'; data=$(json_get "$f" data); rm -f -- "$f"; $delete_data && rm -rf -- "$data"; printf '{"purged":true,"deleted_data":%s,"id":"%s"}\n' "$delete_data" "$id"; }
+
+load_mount(){
+  local name=$1 f; f=$(mount_file "$name"); [[ -r $f ]] || die "Remote mount not found: $name"
+  PEER='' REMOTE_NAME='' SHARE_ID='' REMOTE_PATH='' MOUNTPOINT='' PID_FILE=''
+  # shellcheck disable=SC1090
+  source "$f"
+  valid_peer "$PEER"; valid_name "$REMOTE_NAME"; valid_id "$SHARE_ID"; [[ $REMOTE_PATH =~ ^/remote-fs/[a-f0-9]{48}$ ]] || die 'Invalid remote volume path'; [[ -n $MOUNTPOINT && -n $PID_FILE ]] || die 'Remote mount configuration is incomplete'
+}
+pid_from_file(){ local f=$1 p=''; [[ -r $f ]] && read -r p < "$f" || true; [[ $p =~ ^[0-9]+$ ]] && printf '%s\n' "$p"; }
+pid_owned(){ local f=$1 needle=$2 p; p=$(pid_from_file "$f" || true); [[ -n $p && -r /proc/$p/cmdline ]] || return 1; kill -0 "$p" 2>/dev/null || return 1; tr '\0' '\n' < "/proc/$p/cmdline" | grep -Fqx -- "$needle"; }
+is_mounted(){ local path=$1; awk -v p="$path" '$2==p && $3 ~ /^fuse/ {found=1} END{exit !found}' /proc/mounts; }
+peer_field(){ local json=$1 key=$2; printf '%s' "$json" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -n1; }
+mount_start(){
+  local name=$1; load_mount "$name"; is_mounted "$MOUNTPOINT" && return 0; need_cmd "$FUSE_CLIENT"; need_cmd "$PEERCTL"
+  local profile endpoint user pass base url p
+  profile=$("$PEERCTL" overlay-profile "$PEER"); endpoint=$(peer_field "$profile" endpoint); user=$(peer_field "$profile" username); pass=$(peer_field "$profile" password)
+  [[ $endpoint == wss://*/overlay && -n $user && -n $pass ]] || die 'LiteVMM remote volumes require a paired HTTPS endpoint'
+  base=${endpoint%/overlay}; url="$base$REMOTE_PATH"; install -d -m 0755 "$MOUNTPOINT"
+  local oldpid; oldpid=$(pid_from_file "$PID_FILE" || true); [[ -z $oldpid ]] || kill "$oldpid" 2>/dev/null || true; rm -f -- "$PID_FILE"
+  LITEVMM_REMOTE_FS_URL="$url" LITEVMM_REMOTE_FS_USER="$user" LITEVMM_REMOTE_FS_PASSWORD="$pass" "$FUSE_CLIENT" "$MOUNTPOINT" </dev/null >>"$RUN_ROOT/mount-$name.log" 2>&1 & echo $! > "$PID_FILE"
+  for _ in {1..120}; do is_mounted "$MOUNTPOINT" && return 0; p=$(pid_from_file "$PID_FILE" || true); [[ -n $p ]] && kill -0 "$p" 2>/dev/null || break; sleep .1; done
+  [[ -r $RUN_ROOT/mount-$name.log ]] && tail -40 "$RUN_ROOT/mount-$name.log" >&2 || true; die 'LiteVMM remote FUSE mount did not become ready'
+}
+mount_stop(){ local name=$1; load_mount "$name"; if is_mounted "$MOUNTPOINT"; then if command -v fusermount3 >/dev/null 2>&1; then fusermount3 -u "$MOUNTPOINT"; elif command -v fusermount >/dev/null 2>&1; then fusermount -u "$MOUNTPOINT"; else umount "$MOUNTPOINT"; fi; fi; local p; p=$(pid_from_file "$PID_FILE" || true); [[ -n $p ]] && kill "$p" 2>/dev/null || true; rm -f -- "$PID_FILE"; }
+mount_show(){ local name=$1; load_mount "$name"; local mounted=false; is_mounted "$MOUNTPOINT" && mounted=true; printf '{"name":"%s","peer_id":"%s","remote_name":"%s","share_id":"%s","mountpoint":"%s","mounted":%s,"docker_volume":"%s"}\n' "$(json_escape "$name")" "$PEER" "$(json_escape "$REMOTE_NAME")" "$SHARE_ID" "$(json_escape "$MOUNTPOINT")" "$mounted" "$(json_escape "$name")"; }
+mount_list(){ local f first=true; printf '['; shopt -s nullglob; for f in "$MOUNT_STATE_ROOT"/*.conf; do $first || printf ','; first=false; mount_show "$(basename "$f" .conf)"; done; shopt -u nullglob; printf ']\n'; }
+mount_attach(){
+  ensure_dirs; local peer=${1:?} remote=${2:?} localname=${3:-$remote}; valid_peer "$peer"; valid_name "$remote"; valid_name "$localname"; need_cmd "$PEERCTL"; need_cmd "$DOCKER_BIN"; [[ ! -e $(mount_file "$localname") ]] || die "Remote mount already exists: $localname"
+  "$DOCKER_BIN" volume inspect "$localname" >/dev/null 2>&1 && die "Docker volume already exists: $localname"
+  local existing en ep; shopt -s nullglob
+  for existing in "$MOUNT_STATE_ROOT"/*.conf; do
+    PEER=''; REMOTE_NAME=''; source "$existing"; en=$REMOTE_NAME; ep=$PEER
+    [[ $ep == "$peer" && $en == "$remote" ]] && { shopt -u nullglob; die "Peer volume $remote is already attached"; }
+  done
+  shopt -u nullglob
+  local resp id path mp tmp; resp=$(printf 'name=%s' "$remote" | "$PEERCTL" proxy "$peer" POST /remote-volumes/shares application/x-www-form-urlencoded); id=$(peer_field "$resp" id); path=$(peer_field "$resp" path); valid_id "$id"; [[ $path =~ ^/remote-fs/[a-f0-9]{48}$ ]] || die 'Peer returned an invalid remote volume path'; mp="$MOUNT_ROOT/$localname"; tmp=$(mktemp "$MOUNT_STATE_ROOT/.mount.XXXXXX")
+  printf 'PEER=%q\nREMOTE_NAME=%q\nSHARE_ID=%q\nREMOTE_PATH=%q\nMOUNTPOINT=%q\nPID_FILE=%q\n' "$peer" "$remote" "$id" "$path" "$mp" "$RUN_ROOT/mount-$localname.pid" > "$tmp"; chmod 0640 "$tmp"; mv "$tmp" "$(mount_file "$localname")"
+  if ! mount_start "$localname"; then rm -f -- "$(mount_file "$localname")"; rmdir "$mp" 2>/dev/null || true; "$PEERCTL" proxy "$peer" DELETE "/remote-volumes/shares/$id" application/x-www-form-urlencoded </dev/null >/dev/null 2>&1 || true; die 'Could not mount peer volume'; fi
+  if ! "$DOCKER_BIN" volume create --driver local --label litevmm.remote-volume=true --label "litevmm.remote-peer=$peer" --label "litevmm.remote-name=$remote" --opt type=none --opt o=bind --opt "device=$mp" "$localname" >/dev/null; then
+    mount_stop "$localname" || true; rm -f -- "$(mount_file "$localname")" "$RUN_ROOT/mount-$localname.log"; rmdir "$mp" 2>/dev/null || true; "$PEERCTL" proxy "$peer" DELETE "/remote-volumes/shares/$id" application/x-www-form-urlencoded </dev/null >/dev/null 2>&1 || true; die 'Could not create Docker bind-backed volume'
+  fi
+  mount_show "$localname"
+}
+mount_detach(){
+  local name=${1:?} stop_remote=${2:-true}; validate_bool "$stop_remote"; load_mount "$name"; need_cmd "$DOCKER_BIN"
+  if "$DOCKER_BIN" volume inspect "$name" >/dev/null 2>&1; then "$DOCKER_BIN" volume rm "$name" >/dev/null; fi
+  mount_stop "$name"; $stop_remote && "$PEERCTL" proxy "$PEER" DELETE "/remote-volumes/shares/$SHARE_ID" application/x-www-form-urlencoded </dev/null >/dev/null 2>&1 || true
+  rm -f -- "$(mount_file "$name")" "$RUN_ROOT/mount-$name.log"; rmdir "$MOUNTPOINT" 2>/dev/null || true; printf '{"detached":true,"name":"%s"}\n' "$(json_escape "$name")"
+}
+resume_all(){ ensure_dirs; local f name failed=0; shopt -s nullglob; for f in "$MOUNT_STATE_ROOT"/*.conf; do name=$(basename "$f" .conf); is_mounted "$MOUNT_ROOT/$name" && continue; mount_start "$name" || { echo "Could not resume remote volume $name" >&2; failed=1; }; done; shopt -u nullglob; return "$failed"; }
+suspend(){ ensure_dirs; local f name; shopt -s nullglob; for f in "$MOUNT_STATE_ROOT"/*.conf; do name=$(basename "$f" .conf); mount_stop "$name" || true; done; shopt -u nullglob; printf '{"suspended":true}\n'; }
+revoke_peer(){ local peer=$1 owner=$2 f name id; valid_peer "$peer"; valid_owner "$owner"; shopt -s nullglob; for f in "$MOUNT_STATE_ROOT"/*.conf; do name=$(basename "$f" .conf); load_mount "$name"; [[ $PEER == "$peer" ]] && mount_detach "$name" false >/dev/null 2>&1 || true; done; for f in "$SHARE_ROOT"/*.json; do [[ $(json_get "$f" owner) == "$owner" ]] || continue; id=$(basename "$f" .json); share_stop "$owner" "$id" >/dev/null 2>&1 || true; done; shopt -u nullglob; }
+daemon(){ ensure_dirs; trap 'exit 0' TERM INT; while :; do resume_all || true; sleep "$DAEMON_INTERVAL" & wait $!; done; }
+
+case ${1:-help} in
+  share-create) shift; share_create "$@";; share-start) shift; share_start "$@";; share-stop) shift; share_stop "$@";; share-stop-admin) shift; share_stop_admin "$@";; share-show) shift; share_show "$@";; share-list) shift; share_list "$@";; share-purge) shift; share_purge "$@";;
+  attach) shift; mount_attach "$@";; detach) shift; mount_detach "$@";; mount-start) shift; mount_start "$@";; mount-stop) shift; mount_stop "$@";; mount-show) shift; mount_show "$@";; mount-list) mount_list;; resume-all) resume_all;; suspend) suspend;; revoke-peer) shift; revoke_peer "$@";; daemon) daemon;;
+  help|-h|--help) echo 'remote-volumectl share-create OWNER NAME | share-start OWNER ID | share-stop OWNER ID | share-list [OWNER] | share-purge ID [DELETE_DATA] | attach PEER REMOTE_NAME [DOCKER_VOLUME] | detach DOCKER_VOLUME | mount-list | daemon';;
+  *) die "Unknown remote volume command: ${1:-}";;
+esac
