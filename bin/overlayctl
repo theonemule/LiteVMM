@@ -256,6 +256,7 @@ show() (
   for id in "${MEMBERS[@]}"; do $first || printf ','; first=false; printf '"%s"' "$id"; done
   printf '],"tap":"%s","tap_bridge_learning":"%s","state":"%s","running":%s,"tap_process":%s,"tap_type":"%s","tap_up":%s,"tap_bridged":%s,"relay_path":"/overlay/%s","tap_cidr":"%s","tap_peer":"%s"}\n' "$(tap_name "$NAME")" "$TAP_BRIDGE_LEARNING" "$state" "$running" "$process" "$type" "$up" "$bridged" "$NAME" "$(health_cidr)" "$(health_peer)"
 )
+peer_list() { load "$1"; local id; for id in "${MEMBERS[@]}"; do printf '%s\n' "$id"; done; }
 list() { local file first=true; printf '['; for file in "$ROOT"/*.conf; do [[ -f $file ]] || continue; $first || printf ','; first=false; show "$(basename "$file" .conf)"; done; printf ']\n'; }
 health() (
   load "$1"; local reachable=null
@@ -341,14 +342,14 @@ migrate_config() {
 
 case ${1:-} in
   run) run; exit;;
-  help|-h|--help|'') echo 'overlayctl create NAME --bridge BRIDGE --role hub|spoke --peer NODE_ID [--peer NODE_ID ...] [--mtu 1400] [--staged]'; echo 'overlayctl list|show NAME|health NAME|stage NAME|validate NAME|activate NAME|delete NAME|reset|render|migrate-config|restart-service'; exit;;
+  help|-h|--help|'') echo 'overlayctl create NAME --bridge BRIDGE --role hub|spoke --peer NODE_ID [--peer NODE_ID ...] [--mtu 1400] [--staged]'; echo 'overlayctl list|show NAME|peer-list NAME|health NAME|stage NAME|validate NAME|activate NAME|delete NAME|reset|render|migrate-config|restart-service'; exit;;
 esac
 access
 # The supervisor never takes this mutation lock, so service restarts cannot deadlock.
-case $1 in list|show|health|validate|render-config) ;; *) exec 8>"$RUN/.lock"; flock -x 8;; esac
+case $1 in list|show|peer-list|health|validate|render-config) ;; *) exec 8>"$RUN/.lock"; flock -x 8;; esac
 cmd=$1; shift
 case $cmd in
-  create) create "$@";; list) list;; show) show "$@";; health) health "$@";; validate) validate "$@";;
+  create) create "$@";; list) list;; show) show "$@";; peer-list) peer_list "$@";; health) health "$@";; validate) validate "$@";;
   stage) set_stage "$1" true;; activate) set_stage "$1" false;; delete) delete "$@";; reset) reset;;
   render) for f in "$ROOT"/*.conf; do [[ -f $f ]] && render_config "$(basename "$f" .conf)"; done; render_web;;
   render-config) render_config "$@";; restart-service) restart_service;; revoke-peer) revoke_peer "$@";; migrate-config) migrate_config;;

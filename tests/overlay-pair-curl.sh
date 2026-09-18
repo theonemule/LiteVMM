@@ -10,7 +10,7 @@ hub=${1%/}; hub_user=$2; spoke=${3%/}; spoke_user=$4
 command -v curl >/dev/null && command -v python3 >/dev/null || { echo 'curl and python3 are required'; exit 2; }
 [[ -n ${HUB_PASSWORD:-} ]] || { read -rsp "Password for $hub_user@$hub: " HUB_PASSWORD; echo; }
 [[ -n ${SPOKE_PASSWORD:-} ]] || { read -rsp "Password for $spoke_user@$spoke: " SPOKE_PASSWORD; echo; }
-suffix=$(printf '%x' "$(date +%s)" | tail -c 8); overlay="dp${suffix:0:7}"; hub_br="dph${suffix:0:7}"; spoke_br="dps${suffix:0:7}"; hub_box="dp-hub-$suffix"; spoke_box="dp-spoke-$suffix"; hub_net="dpn-hub-$suffix"; spoke_net="dpn-spoke-$suffix"; tmp=$(mktemp -d)
+suffix=$(printf '%x' "$(date +%s)" | tail -c 8); overlay="dp${suffix:0:7}"; hub_br="dph${suffix:0:7}"; spoke_br="$hub_br"; hub_box="dp-hub-$suffix"; spoke_box="dp-spoke-$suffix"; hub_net="dpn-hub-$suffix"; spoke_net="dpn-spoke-$suffix"; tmp=$(mktemp -d)
 hcurl(){ curl -sS --user "$hub_user:$HUB_PASSWORD" --connect-timeout 10 --max-time 180 "$@"; }
 scurl(){ curl -sS --user "$spoke_user:$SPOKE_PASSWORD" --connect-timeout 10 --max-time 180 "$@"; }
 cleanup(){ set +e; [[ ${KEEP_ON_FAILURE:-false} == true ]] && { echo "Preserved failed overlay $overlay for diagnostics"; return; }; scurl -X DELETE "$spoke/docker/containers/$spoke_box" --data 'force=true' >/dev/null; hcurl -X DELETE "$hub/docker/containers/$hub_box" --data 'force=true' >/dev/null; scurl -X DELETE "$spoke/docker/networks/$spoke_net" >/dev/null; hcurl -X DELETE "$hub/docker/networks/$hub_net" >/dev/null; scurl -X DELETE "$spoke/overlays/$overlay" >/dev/null; hcurl -X DELETE "$hub/overlays/$overlay" >/dev/null; rm -rf "$tmp"; }
@@ -18,9 +18,8 @@ trap cleanup EXIT INT TERM
 json_field(){ python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 hub_peer=$(hcurl "$hub/cluster/peers" | json_field 'd[0]["node_id"] if d else ""'); spoke_peer=$(scurl "$spoke/cluster/peers" | json_field 'd[0]["node_id"] if d else ""')
 [[ -n $hub_peer && -n $spoke_peer ]] || { echo 'Both hosts must already be paired'; exit 1; }
-echo "Creating overlay $overlay on hub and spoke"
+echo "Creating coordinated overlay $overlay from the hub"
 hcurl -f -X POST "$hub/overlays" --data-urlencode "name=$overlay" --data-urlencode "bridge=$hub_br" --data 'role=hub' --data-urlencode "peer_0=$hub_peer" > "$tmp/hub-overlay.json"
-scurl -f -X POST "$spoke/overlays" --data-urlencode "name=$overlay" --data-urlencode "bridge=$spoke_br" --data 'role=spoke' --data-urlencode "peer_0=$spoke_peer" > "$tmp/spoke-overlay.json"
 sleep 5
 hub_running=$(hcurl -f "$hub/overlays/$overlay" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(bool(d.get("running") and d.get("tap_type")=="tap" and d.get("tap_process") and d.get("tap_up") and d.get("tap_bridged"))).lower())')
 spoke_running=$(scurl -f "$spoke/overlays/$overlay" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(bool(d.get("running") and d.get("tap_type")=="tap" and d.get("tap_process") and d.get("tap_up") and d.get("tap_bridged"))).lower())')

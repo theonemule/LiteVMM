@@ -164,6 +164,17 @@ storage_cmd() {
 overlay_cmd() {
   if command -v sudo >/dev/null 2>&1; then sudo -n "$OVERLAYCTL" "$@"; else "$OVERLAYCTL" "$@"; fi
 }
+overlay_remote_create() {
+  local peer_id=$1 name=$2 bridge=$3 role=$4 mtu=$5 staged=$6 body out
+  body="name=$name&bridge=$bridge&role=$role&mtu=$mtu"
+  [[ $staged == true ]] && body+="&staged=true"
+  out=$(printf '%s' "$body" | peer_cmd proxy "$peer_id" POST /overlays application/x-www-form-urlencoded 2>&1) || return 1
+  printf '%s' "$out"
+}
+overlay_remote_delete() {
+  local peer_id=$1 name=$2
+  peer_cmd proxy "$peer_id" DELETE "/overlays/$name" application/x-www-form-urlencoded </dev/null
+}
 vm_delete_cmd() {
   # VM directories can legitimately be root-owned after an import, restore,
   # migration, or older installation. vmctl still validates the VM name,
@@ -1083,16 +1094,75 @@ case "${P[0]-}" in
       GET)
         if [[ -n ${P[1]-} ]]; then raw_json_reply '200 OK' overlay_cmd show "${P[1]}"; else raw_json_reply '200 OK' overlay_cmd list; fi;;
       POST)
-        name=$(param name); bridge=$(param bridge); role=$(param role); [[ -n $name && -n $bridge && -n $role ]] || error_reply '400 Bad Request' 'name, bridge, and role are required'
-        if command -v sudo >/dev/null 2>&1; then args=(sudo -n "$OVERLAYCTL" create "$name" --bridge "$bridge" --role "$role"); else args=("$OVERLAYCTL" create "$name" --bridge "$bridge" --role "$role"); fi
-        for ((i=0;i<16;i++)); do v=$(param "peer_${i}"); [[ -n $v ]] && args+=(--peer "$v"); done
-        [[ -n $(param mtu) ]] && args+=(--mtu "$(param mtu)")
-        [[ $(param staged false) == true ]] && args+=(--staged)
-        if ! out=$("${args[@]}" 2>&1); then error_reply '400 Bad Request' "$out"; fi
-        reply '201 Created' "$out";;
+        name=$(param name); bridge=$(param bridge); role=$(param role); mtu=$(param mtu 1400); staged=$(param staged false)
+        [[ $name =~ ^[a-z][a-z0-9-]{0,10}$ ]] || error_reply '400 Bad Request' 'invalid overlay name'
+        [[ $bridge =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] || error_reply '400 Bad Request' 'invalid Linux bridge name'
+        [[ $role == hub || $role == spoke ]] || error_reply '400 Bad Request' 'role must be hub or spoke'
+        [[ $mtu =~ ^[0-9]{4}$ && $mtu -ge 1200 && $mtu -le 1499 ]] || error_reply '400 Bad Request' 'MTU must be 1200-1499'
+        [[ $staged == true || $staged == false ]] || error_reply '400 Bad Request' 'staged must be true or false'
+
+        if [[ $PEER_API_REQUEST == true ]]; then
+          caller_peer=$(peer_cmd peer-id-for-user "$REMOTE_USER" 2>&1) || error_reply '401 Unauthorized' "$caller_peer"
+          args=(create "$name" --bridge "$bridge" --role "$role" --peer "$caller_peer" --mtu "$mtu")
+          [[ $staged == true ]] && args+=(--staged)
+          out=$(overlay_cmd "${args[@]}" 2>&1) || error_reply '400 Bad Request' "$out"
+          reply '201 Created' "$out"
+        fi
+
+        peers=()
+        for ((i=0;i<16;i++)); do
+          v=$(param "peer_$i")
+          [[ -n $v ]] || continue
+          [[ $v =~ ^[a-fA-F0-9]{32}$ ]] || error_reply '400 Bad Request' 'invalid paired host id'
+          peers+=("${v,,}")
+        done
+        ((${#peers[@]} > 0)) || error_reply '400 Bad Request' 'at least one paired host is required'
+        [[ $role == hub || ${#peers[@]} == 1 ]] || error_reply '400 Bad Request' 'a spoke requires exactly one paired hub'
+
+        local_args=(create "$name" --bridge "$bridge" --role "$role")
+        for v in "${peers[@]}"; do local_args+=(--peer "$v"); done
+        local_args+=(--mtu "$mtu")
+        [[ $staged == true ]] && local_args+=(--staged)
+
+        created_remote=()
+        rollback_overlay() {
+          local peer
+          for peer in "${created_remote[@]}"; do overlay_remote_delete "$peer" "$name" >/dev/null 2>&1 || true; done
+          overlay_cmd delete "$name" >/dev/null 2>&1 || true
+        }
+
+        if [[ $role == hub ]]; then
+          out=$(overlay_cmd "${local_args[@]}" 2>&1) || error_reply '400 Bad Request' "$out"
+          for v in "${peers[@]}"; do
+            if ! remote_out=$(overlay_remote_create "$v" "$name" "$bridge" spoke "$mtu" "$staged" 2>&1); then
+              rollback_overlay
+              error_reply '502 Bad Gateway' "Peer overlay creation failed for $v: $remote_out"
+            fi
+            created_remote+=("$v")
+          done
+        else
+          v=${peers[0]}
+          if ! remote_out=$(overlay_remote_create "$v" "$name" "$bridge" hub "$mtu" "$staged" 2>&1); then
+            error_reply '502 Bad Gateway' "Peer overlay creation failed for $v: $remote_out"
+          fi
+          created_remote+=("$v")
+          if ! out=$(overlay_cmd "${local_args[@]}" 2>&1); then
+            rollback_overlay
+            error_reply '400 Bad Request' "$out"
+          fi
+        fi
+        raw_json_reply '201 Created' overlay_cmd show "$name";;
       DELETE)
         name=${P[1]-}; [[ -n $name ]] || name=$(param name); [[ -n $name ]] || error_reply '400 Bad Request' 'overlay name is required'
-        if command -v sudo >/dev/null 2>&1; then run_cmd sudo -n "$OVERLAYCTL" delete "$name" >/dev/null; else run_cmd "$OVERLAYCTL" delete "$name" >/dev/null; fi
+        if [[ $PEER_API_REQUEST == true ]]; then
+          overlay_cmd delete "$name" >/dev/null 2>&1 || error_reply '400 Bad Request' 'Overlay deletion failed'
+          reply '200 OK' '{"deleted":true}'
+        fi
+        mapfile -t peers < <(overlay_cmd peer-list "$name")
+        for v in "${peers[@]}"; do
+          out=$(overlay_remote_delete "$v" "$name" 2>&1) || error_reply '502 Bad Gateway' "Peer overlay deletion failed for $v: $out"
+        done
+        overlay_cmd delete "$name" >/dev/null 2>&1 || error_reply '400 Bad Request' 'Local overlay deletion failed'
         reply '200 OK' '{"deleted":true}';;
       *) error_reply '405 Method Not Allowed' 'Use GET, POST, or DELETE';;
     esac;;

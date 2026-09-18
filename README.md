@@ -148,6 +148,12 @@ New installations use `/var/lib/vmapi/vms/NAME` for `vm.conf`, NVRAM, and runtim
 
 Docker objects are **not** duplicated into this filesystem. The Docker daemon remains the inventory and state authority for containers, Docker images, Docker networks and Docker volumes.
 
+### Brokered overlay networks
+
+Creating a GOST TAP overlay from one LiteVMM host is a coordinated peer operation. Select one or more paired hosts in the network dialog and LiteVMM creates the local endpoint plus the matching endpoint on each selected peer through the authenticated peer API. A local hub creates remote spokes; a local spoke creates the selected remote host as its hub. Both ends use the same overlay name and bridge name, and the data plane runs as TAP Ethernet over the existing HTTP(S) WebSocket endpoint.
+
+If either side cannot create or start its endpoint, LiteVMM rolls back the endpoints already created for that request. Deleting the overlay from the initiating host also deletes its paired endpoints.
+
 ### Trusted peer hosts
 
 Pairing is a manual, three-step public-key exchange. Once two nodes are paired, the peer relationship is the trust boundary for control-plane calls and WebSocket backplane connections. Pair records remain root-only under `/var/lib/vmapi/peers`, and revoking a peer removes its HTTP credential, closes its overlay connections, and tears down its local storage-backplane mount.

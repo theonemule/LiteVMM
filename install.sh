@@ -239,8 +239,8 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/storagectl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmctl delete *'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl transport-profile *, /usr/local/bin/peerctl migrate *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl peer-list *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl node-id, /usr/local/bin/peerctl peer-id-for-user *, /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl transport-profile *, /usr/local/bin/peerctl migrate *'
         ;;
       docker)
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list, /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl delete *'
@@ -264,8 +264,8 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/storagectl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmctl delete *'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl transport-profile *, /usr/local/bin/peerctl migrate *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl peer-list *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl node-id, /usr/local/bin/peerctl peer-id-for-user *, /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl transport-profile *, /usr/local/bin/peerctl migrate *'
         ;;
       backup)
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list, /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl delete *'

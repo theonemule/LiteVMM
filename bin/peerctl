@@ -217,6 +217,27 @@ url_origin() { printf '%s\n' "$1" | sed -nE 's#^(https?://[A-Za-z0-9.-]+(:[0-9]{
 valid_proxy_path() { local path=${1:-}; [[ $path == /* && $path != //* && $path != *$'\r'* && $path != *$'\n'* && $path != *'..'* ]] || die 'Invalid peer API path'; [[ $path != /peer-api* && $path != /api* ]] || die 'Peer API path must be relative to the API root'; }
 peer_api_path() { printf '/peer-api%s' "$1"; }
 
+cmd_node_id() {
+  ensure_identity
+  node_id
+}
+
+cmd_peer_id_for_user() {
+  local user=${1:-} file RELAY_USER='' NODE_ID=''
+  valid_relay_user "$user"
+  for file in "$PEER_ROOT"/*.conf; do
+    [[ -f $file ]] || continue
+    RELAY_USER=''; NODE_ID=''
+    source "$file"
+    if [[ $RELAY_USER == "$user" ]]; then
+      valid_id "${NODE_ID,,}"
+      printf '%s\n' "${NODE_ID,,}"
+      return 0
+    fi
+  done
+  die 'HTTP user is not a paired peer'
+}
+
 cmd_identity() {
   local id fingerprint
   ensure_identity; id=$(node_id); fingerprint=$(key_fingerprint "$(identity_public_file)")
@@ -401,7 +422,7 @@ case "${1:-}" in
 esac
 
 case "${1:-help}" in
-  identity) cmd_identity;; request) shift; cmd_request "$@";; pending) cmd_pending;; cancel-pending) cmd_cancel_pending;; accept) shift; cmd_accept "$@";; complete) shift; cmd_complete "$@";; list) cmd_list;; set-url) shift; cmd_set_url "$@";; overlay-credentials) shift; cmd_overlay_credentials "$@";; overlay-profile) shift; cmd_overlay_profile "$@";; transport-profile) shift; cmd_transport_profile "$@";; authorize-user) shift; cmd_authorize_user "$@";; sync-auth) cmd_sync_auth;; cors-origin) shift; cmd_cors_origin "$@";; proxy) shift; cmd_proxy "$@";; migrate) shift; cmd_migrate "$@";; revoke) shift; cmd_revoke "$@";;
-  help|-h|--help) printf '%s\n' 'peerctl identity|request|pending|cancel-pending|accept BUNDLE [NAME]|complete BUNDLE|list|set-url NODE_ID URL|overlay-credentials NODE_ID|overlay-profile NODE_ID|transport-profile NODE_ID|authorize-user USER|sync-auth|proxy NODE_ID METHOD PATH [CONTENT_TYPE]|migrate VM NODE_ID|revoke NODE_ID';;
+  identity) cmd_identity;; node-id) cmd_node_id;; peer-id-for-user) shift; cmd_peer_id_for_user "$@";; request) shift; cmd_request "$@";; pending) cmd_pending;; cancel-pending) cmd_cancel_pending;; accept) shift; cmd_accept "$@";; complete) shift; cmd_complete "$@";; list) cmd_list;; set-url) shift; cmd_set_url "$@";; overlay-credentials) shift; cmd_overlay_credentials "$@";; overlay-profile) shift; cmd_overlay_profile "$@";; transport-profile) shift; cmd_transport_profile "$@";; authorize-user) shift; cmd_authorize_user "$@";; sync-auth) cmd_sync_auth;; cors-origin) shift; cmd_cors_origin "$@";; proxy) shift; cmd_proxy "$@";; migrate) shift; cmd_migrate "$@";; revoke) shift; cmd_revoke "$@";;
+  help|-h|--help) printf '%s\n' 'peerctl identity|node-id|peer-id-for-user USER|request|pending|cancel-pending|accept BUNDLE [NAME]|complete BUNDLE|list|set-url NODE_ID URL|overlay-credentials NODE_ID|overlay-profile NODE_ID|transport-profile NODE_ID|authorize-user USER|sync-auth|proxy NODE_ID METHOD PATH [CONTENT_TYPE]|migrate VM NODE_ID|revoke NODE_ID';;
   *) die "Unknown command: ${1:-}";;
 esac
