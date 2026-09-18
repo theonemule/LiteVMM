@@ -173,6 +173,14 @@ set_host_config() {
   cat "$tmp" > "$file"; rm -f "$tmp"
 }
 
+activate_requested_profile() {
+  install -d -m 0755 /etc/vmapi
+  [[ -f /etc/vmapi/vmapi.conf ]] || install -m 0644 "$BASE/etc/vmapi.conf" /etc/vmapi/vmapi.conf
+  set_host_config VMAPI_PROFILE "$PROFILE"
+  set_host_config VMAPI_HTTP_PORT "$HTTP_PORT"
+  set_host_config VMAPI_BACKPLANE_SERVER true
+}
+
 disable_native_nfs() {
   case $PLATFORM in
     alpine)
@@ -370,6 +378,13 @@ configure_debian() {
   nginx -t && systemctl reload nginx
 }
 
+verify_active_profile_config() {
+  local installed_profile
+  installed_profile=$(awk -F= '$1=="VMAPI_PROFILE"{print $2}' /etc/vmapi/vmapi.conf | tail -n1)
+  [[ $installed_profile == "$PROFILE" ]] ||
+    die "Profile activation failed: requested $PROFILE but /etc/vmapi/vmapi.conf contains ${installed_profile:-none}"
+}
+
 verify_profile_install() {
   local installed_profile
   installed_profile=$(awk -F= '$1=="VMAPI_PROFILE"{print $2}' /etc/vmapi/vmapi.conf | tail -n1)
@@ -442,6 +457,8 @@ choose_profile
 detect_platform
 ensure_admin_user
 install_packages
+activate_requested_profile
+verify_active_profile_config
 disable_native_nfs
 getent group vmapi-admin >/dev/null || groupadd --system vmapi-admin
 getent group vmapi >/dev/null || groupadd --system vmapi

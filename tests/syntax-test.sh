@@ -48,6 +48,8 @@ grep -Fq 'websocat' "$ROOT/install.sh"
 grep -Fq '1) backup                 Backup only' "$ROOT/install.sh"
 grep -Fq "Docker profile verification failed: docker is not installed" "$ROOT/install.sh"
 grep -Fq 'verify_profile_install' "$ROOT/install.sh"
+grep -Fq 'verify_active_profile_config()' "$ROOT/install.sh"
+grep -Fq 'activate_requested_profile()' "$ROOT/install.sh"
 grep -Fq 'openssh-client-default' "$ROOT/install.sh"
 grep -Fq 'docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service' "$ROOT/install.sh"
 grep -Fq 'docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server websockify' "$ROOT/install.sh"
@@ -86,3 +88,12 @@ bash -n "$ROOT/tests/api-regression-curl.sh"
 bash -n "$ROOT/tests/overlay-pair-curl.sh"
 [[ -s "$ROOT/www/index.html" && -s "$ROOT/www/app.css" && -s "$ROOT/www/vendor/bootstrap/bootstrap.min.css" && -s "$ROOT/www/vendor/bootstrap/bootstrap.bundle.min.js" ]]
 echo 'syntax: PASS'
+
+python3 - "$ROOT/install.sh" <<'PY'
+from pathlib import Path
+import sys
+s=Path(sys.argv[1]).read_text()
+a=s.index('install_packages\nactivate_requested_profile\nverify_active_profile_config\ndisable_native_nfs')
+b=s.index('if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then install_gost; fi')
+assert a < b
+PY
