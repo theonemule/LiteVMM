@@ -52,11 +52,17 @@ log_file(){ valid_peer "$1"; printf '%s/%s.websocat.log\n' "$RUN_ROOT" "${1,,}";
 mountpoint(){ valid_peer "$1"; printf '%s/%s\n' "$MOUNT_ROOT" "${1,,}"; }
 
 ensure_dirs(){
-  install -d -m 0750 "$BACKPLANE_ROOT" "$STATE_ROOT"
+  # The NFS export root and the peers container are path components for QEMU
+  # and the unprivileged vmapi worker on the client. They need execute
+  # permission without granting directory listing or write access. Individual
+  # peer namespaces remain 0770 and are owned by the client's vmapi uid/gid.
+  install -d -m 0711 "$BACKPLANE_ROOT"
+  install -d -m 0750 "$STATE_ROOT"
   install -d -m 0755 "$MOUNT_ROOT"
   install -d -m 0700 "$RUN_ROOT"
-  install -d -m 0770 "$BACKPLANE_ROOT/peers"
+  install -d -m 0711 "$BACKPLANE_ROOT/peers"
   install -d -m 0755 "$SHARED_ROOT"
+  chmod 0711 "$BACKPLANE_ROOT" "$BACKPLANE_ROOT/peers"
 }
 
 json_field(){ local json=$1 key=$2; printf '%s' "$json" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -n1; }
@@ -149,6 +155,18 @@ start_tunnel(){
   wait_port "$port" && pid_alive "$pf" || { tail -40 "$lf" >&2 2>/dev/null || true; die 'Peer backplane WebSocket tunnel failed to start'; }
 }
 
+repair_mount_traversal(){
+  local peer=$1 mp
+  mp=$(mountpoint "$peer")
+  # Older servers exported these parent directories as 0750/0770. Because the
+  # export uses no_root_squash, the privileged client can repair the two path
+  # components in-place so vmapi/QEMU can traverse an already-mounted peer
+  # immediately after an upgrade.
+  [[ -d $mp ]] || return 0
+  chmod 0711 "$mp" 2>/dev/null || true
+  [[ -d $mp/peers ]] && chmod 0711 "$mp/peers" 2>/dev/null || true
+}
+
 mount_peer(){
   local peer=$1 port=$2 mp id
   need_cmd "$MOUNT_BIN"
@@ -157,6 +175,7 @@ mount_peer(){
   # backoff; mount.nfs's own retry loop against an unreachable peer generated
   # enough connections to exhaust nf_conntrack on small hosts.
   is_mounted "$mp" || timeout "${VMAPI_BACKPLANE_MOUNT_TIMEOUT:-90}" "$MOUNT_BIN" -t nfs -o "vers=4.2,proto=tcp,port=$port,nconnect=1,hard,timeo=600,retrans=2,retry=0" 127.0.0.1:/ "$mp"
+  repair_mount_traversal "$peer"
   id=$(local_node_id)
   install -d -m 0770 "$mp/peers/$id"
   install -d -m 0770 "$mp/peers/$id"/{backups,replicas,vm-disks,docker-volumes,docker-images,registry,artifacts}
@@ -177,7 +196,11 @@ connect_peer(){
   ((rc != 2)) || die "$PEER_QUERY_ERROR"
   ((rc == 0)) || die 'Paired host does not advertise the storage-backplane capability (it needs VMAPI_BACKPLANE_SERVER=true in a vmapi.conf its web API can read)'
   if load_state "$peer" 2>/dev/null; then port=$PORT; else port=$(free_port); write_state "$peer" "$port"; fi
-  if is_mounted "$mp" && pid_alive "$(pid_file "$peer")"; then show_peer "$peer"; return; fi
+  if is_mounted "$mp" && pid_alive "$(pid_file "$peer")"; then
+    repair_mount_traversal "$peer"
+    show_peer "$peer"
+    return
+  fi
   is_mounted "$mp" && "$UMOUNT_BIN" "$mp" >/dev/null 2>&1 || true
   pid_alive "$(pid_file "$peer")" || start_tunnel "$peer" "$port"
   # Do not leave a tunnel behind a failed mount; the next attempt starts clean.

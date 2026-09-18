@@ -26,6 +26,20 @@ out=$(env "${common[@]}" bash "$ROOT/bin/replicationctl" replica-show "$id")
 [[ $out == *'"active":false'* ]]
 env "${common[@]}" bash "$ROOT/bin/replicationctl" replica-purge "$id" true >/dev/null
 [[ ! -e $FILE && ! -e $META ]]
+
+cat > "$T/qemu-img" <<'QEMU'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ ${1:-} == info ]]
+[[ " $* " == *" --force-share "* ]] || { echo "write lock is held" >&2; exit 1; }
+printf '%s\n' '{"virtual-size":1048576}'
+QEMU
+chmod +x "$T/qemu-img"
+export VMAPI_CONFIG=/dev/null
+export VMAPI_LIB="$ROOT/lib/common.sh"
+export QEMU_IMG="$T/qemu-img"
+source <(sed '/^case ${1:-help} in/,$d' "$ROOT/bin/replicationctl")
+[[ $(image_virtual_size "$T/locked.qcow2") == 1048576 ]]
 grep -Fq 'drive-mirror' bin/replicationctl
 grep -Fq '"mode":"existing"' bin/replicationctl
 grep -Fq 'nfs4-wss-backplane' bin/replicationctl

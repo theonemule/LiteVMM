@@ -162,8 +162,8 @@
       xhr.send(file);
     });
   }
-  function downloadFile(path, peerId = '') {
-    const targetPeerId = peerId || state.remotePeerId;
+  function downloadFile(path, peerIdOverride = null) {
+    const targetPeerId = peerIdOverride === null ? state.remotePeerId : peerIdOverride;
     const useRemote = targetPeerId && state.route !== 'cluster';
     const target = useRemote ? `${API}/cluster/peers/${encodeURIComponent(targetPeerId)}/proxy?path=${encodeURIComponent(path)}` : API + path;
     window.open(target, '_blank', 'noopener');
@@ -177,7 +177,9 @@
 
   function formatDate(value) {
     if (!value) return '';
-    const date=new Date(value);
+    const numeric=Number(value);
+    const raw=Number.isFinite(numeric) && String(value).trim() !== '' ? (numeric < 1e12 ? numeric * 1000 : numeric) : value;
+    const date=new Date(raw);
     return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
   }
 

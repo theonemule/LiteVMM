@@ -25,4 +25,20 @@ esac
 SS
 out=$(env "${common[@]}" VMAPI_BACKPLANE_NFS_BIND=0.0.0.0 bash "$ROOT/bin/backplanectl" server-status)
 [[ $out == *'"external_exposure":true'* ]]
+
+# Export roots must be traversable by the unprivileged QEMU/vmapi process.
+# Peer namespaces themselves retain their stricter per-client ownership.
+PERMROOT="$T/perm-root"
+mkdir -p "$PERMROOT"
+export VMAPI_CONFIG=/dev/null
+export VMAPI_LIB="$ROOT/lib/common.sh"
+export VMAPI_BACKPLANE_ROOT="$PERMROOT/backplane"
+export VMAPI_BACKPLANE_STATE_ROOT="$PERMROOT/state"
+export VMAPI_BACKPLANE_MOUNT_ROOT="$PERMROOT/mounts"
+export VMAPI_BACKPLANE_RUN_ROOT="$PERMROOT/run"
+source <(sed '/^case ${1:-help} in/,$d' "$ROOT/bin/backplanectl")
+ensure_dirs
+[[ $(stat -c %a "$PERMROOT/backplane") == 711 ]]
+[[ $(stat -c %a "$PERMROOT/backplane/peers") == 711 ]]
+[[ $(stat -c %a "$PERMROOT/backplane/shared") == 755 ]]
 echo 'backplane loopback exposure checks: PASS'

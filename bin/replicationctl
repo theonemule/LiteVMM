@@ -61,12 +61,24 @@ refresh_meta(){
   write_meta "$meta" "$OWNER" "$VM" "$DISK_INDEX" "$BYTES" "$FILE_NAME" "$active"
 }
 
+image_virtual_size(){
+  local file=$1 out bytes
+  need_cmd "$QEMU_IMG"
+  # A running QEMU owns the qcow2 write lock. Metadata inspection for
+  # replication must not try to acquire a conflicting shared lock.
+  out=$("$QEMU_IMG" info --force-share --output=json "$file" 2>&1) ||
+    die "Could not inspect image $file: $out"
+  bytes=$(printf '%s' "$out" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+  validate_positive_int "$bytes"
+  printf '%s\n' "$bytes"
+}
+
 ensure_replica_file(){
   local file=$1 bytes=$2
   need_cmd "$QEMU_IMG"
   if [[ -f $file ]]; then
     local current
-    current=$("$QEMU_IMG" info --output=json "$file" 2>/dev/null | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    current=$(image_virtual_size "$file")
     if [[ $current != "$bytes" ]]; then
       rm -f -- "$file"
       "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null
@@ -109,8 +121,7 @@ start_replication(){
   while IFS= read -r idx; do
     source=$(vm_disk_path_index "$vm" "$idx")
     [[ -f $source ]] || die "Disk file missing: $source"
-    bytes=$("$QEMU_IMG" info --output=json "$source" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    validate_positive_int "$bytes"
+    bytes=$(image_virtual_size "$source")
     target="$remote/disk${idx}.qcow2"; meta="$remote/disk${idx}.meta"; job="repl-$idx"
     ensure_replica_file "$target" "$bytes"
     write_meta "$meta" "$owner" "$vm" "$idx" "$bytes" "disk${idx}.qcow2" true
@@ -132,10 +143,14 @@ resume_replication(){
   while IFS= read -r idx; do
     eval "job=\${DISK_${idx}_JOB:-}"; eval "target=\${DISK_${idx}_TARGET:-}"; eval "meta=\${DISK_${idx}_META:-}"; eval "bytes=\${DISK_${idx}_BYTES:-}"
     [[ -n $job && -n $target && -n $meta && -n $bytes ]] || die "Replication state is incomplete for $vm disk $idx"
-    ensure_replica_file "$target" "$bytes"
-    refresh_meta "$meta" true
     obj=$(query_job_json "$vm" "$job")
-    [[ -n $obj ]] || start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
+    # An active mirror job owns the destination qcow2 lock. Do not inspect or
+    # recreate its target from the daemon while QEMU is writing it.
+    if [[ -z $obj ]]; then
+      ensure_replica_file "$target" "$bytes"
+      start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
+    fi
+    refresh_meta "$meta" true
   done < <(state_disk_indexes "$state")
 }
 
