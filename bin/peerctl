@@ -54,7 +54,12 @@ ensure_peer_root() {
 }
 
 node_id() {
-  install -d -m 0700 "$(dirname "$NODE_ID_FILE")"
+  # Create the parent if missing, but never change an existing directory's
+  # mode: with GNU install, `install -d -m 0700 /etc/vmapi` re-locked the whole
+  # config directory on every call, so the web API (running as vmapi) could no
+  # longer read vmapi.conf and silently fell back to defaults, including
+  # VMAPI_BACKPLANE_SERVER=false. node-id itself stays root-only (0600).
+  [[ -d $(dirname "$NODE_ID_FILE") ]] || install -d -m 0755 "$(dirname "$NODE_ID_FILE")"
   if [[ ! -s $NODE_ID_FILE ]]; then random_hex > "$NODE_ID_FILE"; chmod 0600 "$NODE_ID_FILE"; fi
   local id; id=$(cat "$NODE_ID_FILE"); valid_id "$id"; printf '%s' "${id,,}"
 }

@@ -12,8 +12,19 @@ MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
 UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
 EXPORTFS=${VMAPI_EXPORTFS:-$(command -v exportfs 2>/dev/null || printf %s /usr/sbin/exportfs)}
 RPC_NFSD=${VMAPI_RPC_NFSD:-$(command -v rpc.nfsd 2>/dev/null || printf %s /usr/sbin/rpc.nfsd)}
-NFS_EXPORTD=${VMAPI_NFS_EXPORTD:-$(command -v nfsv4.exportd 2>/dev/null || printf %s /usr/sbin/nfsv4.exportd)}
-SS=${VMAPI_SS:-/usr/bin/ss}
+# Tool locations differ by distribution (Debian: /usr/bin/ss, Alpine: /sbin/ss)
+# and service managers may start us with a short PATH, so search the sbin dirs.
+find_tool(){
+  local name=$1 dir path
+  path=$(command -v "$name" 2>/dev/null) && { printf '%s\n' "$path"; return; }
+  for dir in /usr/sbin /sbin /usr/bin /bin; do [[ -x $dir/$name ]] && { printf '%s\n' "$dir/$name"; return; }; done
+  printf '/usr/sbin/%s\n' "$name"
+}
+NFS_EXPORTD=${VMAPI_NFS_EXPORTD:-$(find_tool nfsv4.exportd)}
+# Alpine's nfs-utils has no nfsv4.exportd; rpc.mountd answers the same kernel
+# export upcalls when NFSv2/v3 and UDP are disabled.
+RPC_MOUNTD=${VMAPI_RPC_MOUNTD:-$(find_tool rpc.mountd)}
+SS=${VMAPI_SS:-$(find_tool ss)}
 
 BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
 MOUNT_ROOT=${VMAPI_BACKPLANE_MOUNT_ROOT:-/var/lib/vmapi/peer-storage}
@@ -58,11 +69,16 @@ local_node_id(){
 
 peer_profile(){ "$PEERCTL" transport-profile "$1"; }
 
+# Returns 0 if the peer advertises the backplane, 1 if it does not, 2 if it
+# could not be queried (reason in PEER_QUERY_ERROR). Never exits: the daemon's
+# reconcile loop must keep serving other peers.
 peer_supports_backplane(){
   local peer=$1 out
-  valid_peer "$peer"
-  out=$("$PEERCTL" proxy "$peer" GET / 2>/dev/null || true)
-  [[ -n $out ]] && json_has_cap "$out" storage-backplane
+  valid_peer "$peer"; PEER_QUERY_ERROR=''
+  if ! out=$("$PEERCTL" proxy "$peer" GET / 2>&1); then
+    PEER_QUERY_ERROR="Could not query paired host $peer: ${out:0:300}"; return 2
+  fi
+  json_has_cap "$out" storage-backplane
 }
 
 load_state(){
@@ -134,7 +150,10 @@ mount_peer(){
   local peer=$1 port=$2 mp id
   need_cmd "$MOUNT_BIN"
   mp=$(mountpoint "$peer"); install -d -m 0755 "$mp"
-  is_mounted "$mp" || "$MOUNT_BIN" -t nfs -o "vers=4.2,proto=tcp,port=$port,nconnect=1,hard,timeo=600,retrans=2" 127.0.0.1:/ "$mp"
+  # retry=0 + timeout: one attempt per call. Retrying is the daemon's job, with
+  # backoff; mount.nfs's own retry loop against an unreachable peer generated
+  # enough connections to exhaust nf_conntrack on small hosts.
+  is_mounted "$mp" || timeout "${VMAPI_BACKPLANE_MOUNT_TIMEOUT:-90}" "$MOUNT_BIN" -t nfs -o "vers=4.2,proto=tcp,port=$port,nconnect=1,hard,timeo=600,retrans=2,retry=0" 127.0.0.1:/ "$mp"
   id=$(local_node_id)
   install -d -m 0770 "$mp/peers/$id"
   install -d -m 0770 "$mp/peers/$id"/{backups,replicas,docker-volumes,docker-images,registry,artifacts}
@@ -144,12 +163,15 @@ connect_peer(){
   ensure_dirs
   local peer=${1:?peer required} port mp
   valid_peer "$peer"; peer=${peer,,}; mp=$(mountpoint "$peer")
-  peer_supports_backplane "$peer" || die 'Paired host does not advertise the storage-backplane capability'
+  local rc=0; peer_supports_backplane "$peer" || rc=$?
+  ((rc != 2)) || die "$PEER_QUERY_ERROR"
+  ((rc == 0)) || die 'Paired host does not advertise the storage-backplane capability (it needs VMAPI_BACKPLANE_SERVER=true in a vmapi.conf its web API can read)'
   if load_state "$peer" 2>/dev/null; then port=$PORT; else port=$(free_port); write_state "$peer" "$port"; fi
   if is_mounted "$mp" && pid_alive "$(pid_file "$peer")"; then show_peer "$peer"; return; fi
   is_mounted "$mp" && "$UMOUNT_BIN" "$mp" >/dev/null 2>&1 || true
   pid_alive "$(pid_file "$peer")" || start_tunnel "$peer" "$port"
-  mount_peer "$peer" "$port"
+  # Do not leave a tunnel behind a failed mount; the next attempt starts clean.
+  if ! (mount_peer "$peer" "$port"); then kill_pidfile "$(pid_file "$peer")"; die "Could not mount the storage backplane of peer $peer"; fi
   show_peer "$peer"
 }
 
@@ -194,14 +216,34 @@ path_for(){
   if [[ -n $name ]]; then install -d -m 0770 "$base/$name"; printf '%s/%s\n' "$base" "$name"; else printf '%s\n' "$base"; fi
 }
 
+# Per-peer retry backoff for the reconcile loop: 30s doubling to 15 minutes,
+# cleared on success. Explicit connects (e.g. a backup) ignore it.
+backoff_file(){ printf '%s/%s.backoff\n' "$RUN_ROOT" "$1"; }
+backoff_active(){
+  local f next=0 delay; f=$(backoff_file "$1"); [[ -r $f ]] || return 1
+  read -r next delay < "$f" || return 1
+  [[ $next =~ ^[0-9]+$ ]] && (( $(date +%s) < next ))
+}
+backoff_fail(){
+  local f next delay=0; f=$(backoff_file "$1")
+  [[ -r $f ]] && read -r next delay < "$f" || true
+  [[ $delay =~ ^[0-9]+$ ]] || delay=0
+  delay=$(( delay * 2 )); (( delay >= 30 )) || delay=30; (( delay <= 900 )) || delay=900
+  printf '%s %s\n' "$(( $(date +%s) + delay ))" "$delay" > "$f"
+  echo "Peer $1 backplane unavailable; retrying in ${delay}s" >&2
+}
+backoff_clear(){ rm -f -- "$(backoff_file "$1")"; }
+
 reconcile(){
   ensure_dirs
   local peers peer f failed=0
   peers=$("$PEERCTL" list 2>/dev/null || printf '[]')
   while IFS= read -r peer; do
     [[ -n $peer ]] || continue
-    peer_supports_backplane "$peer" || continue
-    connect_peer "$peer" >/dev/null || { echo "Could not connect storage backplane for peer $peer" >&2; failed=1; }
+    backoff_active "$peer" && continue
+    peer_supports_backplane "$peer" || { [[ -z ${PEER_QUERY_ERROR:-} ]] || backoff_fail "$peer"; continue; }
+    if (connect_peer "$peer" >/dev/null); then backoff_clear "$peer"
+    else echo "Could not connect storage backplane for peer $peer" >&2; backoff_fail "$peer"; failed=1; fi
   done < <(printf '%s' "$peers" | grep -o '"node_id":"[a-fA-F0-9]\{32\}"' | cut -d'"' -f4)
   shopt -s nullglob
   for f in "$STATE_ROOT"/*.conf; do
@@ -256,14 +298,24 @@ server_cleanup(){
 server_daemon(){
   [[ $SERVER_ENABLED == true ]] || die 'Storage backplane server is disabled'
   ensure_dirs
-  need_cmd "$EXPORTFS"; need_cmd "$RPC_NFSD"; need_cmd "$NFS_EXPORTD"; need_cmd "$WEBSOCKIFY"; need_cmd "$SS"
+  need_cmd "$EXPORTFS"; need_cmd "$RPC_NFSD"; need_cmd "$WEBSOCKIFY"; need_cmd "$SS"
+  local -a export_daemon
+  if [[ -x $NFS_EXPORTD ]]; then export_daemon=("$NFS_EXPORTD" -F)
+  elif [[ -x $RPC_MOUNTD ]]; then export_daemon=("$RPC_MOUNTD" -F -N 2 -N 3 -u)
+  else die "Neither nfsv4.exportd nor rpc.mountd is installed ($NFS_EXPORTD, $RPC_MOUNTD)"; fi
   valid_ipv4_bind "$NFS_BIND"; valid_port "$NFS_PORT"; valid_port "$WS_PORT"; validate_positive_int "$NFS_THREADS"
-  install -d -m 0755 /proc/fs/nfsd
-  mountpoint -q /proc/fs/nfsd || "$MOUNT_BIN" -t nfsd nfsd /proc/fs/nfsd
+  # /proc/fs/nfsd appears when the nfsd module loads; it cannot be created or
+  # chmod-ed from userspace (install -d failed here with EPERM on Alpine).
+  command -v modprobe >/dev/null 2>&1 && modprobe nfsd 2>/dev/null || true
+  [[ -d /proc/fs/nfsd ]] || die 'Kernel NFS server support (nfsd) is unavailable'
+  install -d -m 0755 /var/lib/nfs
+  # Not `mountpoint -q`: this script defines its own mountpoint() (peer mount
+  # paths), which shadowed the system command and aborted server start-up.
+  awk '$2=="/proc/fs/nfsd" && $3=="nfsd" {f=1} END{exit !f}' /proc/mounts || "$MOUNT_BIN" -t nfsd nfsd /proc/fs/nfsd
   "$RPC_NFSD" 0 >/dev/null 2>&1 || true
   "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
   "$EXPORTFS" -i -o rw,sync,no_subtree_check,no_root_squash,insecure,fsid=0 "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT"
-  "$NFS_EXPORTD" -F </dev/null >>"$RUN_ROOT/exportd.log" 2>&1 & echo $! > "$RUN_ROOT/exportd.pid"
+  "${export_daemon[@]}" </dev/null >>"$RUN_ROOT/exportd.log" 2>&1 & echo $! > "$RUN_ROOT/exportd.pid"
   "$RPC_NFSD" --host "$NFS_BIND" --port "$NFS_PORT" --no-udp --no-nfs-version 3 --no-nfs-version 4.0 --nfs-version 4.1 --nfs-version 4.2 "$NFS_THREADS"
   "$WEBSOCKIFY" "$WS_BIND:$WS_PORT" "$NFS_BIND:$NFS_PORT" </dev/null >>"$RUN_ROOT/websockify.log" 2>&1 & echo $! > "$RUN_ROOT/websockify.pid"
   trap 'server_cleanup; exit 0' TERM INT EXIT
