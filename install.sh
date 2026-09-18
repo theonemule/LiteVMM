@@ -95,7 +95,7 @@ install_packages() {
     alpine)
       enable_alpine_community
       apk update
-      apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client
+      apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client-default
       case $PROFILE in
         virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso nfs-utils websocat;;
         docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websockify websocat;;
@@ -370,6 +370,31 @@ configure_debian() {
   nginx -t && systemctl reload nginx
 }
 
+verify_profile_install() {
+  local installed_profile
+  installed_profile=$(awk -F= '$1=="VMAPI_PROFILE"{print $2}' /etc/vmapi/vmapi.conf | tail -n1)
+  [[ $installed_profile == "$PROFILE" ]] || die "Profile verification failed: requested $PROFILE but /etc/vmapi/vmapi.conf contains ${installed_profile:-none}"
+
+  case "$PROFILE" in
+    virtualization)
+      command -v qemu-system-x86_64 >/dev/null 2>&1 || die 'VM profile verification failed: qemu-system-x86_64 is not installed'
+      ;;
+    docker)
+      command -v docker >/dev/null 2>&1 || die 'Docker profile verification failed: docker is not installed'
+      docker info >/dev/null 2>&1 || die 'Docker profile verification failed: Docker daemon is not running'
+      ;;
+    virtualization-docker)
+      command -v qemu-system-x86_64 >/dev/null 2>&1 || die 'VM + Docker profile verification failed: qemu-system-x86_64 is not installed'
+      command -v docker >/dev/null 2>&1 || die 'VM + Docker profile verification failed: docker is not installed'
+      docker info >/dev/null 2>&1 || die 'VM + Docker profile verification failed: Docker daemon is not running'
+      ;;
+    backup) ;;
+  esac
+
+  [[ $(awk -F= '$1=="VMAPI_BACKPLANE_SERVER"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == true ]] ||
+    die 'Backup-storage verification failed: VMAPI_BACKPLANE_SERVER is not enabled'
+}
+
 finalize() {
   /usr/local/bin/peerctl sync-auth
   if [[ $PROFILE == docker || $PROFILE == virtualization-docker ]]; then
@@ -436,6 +461,7 @@ install_common_files
 write_sudoers
 case $PLATFORM in alpine) configure_alpine;; debian) configure_debian;; esac
 finalize
+verify_profile_install
 if [[ $(awk -F= '$1=="VMAPI_TLS_ENABLED"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == true ]]; then /usr/local/bin/certctl apply; fi
 [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]] && report_nested_hyperv_requirement || true
 scheme=http; [[ $(awk -F= '$1=="VMAPI_TLS_ENABLED"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == true ]] && scheme=https
