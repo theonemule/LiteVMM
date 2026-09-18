@@ -1,8 +1,8 @@
-# LiteVMM 0.9
+# LiteVMM 0.10
 
-LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, combined virtualization + Docker, or backup-receiver profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. The core management API remains Bash/FastCGI. Docker profiles additionally install a small Python/pyfuse3 helper for LiteVMM peer-backed FUSE volumes, and Lighttpd-based receiver nodes use a small Python WebSocket CGI for that filesystem data path.
+LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, combined virtualization + Docker, or backup-storage profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses the Linux NFSv4 client/server stack carried through the existing LiteVMM WebSocket endpoint.
 
-There is no application database, no libvirt dependency, no Python/Node backend, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. Existing `vmapi` command, path, environment-variable, and API identifiers are retained for compatibility.
+There is no application database, no libvirt dependency, no Python/Node backend, no custom userspace filesystem, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. The existing `vmapi` name remains for the core command and filesystem layout. LiteVMM 0.10 intentionally removes the retired custom-filesystem, per-volume share, backup-upload, and per-disk replication transport interfaces.
 
 ## Architecture
 
@@ -50,8 +50,8 @@ The console covers:
 - optional local OCI registry and direct image push/pull to paired LiteVMM Docker hosts
 - Docker network create/list/inspect/remove plus host bridge/interface visibility
 - named GOST TAP-over-WebSocket Layer-2 overlays for paired peers
-- continuous VM disk replication to paired virtualization or backup-receiver nodes over WSS without requiring an overlay network
-- Docker volume create/list/inspect/remove with Docker-local, host bind, NFS, SMB/CIFS, tmpfs, custom-driver, and LiteVMM peer-backed FUSE-over-WSS storage
+- continuous VM disk replication to paired storage-backplane nodes without requiring an overlay network
+- Docker volume create/list/inspect/remove with Docker-local, host bind, NFS, SMB/CIFS, tmpfs, custom-driver, and LiteVMM peer-backed NFSv4/WSS storage
 - five-second host, VM and container resource monitoring with rolling in-browser graphs
 - a System information view with OS, kernel, CPU/RAM, IP addressing, routes, disks, mounts, service state, and installed component versions
 
@@ -150,76 +150,58 @@ Docker objects are **not** duplicated into this filesystem. The Docker daemon re
 
 ### Trusted peer hosts
 
-Pairing is a manual, three-step public-key exchange: export a request on host A, import it on host B to receive a response, then import that response on A. The request detects and includes the local host name and node ID. Each node creates and retains an Ed25519 private key under `/etc/vmapi/identity`; only public keys and fingerprints leave the host. The offline transfer is the initial trust ceremony, so compare the displayed host name and fingerprint through a trusted channel before accepting it.
+Pairing is a manual, three-step public-key exchange. Once two nodes are paired, the peer relationship is the trust boundary for control-plane calls and WebSocket backplane connections. Pair records remain root-only under `/var/lib/vmapi/peers`, and revoking a peer removes its HTTP credential, closes its overlay connections, and tears down its local storage-backplane mount.
 
-After pairing, host-to-host requests use HTTP Basic authentication on `/peer-api/`. The same pair-specific username/password is used for authenticated WebSocket data paths such as `/overlay/NAME`, `/replication/TOKEN`, and `/remote-fs/TOKEN`. Lighttpd verifies both against `/etc/vmapi-peer.htpasswd`; the CGI also checks that the authenticated user is still paired. The browser's local management login remains separate. Ed25519 signatures protect the pairing bundles, not subsequent API requests.
+### Shared peer storage backplane
 
-Pair records remain root-only in `/var/lib/vmapi/peers`. `peerctl sync-auth` rebuilds the HTTP password database from existing pairs, so an upgrade does not normally require re-pairing. Duplicate legacy usernames must be revoked and paired again. Revoking a peer removes its HTTP credential, removes it from hub allowlists, and closes its existing overlay connections. Pairing bundles expire after 15 minutes and include a shared secret; transfer them privately.
+A storage-capable node runs NFSv4.1/4.2 over TCP only. LiteVMM starts `rpc.nfsd` explicitly on `127.0.0.1:2049`, disables the distribution-managed NFS service, exports only `/var/lib/vmapi/backplane`, and verifies the actual listener before reporting the backplane healthy. NFS is not exposed on a LAN/WAN interface unless an administrator deliberately changes the underlying configuration.
+
+The storage byte stream is carried through the existing LiteVMM HTTP(S) endpoint:
+
+```text
+feature / Docker / QEMU
+        |
+        v
+peer NFS mount
+        |
+127.0.0.1:dynamic-port
+        |
+     websocat
+        |
+ WSS /backplane/storage
+        |
+ existing LiteVMM HTTP(S) port
+        |
+    websockify
+        |
+127.0.0.1:2049
+        |
+   kernel NFSv4
+        |
+/var/lib/vmapi/backplane
+```
+
+The client runs `websocat` as a loopback TCP bridge and mounts it with the normal Linux NFS client. The storage host runs `websockify` on loopback behind Nginx or Lighttpd. One peer-wide mount is reused by backups, VM replicas, Docker volumes, Docker image archives, registry data, and future filesystem-backed storage features.
+
+Each source node receives a namespace under `peers/NODE_ID/` with storage classes including `backups`, `replicas`, `docker-volumes`, `docker-images`, `registry`, and `artifacts`.
 
 ### VM backups
 
-`vmbackupctl` creates consistent tar.gz archives of stopped VMs under `/var/lib/vmapi/backups`. Every archive contains VM configuration and every attached virtual disk, so it is also the migration transport unit. It lists/downloads/deletes archives, streams them to an authenticated paired host, and writes cron schedules for either local or peer destinations. SCP, SFTP, and arbitrary SSH destinations are intentionally unsupported. Peer transfers use the existing HTTP Basic peer API, store the validated archive on the destination without restoring it, and delete the source staging archive only after the receiver succeeds.
-
-Manual and scheduled backups run as tracked jobs. The VM backup dialog shows phase progress (validation, configuration, disks, compression, and peer transfer) and retains the final success or error state in `/var/lib/vmapi/backup-jobs`. QMP does not provide a reliable byte-level estimate for every disk mode, so the percentage represents completed phases rather than exact bytes copied. The dialog also queries each paired host and exposes peer-held archives for download; this matters because a successful peer-targeted archive is intentionally absent from the source host.
+Peer-targeted VM backups are created locally, then copied into the paired host's `backups/` namespace through the mounted backplane. The local staging archive is removed only after the filesystem copy succeeds. Local backups continue to use `/var/lib/vmapi/backups`. Backup-profile nodes inventory and serve the archives already present in their backplane tree; there is no separate peer-upload transport.
 
 ### Live VM disk replication
 
-Virtualization profiles can continuously mirror the disks of a running VM to an authenticated paired LiteVMM host. The destination may be another virtualization host or a `backup` profile. A backup-only node receives and stores replicas but does not run the VM.
+Virtualization profiles continuously mirror running VM disks directly into qcow2 files under the peer's `replicas/` namespace. QEMU `drive-mirror` performs the initial full synchronization and remains active for subsequent guest writes.
 
-Replication does **not** depend on the Layer-2 overlay feature and does not expose NBD on the LAN. LiteVMM creates a loopback-only `qemu-nbd` receiver for each destination disk, places a loopback GOST WebSocket listener in front of it, and proxies the WebSocket path through the existing LiteVMM HTTP(S) listener. The source creates its own loopback TCP endpoint through GOST and points QEMU's live `drive-mirror` job at that local NBD endpoint. With TLS enabled, the remote byte stream therefore travels over WSS on the same management port as the API.
-
-```text
-source QEMU drive-mirror
-        |
-        v
-loopback NBD endpoint
-        |
-        v
-GOST WSS tunnel  ==================>  existing LiteVMM HTTPS port
-                                             |
-                                             v
-                                      loopback GOST WS
-                                             |
-                                             v
-                                      loopback qemu-nbd
-                                             |
-                                             v
-                                      replica qcow2 disk
-```
-
-The first mirror performs a full disk synchronization. QEMU then leaves the mirror job active in its ready state so later guest writes continue to be copied. LiteVMM persists the replication relationship and runs a reconciliation service that recreates receiver processes, WebSocket tunnels, and mirror jobs after host or VM restarts. Reconnection performs a full reconciliation before returning to continuous mirroring.
-
-Stopping replication cancels the source mirror and closes the WSS/NBD receiver but intentionally retains the last synchronized qcow2 on the destination. The Backups page lists these as **retained replicas** until an administrator explicitly purges them. Disk add/remove/resize/rebind and VM deletion are blocked while persistent replication is configured so the mirror topology cannot silently diverge from the source VM.
+There is no replication-specific block receiver, per-disk WebSocket endpoint, or dedicated replication listener. QEMU writes to an ordinary path on the mounted NFS backplane. Stopping replication cancels the source mirror but retains the last synchronized qcow2 file until it is explicitly purged.
 
 This is disk replication, not lock-step VM fault tolerance. LiteVMM does not replicate guest RAM or CPU state, perform distributed fencing, or automatically boot the destination VM after source failure.
 
-### LiteVMM peer-backed Docker volumes over WSS
+### Peer-backed Docker volumes and image storage
 
-Docker-capable hosts can mount persistent storage that physically lives on a paired LiteVMM receiver without NFS, SMB/CIFS, WebDAV, a Docker volume plugin, or any additional listening port. The Docker host runs a FUSE client which translates Linux filesystem operations into request/response messages on one authenticated WSS connection to the peer's existing LiteVMM HTTPS endpoint. Docker then sees that FUSE mount as an ordinary bind-backed named volume.
+A Docker-capable host allocates a directory under the peer's `docker-volumes/` namespace and exposes it to Docker as an ordinary bind-backed named volume. Docker never talks to NFS directly and LiteVMM does not implement a custom filesystem or Docker volume plugin.
 
-```text
-container
-   |
-Docker named volume
-   |
-LiteVMM FUSE mount
-   |
-   +==== authenticated WSS on existing LiteVMM HTTPS port ====+
-                                                              |
-                                                  /remote-fs/TOKEN
-                                                              |
-                                               Lighttpd WS CGI
-                                                              |
-                                        peer backing directory
-```
-
-The remote-volume data path does not start NFS, Samba, WebDAV, rclone, GOST, a TCP relay, a loopback listener, or a Unix-socket storage daemon. The FUSE process is the client and opens only an outbound WSS connection to the already-paired host. Pair-specific HTTP Basic credentials authenticate the WebSocket upgrade, and a random per-volume token selects the hosted directory. Revoking a peer tears down its local mounts and disables its hosted shares.
-
-Use **Docker → Volumes → LiteVMM peer volume over WSS** to select an HTTPS paired host and a remote volume name. Reattaching the same peer/name reuses the existing data. Detaching removes the local Docker volume and FUSE mount but preserves the peer's data. The receiver's Backups page lists hosted peer volumes separately and requires an explicit destructive action before stored data is deleted.
-
-The first implementation supports regular files and directories, lookup/listing, random reads and writes, create/remove, rename, truncate, chmod/chown metadata, timestamps, statfs, and fsync. Symlinks, hard links, special device nodes, and distributed POSIX lock coordination are intentionally not implemented. Workloads which require cross-client file locking should use a storage system designed for those semantics.
-
-To preserve the strict one-port design, hosting is advertised only when the existing LiteVMM web server can terminate the filesystem WebSocket directly. Alpine/Lighttpd host installs and the containerized backup receiver can host peer volumes. Debian/Ubuntu Nginx installs can consume them as Docker clients but do not advertise `remote-volume-receiver`; adding a hidden backend listener solely for this feature is intentionally avoided.
+Peer image transfer uses the same backplane. `peer-push` saves an image archive under `docker-images/`; `peer-pull` loads that archive into Docker. The optional local OCI registry remains available when registry semantics are desired, but peer image storage does not require a registry on the storage host.
 
 ### Cloud-init provisioning
 
@@ -260,10 +242,10 @@ The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI val
 
 The LiteVMM API and console are always installed. Choose exactly one workload profile:
 
-- `virtualization` installs QEMU/KVM, VM networking and consoles, cloud-init NoCloud seed support, GOST overlays, VM backup sender/receiver, and live disk replication source/receiver support.
-- `docker` installs Docker/Compose management, container terminals, storage-backend volume helpers, LiteVMM FUSE-over-WSS peer-volume client support, streamed image builds, and the optional local OCI registry without QEMU/KVM or VM backup creation.
-- `virtualization-docker` installs the complete virtualization profile, including cloud-init, VM backups, and live replication, plus the full Docker feature set including the peer-volume FUSE client.
-- `backup` installs the paired archive receiver plus the live-replication receiver. On Lighttpd-based deployments it also hosts LiteVMM peer-volume directories over the existing WSS endpoint. It can retain replica qcow2 disks but cannot create, restore, migrate, or run VMs and does not install Docker.
+- `virtualization` installs QEMU/KVM, VM networking and consoles, cloud-init, overlays, backup creation, live disk replication, and both storage-backplane client/server support.
+- `docker` installs Docker/Compose management, container terminals, storage-backend helpers, peer-volume and peer-image backplane client support, streamed image builds, and the optional local OCI registry.
+- `virtualization-docker` installs the complete virtualization and Docker feature sets plus both sides of the storage backplane.
+- `backup` is a storage-only node. It hosts the loopback-only NFSv4/WSS backplane used for backups, retained VM replicas, Docker volumes, image archives, and other peer storage. It does not run VMs or Docker workloads.
 
 On Alpine, Debian, Ubuntu, or a Debian derivative:
 
@@ -274,27 +256,20 @@ sudo ./install.sh --profile virtualization-docker --port 5186
 sudo ./install.sh --profile backup --port 5186
 ```
 
-Running `sudo ./install.sh` interactively presents the four profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`. Existing `/etc/vmapi/vmapi.conf` storage paths and TLS settings are preserved when the installer is rerun.
+Running `sudo ./install.sh` interactively presents the four profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`.
 
-Add `--certbot` to install optional Certbot support. The Admin page can then issue, renew, or disable a certificate. Certificate issuance uses the ACME HTTP-01 standalone challenge on TCP port 80; DNS must resolve to the host and port 80 must be reachable during issuance. Once issued, LiteVMM serves HTTPS on the configured management port.
+Debian uses Nginx on `127.0.0.1:5186` by default. Alpine uses Lighttpd on the configured management port. Both web servers proxy `/backplane/storage` to a loopback-only websockify listener; NFS itself remains bound to loopback.
 
-Debian uses Nginx on `127.0.0.1:5186` by default, so an SSH tunnel remains useful during testing. Alpine uses Lighttpd on the configured management port. The direct WebSocket-CGI server required by peer-backed FUSE volumes is enabled on Lighttpd deployments; Nginx deployments remain remote-volume clients only so no second backend listener is introduced.
+### Containerized backup storage node
 
-### Containerized backup receiver
-
-The repository root `Dockerfile` builds the backup-only profile. It persists pairing identity, peer state, backup archives, retained live-replica disks, and hosted peer-volume data under `/var/lib/vmapi` and exposes port `5186` by default. The image includes `qemu-img`, `qemu-nbd`, and GOST solely for receiving replication streams; it does not include KVM or run guest VMs:
+The repository root `Dockerfile` builds the backup-storage profile. Because the image starts the kernel NFS server inside the container, it must run with sufficient privileges to mount the `nfsd` pseudo-filesystem:
 
 ```bash
 docker build -t litevmm-backup .
-docker run -d --name litevmm-backup \
-  -p 5186:5186 \
-  -e VMAPI_HTTP_USER=admin \
-  -e VMAPI_HTTP_PASSWORD='choose-a-strong-password' \
-  -v litevmm-backup-data:/var/lib/vmapi \
-  litevmm-backup
+docker run -d --privileged --name litevmm-backup   -p 5186:5186   -e VMAPI_HTTP_USER=admin   -e VMAPI_HTTP_PASSWORD='choose-a-strong-password'   -v litevmm-backup-data:/var/lib/vmapi   litevmm-backup
 ```
 
-The container is intended to sit behind an HTTPS reverse proxy. Certbot management is therefore reported as unavailable inside the backup image rather than installing an ACME client into the container. Its `/remote-fs/TOKEN` WebSocket filesystem endpoint is served by the same Lighttpd listener as the API; no additional storage port is exposed.
+Only the LiteVMM management port is published. NFS remains on `127.0.0.1:2049` inside the container and is reachable by peers only through `/backplane/storage`.
 
 ### Deploy to Alpine hosts from Windows
 
@@ -499,9 +474,9 @@ The console exposes storage as a backend choice rather than requiring the storag
 - SMB/CIFS shares
 - tmpfs memory-backed volumes
 - arbitrary Docker volume drivers and repeated driver options
-- LiteVMM peer volumes mounted by FUSE over the paired host's existing WSS endpoint
+- LiteVMM peer volumes backed by the shared NFSv4/WSS storage backplane
 
-For example, a host path or network share can be presented to a container as an ordinary named Docker volume. A LiteVMM peer volume follows the same Docker-facing model, but the mountpoint itself is a FUSE filesystem whose backing data resides on the paired LiteVMM receiver and whose I/O travels only over the existing HTTPS/WSS endpoint. This is useful when another NAS, file server, or storage appliance owns the data and LiteVMM only needs to make that storage available to containers. SMB credentials entered as local-driver options are visible to Docker administrators through volume inspection, so use a dedicated low-privilege share account.
+For example, a host path or network share can be presented to a container as an ordinary named Docker volume. A LiteVMM peer volume follows the same Docker-facing model, but its directory resides on the peer-wide NFSv4 mount whose traffic travels through the existing HTTPS/WSS backplane. SMB credentials entered as local-driver options are visible to Docker administrators through volume inspection, so use a dedicated low-privilege share account.
 
 ## Resource monitoring
 
@@ -778,33 +753,23 @@ GET     /api/docker/volumes
 POST    /api/docker/volumes
 GET     /api/docker/volumes/{name}
 DELETE  /api/docker/volumes/{name}
+
+GET     /api/docker/peer-volumes
+POST    /api/docker/peer-volumes              form: peer_id=...&remote_name=...&name=...
+GET     /api/docker/peer-volumes/{name}
+DELETE  /api/docker/peer-volumes/{name}
 ```
 
-Volume create fields include `name`, `driver`, indexed `label_N`, and indexed `opt_N` values. The UI presets translate bind, NFS, SMB/CIFS, and tmpfs choices into ordinary `local` driver options.
-
-LiteVMM peer-volume client endpoints:
+Storage-backplane administration:
 
 ```text
-GET     /api/docker/remote-volumes
-POST    /api/docker/remote-volumes              form: peer_id=...&remote_name=...&name=...
-GET     /api/docker/remote-volumes/{name}
-DELETE  /api/docker/remote-volumes/{name}
+GET     /api/backplane/status
+GET     /api/backplane/docker-volumes
+GET     /api/backplane/docker-volumes/{id}
+DELETE  /api/backplane/docker-volumes/{id}?delete_data=true
 ```
 
-Receiver-side administration and paired-host provisioning:
-
-```text
-GET     /api/remote-volumes/hosted
-POST    /api/remote-volumes/hosted/{id}/stop
-DELETE  /api/remote-volumes/hosted/{id}?delete_data=true|false
-GET     /peer-api/remote-volumes/shares
-POST    /peer-api/remote-volumes/shares          form: name=...
-GET     /peer-api/remote-volumes/shares/{id}
-POST    /peer-api/remote-volumes/shares/{id}/start
-DELETE  /peer-api/remote-volumes/shares/{id}
-```
-
-The actual filesystem data path is `wss://HOST:PORT/remote-fs/TOKEN` on the same LiteVMM HTTPS listener.
+Peer Docker volumes are directories on the shared NFSv4 backplane. The client-side Docker volume is only a bind-backed view of that directory.
 
 ### Live replication endpoints
 
@@ -817,7 +782,7 @@ GET     /api/replications/replicas              destination inventory
 DELETE  /api/replications/replicas/{id}?delete_file=true
 ```
 
-Receiver setup/restart/stop routes are under `/peer-api/replications/receivers/...` and require an authenticated paired-host credential. The data path itself uses a random `/replication/TOKEN` WebSocket route whose generated htpasswd contains only the initiating peer account. NBD listeners remain bound to loopback.
+Replication has no per-disk allocation API or replication-specific data endpoint. QEMU writes the destination qcow2 file through the already-mounted `/backplane/storage` filesystem path.
 
 ## Design boundaries
 
@@ -825,7 +790,7 @@ This intentionally does **not** attempt to become libvirt, Kubernetes or Portain
 
 On the VM side, host DHCP configuration, VFIO/IOMMU binding, snapshots, general storage pools, workload scheduling, automatic HA failover, RAM/CPU state replication, and distributed fencing remain outside this layer. Live replication maintains standby disk copies only. Host bridge creation is intentionally minimal: it creates Linux bridges, optionally attaches member interfaces and writes simple persistence where the host networking stack supports it.
 
-On the Docker side, the project does not duplicate Docker metadata, orchestrate Swarm/Kubernetes, or become a general container platform. LiteVMM peer volumes are a deliberately small FUSE filesystem and do not implement symlinks, hard links, special files, or distributed file-lock coordination. The optional local registry is a loopback-bound CNCF Distribution service exposed through LiteVMM's existing HTTP(S) listener; Docker remains authoritative for containers, images, networks, and volumes.
+On the Docker side, the project does not duplicate Docker metadata, orchestrate Swarm/Kubernetes, or become a general container platform. LiteVMM peer volumes use the Linux NFSv4 client/server implementation rather than a custom filesystem. The optional local registry is a loopback-bound CNCF Distribution service exposed through LiteVMM's existing HTTP(S) listener; Docker remains authoritative for containers, images, networks, and volumes.
 
 The result is one lightweight management plane with two native backends:
 

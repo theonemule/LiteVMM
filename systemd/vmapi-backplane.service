@@ -1,0 +1,15 @@
+[Unit]
+Description=LiteVMM peer storage backplane client
+After=network-online.target
+Wants=network-online.target
+Before=docker.service vmapi-replication.service vmapi-autostart.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/backplanectl daemon
+ExecStop=/usr/local/bin/backplanectl suspend
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

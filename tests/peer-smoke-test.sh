@@ -21,12 +21,29 @@ fi
 exec /usr/bin/install "$@"
 MOCK
 chmod +x "$T/bin/install"
+cat > "$T/bin/chown" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+chmod +x "$T/bin/chown"
+cat > "$T/bin/htpasswd" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ ${1:-} == -vb ]] || exit 2
+file=$2 user=$3 password=$4
+hash=$(awk -F: -v u="$user" '$1==u{print $2}' "$file")
+[[ -n $hash ]] || exit 1
+IFS='$' read -r _ scheme salt rest <<< "$hash"
+calc=$(printf '%s\n' "$password" | openssl passwd -apr1 -salt "$salt" -stdin)
+[[ $calc == "$hash" ]]
+MOCK
+chmod +x "$T/bin/htpasswd"
 
 run_a() {
-  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" VMAPI_PEER_PASSWD_FILE="$T/a/passwd" VMAPI_OVERLAYCTL=/nonexistent VMCTL=true BACKUPCTL=true "$ROOT/bin/peerctl" "$@"
+  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" VMAPI_PEER_PASSWD_FILE="$T/a/passwd" VMAPI_OVERLAYCTL=/nonexistent VMCTL=true BACKUPCTL=true bash "$ROOT/bin/peerctl" "$@"
 }
 run_b() {
-  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/b/peers" VMAPI_IDENTITY_ROOT="$T/b/identity" VMAPI_NODE_ID_FILE="$T/b/node-id" VMAPI_PEER_NONCE_ROOT="$T/b/nonces" VMAPI_PEER_PASSWD_FILE="$T/b/passwd" VMAPI_OVERLAYCTL=/nonexistent VMCTL=true BACKUPCTL=true "$ROOT/bin/peerctl" "$@"
+  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/b/peers" VMAPI_IDENTITY_ROOT="$T/b/identity" VMAPI_NODE_ID_FILE="$T/b/node-id" VMAPI_PEER_NONCE_ROOT="$T/b/nonces" VMAPI_PEER_PASSWD_FILE="$T/b/passwd" VMAPI_OVERLAYCTL=/nonexistent VMCTL=true BACKUPCTL=true bash "$ROOT/bin/peerctl" "$@"
 }
 
 request=$(run_a request node-a https://node-a.example)
@@ -50,11 +67,14 @@ grep -q '"password":"[0-9a-f]' <<< "$credential"
 profile=$(run_a overlay-profile "$b_id")
 grep -q '"endpoint":"wss://node-b.example/overlay"' <<< "$profile"
 grep -q '"username":"relay_' <<< "$profile"
+transport=$(run_a transport-profile "$b_id")
+grep -q '"endpoint":"wss://node-b.example"' <<< "$transport"
+grep -q '"username":"relay_' <<< "$transport"
 
 # Both hosts hash the identical paired HTTP credential; no signature headers.
 source "$T/a/peers/$b_id.conf"
-htpasswd -vb "$T/a/passwd" "$RELAY_USER" "$RELAY_PASSWORD" >/dev/null 2>&1
-htpasswd -vb "$T/b/passwd" "$RELAY_USER" "$RELAY_PASSWORD" >/dev/null 2>&1
+"$T/bin/htpasswd" -vb "$T/a/passwd" "$RELAY_USER" "$RELAY_PASSWORD" >/dev/null 2>&1
+"$T/bin/htpasswd" -vb "$T/b/passwd" "$RELAY_USER" "$RELAY_PASSWORD" >/dev/null 2>&1
 run_b authorize-user "$RELAY_USER"
 if run_b authorize-user not-paired >/dev/null 2>&1; then exit 1; fi
 cat > "$T/curl" <<'MOCK'
@@ -71,14 +91,14 @@ while (($#)); do
   esac
 done
 [[ $target == https://node-b.example/peer-api/* ]]
-htpasswd -vb "$VMAPI_TEST_TMP/b/passwd" "${credential%%:*}" "${credential#*:}" >/dev/null 2>&1
+"$VMAPI_TEST_TMP/bin/htpasswd" -vb "$VMAPI_TEST_TMP/b/passwd" "${credential%%:*}" "${credential#*:}" >/dev/null 2>&1
 printf '{"ok":true}\n'
 MOCK
 chmod +x "$T/curl"
 
-result=$(PATH="$T/bin:$PATH" VMAPI_TEST_ROOT="$ROOT" VMAPI_TEST_TMP="$T" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" CURL_BIN="$T/curl" "$ROOT/bin/peerctl" proxy "$b_id" GET /vms)
+result=$(PATH="$T/bin:$PATH" VMAPI_TEST_ROOT="$ROOT" VMAPI_TEST_TMP="$T" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" CURL_BIN="$T/curl" bash "$ROOT/bin/peerctl" proxy "$b_id" GET /vms)
 [[ $result == '{"ok":true}' ]]
-result=$(PATH="$T/bin:$PATH" VMAPI_TEST_ROOT="$ROOT" VMAPI_TEST_TMP="$T" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" CURL_BIN="$T/curl" "$ROOT/bin/peerctl" proxy "$b_id" GET '/docker/networks?name=overlay-net')
+result=$(PATH="$T/bin:$PATH" VMAPI_TEST_ROOT="$ROOT" VMAPI_TEST_TMP="$T" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" CURL_BIN="$T/curl" bash "$ROOT/bin/peerctl" proxy "$b_id" GET '/docker/networks?name=overlay-net')
 [[ $result == '{"ok":true}' ]]
 
 # Revocation removes API/upgrade credentials from the shared database.

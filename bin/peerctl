@@ -16,7 +16,8 @@ NODE_ID_FILE=${VMAPI_NODE_ID_FILE:-/etc/vmapi/node-id}
 HTPASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
 OVERLAYCTL=${VMAPI_OVERLAYCTL:-/usr/local/bin/overlayctl}
 REPLICATIONCTL=${VMAPI_REPLICATIONCTL:-/usr/local/bin/replicationctl}
-REMOTE_VOLUMECTL=${VMAPI_REMOTE_VOLUMECTL:-/usr/local/bin/remote-volumectl}
+PEER_VOLUMECTL=${VMAPI_PEER_VOLUMECTL:-/usr/local/bin/peer-volumectl}
+BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
 PAIR_TTL=${VMAPI_PAIR_TTL:-900}
 BACKUPCTL=${VMAPI_BACKUPCTL:-/usr/local/bin/vmbackupctl}
 VMCTL=${VMAPI_VMCTL:-/usr/local/bin/vmctl}
@@ -322,6 +323,20 @@ cmd_list() {
 
 cmd_set_url() { local id=${1:?node id required} url=${2:?peer URL required} file; valid_id "$id"; valid_url "$url"; file=$(peer_file "$id"); [[ -f $file ]] || die 'Peer not found'; cfg_set_file "$file" URL "$(normalized_peer_url "$url")"; }
 cmd_overlay_credentials() { local id=${1:?node id required}; load_peer "$id"; printf '{"node_id":"%s","username":"%s","password":"%s"}\n' "$(json_escape "$PEER_NODE_ID")" "$(json_escape "$PEER_RELAY_USER")" "$(json_escape "$PEER_RELAY_PASSWORD")"; }
+cmd_transport_profile() {
+  local id=${1:?node id required} scheme endpoint
+  load_peer "$id"
+  [[ -n $PEER_URL ]] || die 'Peer has no API endpoint; set its endpoint first'
+  [[ -n $PEER_RELAY_USER && -n $PEER_RELAY_PASSWORD ]] || die 'Peer has no transport credential; re-pair this host'
+  case "$PEER_URL" in
+    https://*) scheme=wss;;
+    http://*) scheme=ws;;
+    *) die 'Peer API endpoint uses an unsupported scheme';;
+  esac
+  endpoint="${scheme}://$(url_origin "$PEER_URL" | cut -d/ -f3)"
+  printf '{"node_id":"%s","endpoint":"%s","username":"%s","password":"%s"}\n'     "$(json_escape "$PEER_NODE_ID")" "$(json_escape "$endpoint")" "$(json_escape "$PEER_RELAY_USER")" "$(json_escape "$PEER_RELAY_PASSWORD")"
+}
+
 cmd_overlay_profile() {
   local id=${1:?node id required} scheme endpoint
   load_peer "$id"
@@ -368,9 +383,10 @@ cmd_revoke() {
   local id=${1:?node id required} relay_user=''
   valid_id "$id"; id=${id,,}; load_peer "$id"; relay_user=$PEER_RELAY_USER
   # Tear down peer-bound data paths while the paired credential still exists,
-  # so source-side replication can notify and clean the destination receiver.
+  # so source-side replication can clean its peer-backed state before trust is removed.
   if [[ -x $REPLICATIONCTL ]]; then "$REPLICATIONCTL" revoke-peer "$id" "$relay_user" || true; fi
-  if [[ -x $REMOTE_VOLUMECTL ]]; then "$REMOTE_VOLUMECTL" revoke-peer "$id" "$relay_user" || true; fi
+  if [[ -x $PEER_VOLUMECTL ]]; then "$PEER_VOLUMECTL" revoke-peer "$id" "$relay_user" || true; fi
+  if [[ -x $BACKPLANECTL ]]; then "$BACKPLANECTL" revoke-peer "$id" || true; fi
   rm -f -- "$(peer_file "$id")" "$(peer_public_file "$id")"
   cmd_sync_auth
   # Close existing WebSockets as well as rejecting future upgrades.
@@ -385,7 +401,7 @@ case "${1:-}" in
 esac
 
 case "${1:-help}" in
-  identity) cmd_identity;; request) shift; cmd_request "$@";; pending) cmd_pending;; cancel-pending) cmd_cancel_pending;; accept) shift; cmd_accept "$@";; complete) shift; cmd_complete "$@";; list) cmd_list;; set-url) shift; cmd_set_url "$@";; overlay-credentials) shift; cmd_overlay_credentials "$@";; overlay-profile) shift; cmd_overlay_profile "$@";; authorize-user) shift; cmd_authorize_user "$@";; sync-auth) cmd_sync_auth;; cors-origin) shift; cmd_cors_origin "$@";; proxy) shift; cmd_proxy "$@";; migrate) shift; cmd_migrate "$@";; revoke) shift; cmd_revoke "$@";;
-  help|-h|--help) printf '%s\n' 'peerctl identity|request|pending|cancel-pending|accept BUNDLE [NAME]|complete BUNDLE|list|set-url NODE_ID URL|overlay-credentials NODE_ID|overlay-profile NODE_ID|authorize-user USER|sync-auth|proxy NODE_ID METHOD PATH [CONTENT_TYPE]|migrate VM NODE_ID|revoke NODE_ID';;
+  identity) cmd_identity;; request) shift; cmd_request "$@";; pending) cmd_pending;; cancel-pending) cmd_cancel_pending;; accept) shift; cmd_accept "$@";; complete) shift; cmd_complete "$@";; list) cmd_list;; set-url) shift; cmd_set_url "$@";; overlay-credentials) shift; cmd_overlay_credentials "$@";; overlay-profile) shift; cmd_overlay_profile "$@";; transport-profile) shift; cmd_transport_profile "$@";; authorize-user) shift; cmd_authorize_user "$@";; sync-auth) cmd_sync_auth;; cors-origin) shift; cmd_cors_origin "$@";; proxy) shift; cmd_proxy "$@";; migrate) shift; cmd_migrate "$@";; revoke) shift; cmd_revoke "$@";;
+  help|-h|--help) printf '%s\n' 'peerctl identity|request|pending|cancel-pending|accept BUNDLE [NAME]|complete BUNDLE|list|set-url NODE_ID URL|overlay-credentials NODE_ID|overlay-profile NODE_ID|transport-profile NODE_ID|authorize-user USER|sync-auth|proxy NODE_ID METHOD PATH [CONTENT_TYPE]|migrate VM NODE_ID|revoke NODE_ID';;
   *) die "Unknown command: ${1:-}";;
 esac

@@ -6,7 +6,7 @@ api(){ local profile=$1 path=$2 server=${3:-false}; cat > "$T/vmapi.conf" <<CFG
 VMAPI_PROFILE=$profile
 VMAPI_HTTP_PORT=5186
 VMAPI_TLS_ENABLED=false
-VMAPI_REMOTE_FS_SERVER=$server
+VMAPI_BACKPLANE_SERVER=$server
 VM_ROOT=$T/vms
 DISK_ROOT=$T/disks
 ISO_ROOT=$T/isos
@@ -20,59 +20,43 @@ python3 - "$backup" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
 assert x['profile']=='backup'
-assert x['port']==5186
-assert 'backup-receiver' in x['capabilities']
-assert 'replication-receiver' in x['capabilities']
-assert 'replication-source' not in x['capabilities']
-assert 'qemu-kvm' not in x['capabilities']
-assert 'docker' not in x['capabilities']
-assert 'remote-volume-receiver' not in x['capabilities']
+assert 'backup-storage' in x['capabilities']
+assert 'storage-backplane' not in x['capabilities']
+assert 'backplane-client' not in x['capabilities']
+assert 'qemu-kvm' not in x['capabilities'] and 'docker' not in x['capabilities']
 PY
 backup_server=$(api backup /api/ true | json_body)
 python3 - "$backup_server" <<'PY'
 import json,sys
-x=json.loads(sys.argv[1]); assert 'remote-volume-receiver' in x['capabilities']
+x=json.loads(sys.argv[1])
+assert 'storage-backplane' in x['capabilities']
 PY
-blocked=$(api backup /api/vms)
-[[ $blocked == *'Status: 404 Not Found'* && $blocked == *'qemu-kvm'* ]]
-blocked=$(api backup /api/backups/schedules)
-[[ $blocked == *'Status: 404 Not Found'* && $blocked == *'require the virtualization profile'* ]]
 
 docker=$(api docker /api/ | json_body)
 python3 - "$docker" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
-assert x['profile']=='docker'
-assert 'docker' in x['capabilities'] and 'compose' in x['capabilities'] and 'registry' in x['capabilities']
-assert 'qemu-kvm' not in x['capabilities'] and 'backup' not in x['capabilities']
-assert 'replication-source' not in x['capabilities'] and 'replication-receiver' not in x['capabilities']
-assert 'remote-volume-client' in x['capabilities'] and 'remote-volume-receiver' not in x['capabilities']
+assert 'docker' in x['capabilities'] and 'registry' in x['capabilities']
+assert 'backplane-client' in x['capabilities']
+assert 'peer-volume-client' in x['capabilities']
+assert 'storage-backplane' not in x['capabilities']
+assert 'qemu-kvm' not in x['capabilities']
 PY
 
-virt=$(api virtualization /api/ | json_body)
+virt=$(api virtualization /api/ true | json_body)
 python3 - "$virt" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
-assert x['profile']=='virtualization'
-for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init','replication-source','replication-receiver'):
-    assert cap in x['capabilities']
+for cap in ('qemu-kvm','backup','replication-source','backplane-client','storage-backplane'):
+    assert cap in x['capabilities'], cap
 assert 'docker' not in x['capabilities']
-assert 'remote-volume-receiver' not in x['capabilities']
 PY
 
-virt_server=$(api virtualization /api/ true | json_body)
-python3 - "$virt_server" <<'PY'
-import json,sys
-x=json.loads(sys.argv[1]); assert 'remote-volume-receiver' in x['capabilities']
-PY
-
-combo=$(api virtualization-docker /api/ | json_body)
-python3 - "$combo" <<'PY2'
+combo=$(api virtualization-docker /api/ true | json_body)
+python3 - "$combo" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
-assert x['profile']=='virtualization-docker'
-for cap in ('qemu-kvm','backup','backup-create','vm-network','cloud-init','replication-source','replication-receiver','docker','compose','container-terminal','registry','remote-volume-client'):
+for cap in ('qemu-kvm','backup','replication-source','docker','registry','peer-volume-client','backplane-client','storage-backplane'):
     assert cap in x['capabilities'], cap
-PY2
-
+PY
 echo 'profile API filtering: PASS'

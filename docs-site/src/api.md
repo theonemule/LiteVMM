@@ -4,7 +4,7 @@ title: API reference
 ---
 # API reference
 
-All browser API paths begin with `/api` and require the same HTTP Basic authentication as the console. Forms use `application/x-www-form-urlencoded`; image/file/Compose uploads stream raw request bodies. Responses are JSON unless downloading content, logs, archives, or pairing bundles. The service identity returned from `GET /api/` is `litevmm`; it also reports the active deployment `profile`, management `port`, TLS state, and authoritative capability list. the established `vmapi` command and filesystem identifiers remain compatible.
+All browser API paths begin with `/api` and require the same HTTP Basic authentication as the console. Forms use `application/x-www-form-urlencoded`; image/file/Compose uploads stream raw request bodies. Responses are JSON unless downloading content, logs, archives, or pairing bundles. The service identity returned from `GET /api/` is `litevmm`; it also reports the active deployment `profile`, management `port`, TLS state, and authoritative capability list. The established `vmapi` command and core filesystem identifiers remain, while retired peer-storage transport endpoints are not carried forward in 0.10.
 
 | Resource | Operations |
 |---|---|
@@ -17,7 +17,10 @@ All browser API paths begin with `/api` and require the same HTTP Basic authenti
 | Compose | `GET /compose/projects`; `PUT, GET, DELETE /compose/projects/{name}`; `POST .../deploy` and `.../down`. |
 | Host networking | `GET, POST, PATCH, DELETE /networks`. |
 | Files | List, upload/download, create directory, move, zip, and delete under `/files`. |
-| Backups | Virtualization nodes can create/schedule/restore/download/delete. Backup-profile nodes expose receive/list/download/delete only; peer uploads use `PUT /peer-api/backups/receive/{archive}`. |
+| Backups | Virtualization nodes can create/schedule/restore/download/delete. Backup-profile nodes inventory/download/delete archives stored in the shared peer backplane; peer-targeted backups write through the mounted NFSv4/WSS backplane. |
+| Storage backplane | `GET /backplane/status`; list/show/delete hosted Docker volume directories under `/backplane/docker-volumes`. The data path is `/backplane/storage`; NFS itself remains loopback-only. |
+| Peer Docker volumes | `GET, POST /docker/peer-volumes`; `GET, DELETE /docker/peer-volumes/{name}`. |
+| Replication | Source management under `/replications`; retained destination replica inventory under `/replications/replicas`. Replica files are written through the shared storage backplane. |
 | Cluster | Identity, peer list/revocation, endpoint update, pairing, and signed proxy routes under `/cluster`; VM migration is virtualization-only. |
 | Admin | `GET /admin` reports TLS/Certbot state; certificate issue/renew/disable operations are under `/admin/certificates`. |
 | Overlays | List/create/show/delete and orphan cleanup under `/overlays`. |

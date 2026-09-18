@@ -1,289 +1,294 @@
 #!/usr/bin/env bash
-# Continuous QEMU disk replication over authenticated WebSockets on the LiteVMM HTTPS endpoint.
+# Continuous QEMU disk replication onto the shared LiteVMM NFSv4/WebSocket peer backplane.
 set -Eeuo pipefail
 LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 source "$LIB"
 
+BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
 QEMU_IMG=${QEMU_IMG:-/usr/bin/qemu-img}
-QEMU_NBD=${QEMU_NBD:-/usr/bin/qemu-nbd}
-GOST=${VMAPI_GOST:-$(command -v gost 2>/dev/null || printf '%s' /usr/local/bin/gost)}
 SOCAT=${SOCAT:-$(command -v socat 2>/dev/null || printf '%s' /usr/bin/socat)}
-REPLICA_ROOT=${REPLICA_ROOT:-/var/lib/vmapi/replicas}
+BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
 JOB_ROOT=${VMAPI_REPLICATION_JOB_ROOT:-/var/lib/vmapi/replication-jobs}
-RECEIVER_ROOT=${VMAPI_REPLICATION_RECEIVER_ROOT:-/var/lib/vmapi/replication-receivers}
-RUN_ROOT=${VMAPI_REPLICATION_RUN_ROOT:-/run/vmapi-replication}
-WEB_MODE=${VMAPI_REPLICATION_WEB_MODE:-auto}
-LIGHTTPD_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
-NGINX_REPL_CONF=${VMAPI_NGINX_REPLICATION_CONF:-/etc/nginx/vmapi-replication.conf}
-PEER_PASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
 DAEMON_INTERVAL=${VMAPI_REPLICATION_DAEMON_INTERVAL:-10}
+STALE_SECONDS=${VMAPI_REPLICATION_STALE_SECONDS:-45}
 
 valid_peer_id(){ [[ ${1:-} =~ ^[a-fA-F0-9]{32}$ ]] || die "Invalid peer node id: ${1:-}"; }
-valid_owner(){ [[ ${1:-} =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid replication owner'; }
-valid_receiver_id(){ [[ ${1:-} =~ ^[a-f0-9]{24}$ ]] || die "Invalid receiver id: ${1:-}"; }
-valid_token(){ [[ ${1:-} =~ ^[a-f0-9]{48}$ ]] || die 'Invalid replication token'; }
-valid_port(){ validate_positive_int "$1"; ((10#$1 <= 65535)) || die 'Invalid port'; }
-receiver_file(){ valid_receiver_id "$1"; printf '%s/%s.conf\n' "$RECEIVER_ROOT" "$1"; }
+valid_replica_id(){ [[ ${1:-} =~ ^[a-f0-9]{24}$ ]] || die "Invalid replica id: ${1:-}"; }
 job_dir(){ validate_vm_name "$1"; printf '%s/%s\n' "$JOB_ROOT" "$1"; }
 state_disk_indexes(){ sed -nE 's/^DISK_([0-9]+)_JOB=.*/\1/p' "$1" | sort -n -u; }
-ensure_dirs(){ install -d -m 0750 "$REPLICA_ROOT" "$JOB_ROOT" "$RECEIVER_ROOT"; install -d -m 0700 "$RUN_ROOT"; }
-random_hex(){ openssl rand -hex "$1"; }
-port_in_use(){ ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$1$"; }
-wait_listen(){ [[ ${VMAPI_REPLICATION_SKIP_PORT_WAIT:-false} == true ]] && return 0; local port=$1 i; for ((i=0;i<50;i++)); do port_in_use "$port" && return 0; sleep .05; done; return 1; }
-free_port(){ local start=$1 end=$2 p i; for ((i=0;i<500;i++)); do p=$((start + RANDOM % (end-start+1))); port_in_use "$p" || { printf '%s\n' "$p"; return; }; done; die 'Could not allocate loopback port'; }
-pid_from_file(){ local f=$1 p=''; [[ -r $f ]] && read -r p < "$f" || true; [[ $p =~ ^[0-9]+$ ]] && printf '%s\n' "$p"; }
-pid_owned(){ local f=$1 needle=$2 p; p=$(pid_from_file "$f" || true); [[ -n $p && -r /proc/$p/cmdline ]] || return 1; kill -0 "$p" 2>/dev/null || return 1; tr '\0' '\n' < "/proc/$p/cmdline" | grep -Fqx -- "$needle"; }
-kill_owned(){ local f=$1 needle=$2 p; p=$(pid_from_file "$f" || true); if [[ -n $p ]] && pid_owned "$f" "$needle"; then kill "$p" 2>/dev/null || true; for _ in {1..20}; do kill -0 "$p" 2>/dev/null || break; sleep .05; done; kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true; fi; rm -f -- "$f"; }
+ensure_dirs(){ install -d -m 0750 "$JOB_ROOT"; }
+replica_id(){ printf '%s' "$1/$2/$3" | sha256sum | cut -c1-24; }
 
-load_receiver(){
-  local id=$1 f; valid_receiver_id "$id"; f=$(receiver_file "$id"); [[ -r $f ]] || die "Replication receiver not found: $id"
-  OWNER='' VM='' DISK_INDEX='' BYTES='' TOKEN='' NBD_PORT='' WS_PORT='' EXPORT='' FILE='' NBD_PID_FILE='' GOST_PID_FILE='' GOST_CONFIG='' ACTIVE=true
-  # shellcheck disable=SC1090
-  source "$f"
-  valid_owner "$OWNER"; validate_vm_name "$VM"; validate_int "$DISK_INDEX"; validate_positive_int "$BYTES"; valid_token "$TOKEN"; valid_port "$NBD_PORT"; valid_port "$WS_PORT"; validate_bool "$ACTIVE"
-  [[ -n $EXPORT && -n $FILE && -n $NBD_PID_FILE && -n $GOST_PID_FILE && -n $GOST_CONFIG ]] || die 'Replication receiver configuration is incomplete'
+qmp(){
+  local vm=$1 payload=$2 sock="$(vm_dir "$vm")/runtime/qmp.sock"
+  [[ -S $sock ]] || die "QMP socket is unavailable for $vm"
+  need_cmd "$SOCAT"
+  { printf '%s\n' '{"execute":"qmp_capabilities"}'; sleep .03; printf '%s\n' "$payload"; sleep .08; } | "$SOCAT" -T 5 - "UNIX-CONNECT:$sock"
 }
-receiver_nbd_running(){ pid_owned "$NBD_PID_FILE" "$FILE"; }
-receiver_gost_running(){ pid_owned "$GOST_PID_FILE" "$GOST_CONFIG"; }
-write_receiver_gost(){
-  install -d -m 0700 "$(dirname "$GOST_CONFIG")"
-  cat > "$GOST_CONFIG" <<CFG
-services:
-- name: replication-$DISK_INDEX
-  addr: "127.0.0.1:$WS_PORT"
-  handler:
-    type: forward
-  listener:
-    type: ws
-    metadata:
-      path: "/replication/$TOKEN"
-  forwarder:
-    nodes:
-    - name: nbd
-      addr: "127.0.0.1:$NBD_PORT"
-CFG
-  chmod 0600 "$GOST_CONFIG"
-}
-receiver_start_existing(){
-  local id=${1:?}; load_receiver "$id"; [[ $ACTIVE == true ]] || die "Replication receiver is inactive: $id"; need_cmd "$QEMU_NBD"; need_cmd "$GOST"; need_cmd ss; [[ -f $FILE ]] || die "Replica file is missing: $FILE"
-  if ! receiver_nbd_running; then
-    rm -f -- "$NBD_PID_FILE"; port_in_use "$NBD_PORT" && die "Receiver NBD port is already in use: $NBD_PORT"
-    "$QEMU_NBD" --fork --persistent --shared=1 --bind=127.0.0.1 --port="$NBD_PORT" --export-name="$EXPORT" --format=qcow2 --pid-file="$NBD_PID_FILE" "$FILE"
-    wait_listen "$NBD_PORT" && receiver_nbd_running || die 'qemu-nbd replication receiver failed to start'
-  fi
-  write_receiver_gost
-  if ! receiver_gost_running; then
-    rm -f -- "$GOST_PID_FILE"; port_in_use "$WS_PORT" && die "Receiver WebSocket port is already in use: $WS_PORT"
-    "$GOST" -C "$GOST_CONFIG" </dev/null >>"$RUN_ROOT/$id.gost.log" 2>&1 & echo $! > "$GOST_PID_FILE"
-    wait_listen "$WS_PORT" && receiver_gost_running || die 'GOST replication receiver failed to start'
-  fi
-}
-receiver_stop_processes(){ local id=$1; load_receiver "$id"; kill_owned "$GOST_PID_FILE" "$GOST_CONFIG"; kill_owned "$NBD_PID_FILE" "$FILE"; }
-receiver_auth_file(){ printf '%s/%s.htpasswd\n' "$RUN_ROOT" "$1"; }
-write_receiver_auth(){
-  local id=$1 auth line; load_receiver "$id"; [[ -r $PEER_PASSWD ]] || die "Peer password file is unavailable: $PEER_PASSWD"; auth=$(receiver_auth_file "$id")
-  line=$(awk -F: -v u="$OWNER" '$1==u {print; exit}' "$PEER_PASSWD"); [[ -n $line ]] || die "Paired credential is no longer available for replication owner: $OWNER"
-  printf '%s\n' "$line" > "$auth"; chmod 0640 "$auth"; chown --reference="$PEER_PASSWD" "$auth" 2>/dev/null || true
-}
-web_mode(){ [[ $WEB_MODE != auto ]] && { printf '%s\n' "$WEB_MODE"; return; }; if command -v lighttpd >/dev/null 2>&1 && [[ -d $LIGHTTPD_ROOT ]]; then echo lighttpd; elif command -v nginx >/dev/null 2>&1; then echo nginx; else echo none; fi; }
-render_web(){
-  local mode; mode=$(web_mode); [[ $mode != none ]] || return 0; local f idfile id
-  case $mode in
-    lighttpd)
-      install -d -m 0755 "$LIGHTTPD_ROOT/conf.d"; f="$LIGHTTPD_ROOT/conf.d/zz-vmapi-replication.conf"; : > "$f"; printf '# Generated by replicationctl. NBD remains loopback-only.\n' >> "$f"
-      for idfile in "$RECEIVER_ROOT"/*.conf; do [[ -f $idfile ]] || continue; id=$(basename "$idfile" .conf); load_receiver "$id"; [[ $ACTIVE == true ]] || continue; write_receiver_auth "$id"; local auth_file; auth_file=$(receiver_auth_file "$id"); cat >> "$f" <<CFG
-\$HTTP["url"] == "/replication/$TOKEN" {
-  auth.backend = "htpasswd"
-  auth.backend.htpasswd.userfile = "$auth_file"
-  auth.require = ( "" => ( "method" => "basic", "realm" => "VMAPI peers", "require" => "valid-user" ) )
-  proxy.server = ( "" => (( "host" => "127.0.0.1", "port" => $WS_PORT )) )
-  proxy.header = ( "upgrade" => "enable" )
-}
-CFG
-      done
-      if [[ ${VMAPI_REPLICATION_SKIP_RELOAD:-false} != true ]]; then lighttpd -tt -f "$LIGHTTPD_ROOT/lighttpd.conf" >/dev/null; if command -v rc-service >/dev/null 2>&1 && [[ -x /etc/init.d/lighttpd ]]; then rc-service lighttpd restart >/dev/null; elif [[ -r /run/lighttpd.pid ]]; then kill -USR1 "$(cat /run/lighttpd.pid)"; else die 'Could not reload Lighttpd'; fi; fi;;
-    nginx)
-      f=$NGINX_REPL_CONF; : > "$f"; printf '# Generated by replicationctl. NBD remains loopback-only.\n' >> "$f"
-      for idfile in "$RECEIVER_ROOT"/*.conf; do [[ -f $idfile ]] || continue; id=$(basename "$idfile" .conf); load_receiver "$id"; [[ $ACTIVE == true ]] || continue; write_receiver_auth "$id"; local auth_file; auth_file=$(receiver_auth_file "$id"); cat >> "$f" <<CFG
-location = /replication/$TOKEN {
-    auth_basic "VMAPI peers";
-    auth_basic_user_file $auth_file;
-    proxy_pass http://127.0.0.1:$WS_PORT;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 86400s;
-    proxy_send_timeout 86400s;
-    proxy_buffering off;
-}
-CFG
-      done
-      [[ ${VMAPI_REPLICATION_SKIP_RELOAD:-false} == true ]] || { nginx -t >/dev/null; systemctl reload nginx; };;
-    *) die "Unsupported replication web mode: $mode";;
-  esac
-}
-clear_web(){
-  local mode; mode=$(web_mode); [[ $mode != none ]] || return 0
-  case $mode in
-    lighttpd)
-      install -d -m 0755 "$LIGHTTPD_ROOT/conf.d"; : > "$LIGHTTPD_ROOT/conf.d/zz-vmapi-replication.conf"
-      if [[ ${VMAPI_REPLICATION_SKIP_RELOAD:-false} != true ]]; then lighttpd -tt -f "$LIGHTTPD_ROOT/lighttpd.conf" >/dev/null; if command -v rc-service >/dev/null 2>&1 && [[ -x /etc/init.d/lighttpd ]]; then rc-service lighttpd restart >/dev/null; elif [[ -r /run/lighttpd.pid ]]; then kill -USR1 "$(cat /run/lighttpd.pid)"; fi; fi;;
-    nginx)
-      : > "$NGINX_REPL_CONF"; [[ ${VMAPI_REPLICATION_SKIP_RELOAD:-false} == true ]] || { nginx -t >/dev/null; systemctl reload nginx; };;
-  esac
-}
-
-receiver_create(){
-  ensure_dirs; local owner=${1:?owner required} vm=${2:?vm required} idx=${3:?disk index required} bytes=${4:?bytes required}; valid_owner "$owner"; validate_vm_name "$vm"; validate_int "$idx"; validate_positive_int "$bytes"; need_cmd "$QEMU_IMG"; need_cmd "$QEMU_NBD"; need_cmd "$GOST"; need_cmd openssl; need_cmd ss
-  local id token nbd_port ws_port export base file state tmp created=false existing existing_id
-  for existing in "$RECEIVER_ROOT"/*.conf; do
-    [[ -f $existing ]] || continue
-    existing_id=$(basename "$existing" .conf); load_receiver "$existing_id"
-    [[ $OWNER == "$owner" && $VM == "$vm" && $DISK_INDEX == "$idx" ]] || continue
-    [[ $ACTIVE == false ]] || die "An active replica already exists for $owner/$vm disk $idx"
-    rm -f -- "$existing" "$GOST_CONFIG" "$RUN_ROOT/$existing_id.gost.log" "$(receiver_auth_file "$existing_id")"
-  done
-  id=$(random_hex 12); token=$(random_hex 24); nbd_port=$(free_port 39000 46999); ws_port=$(free_port 47000 54999); export="repl-$id"; base="$REPLICA_ROOT/$owner/$vm"; install -d -m 0750 "$base"; file="$base/disk${idx}.qcow2"
-  if [[ -f $file ]]; then local current; current=$("$QEMU_IMG" info --output=json "$file" 2>/dev/null | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1); if [[ $current != "$bytes" ]]; then rm -f -- "$file"; "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null; created=true; fi; else "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null; created=true; fi
-  state=$(receiver_file "$id"); tmp=$(mktemp "$RECEIVER_ROOT/.receiver.XXXXXX")
-  printf 'OWNER=%q\nVM=%q\nDISK_INDEX=%q\nBYTES=%q\nTOKEN=%q\nNBD_PORT=%q\nWS_PORT=%q\nEXPORT=%q\nFILE=%q\nNBD_PID_FILE=%q\nGOST_PID_FILE=%q\nGOST_CONFIG=%q\nACTIVE=true\n' "$owner" "$vm" "$idx" "$bytes" "$token" "$nbd_port" "$ws_port" "$export" "$file" "$RUN_ROOT/$id.nbd.pid" "$RUN_ROOT/$id.gost.pid" "$RUN_ROOT/$id.gost.yaml" > "$tmp"; chmod 0640 "$tmp"; mv "$tmp" "$state"
-  if ! receiver_start_existing "$id" || ! render_web; then receiver_stop_processes "$id" 2>/dev/null || true; rm -f -- "$state" "$RUN_ROOT/$id.gost.yaml" "$RUN_ROOT/$id.gost.log" "$(receiver_auth_file "$id")"; $created && rm -f -- "$file"; render_web 2>/dev/null || true; die 'Could not create replication receiver'; fi
-  printf '{"id":"%s","path":"/replication/%s","export":"%s","bytes":%s}\n' "$id" "$token" "$export" "$bytes"
-}
-receiver_delete(){
-  local id=${1:?}; load_receiver "$id"; local replica=$FILE config=$GOST_CONFIG
-  if [[ $ACTIVE == true ]]; then receiver_stop_processes "$id"; fi
-  cfg_set_file "$(receiver_file "$id")" ACTIVE false
-  rm -f -- "$config" "$RUN_ROOT/$id.gost.log" "$(receiver_auth_file "$id")"
-  render_web
-  printf '{"stopped":true,"active":false,"id":"%s","replica":"%s"}\n' "$id" "$(json_escape "$replica")"
-}
-receiver_purge(){
-  local id=${1:?} delete_file=${2:-false}; validate_bool "$delete_file"; load_receiver "$id"; local replica=$FILE config=$GOST_CONFIG
-  [[ $ACTIVE == false ]] || receiver_stop_processes "$id"
-  rm -f -- "$(receiver_file "$id")" "$config" "$RUN_ROOT/$id.gost.log" "$(receiver_auth_file "$id")"
-  $delete_file && rm -f -- "$replica"
-  render_web
-  printf '{"purged":true,"deleted_file":%s,"id":"%s","replica":"%s"}\n' "$delete_file" "$id" "$(json_escape "$replica")"
-}
-receiver_show(){
-  local id=${1:?}; load_receiver "$id"; local np=false gp=false allocated=0
-  if [[ $ACTIVE == true ]]; then receiver_nbd_running && np=true; receiver_gost_running && gp=true; fi
-  [[ -f $FILE ]] && allocated=$(( $(du -k "$FILE" 2>/dev/null | awk '{print $1+0}') * 1024 ))
-  printf '{"id":"%s","owner":"%s","vm":"%s","disk_index":%s,"bytes":%s,"allocated_bytes":%s,"active":%s,"path":"/replication/%s","export":"%s","nbd_running":%s,"websocket_running":%s,"replica":"%s"}\n' "$id" "$(json_escape "$OWNER")" "$(json_escape "$VM")" "$DISK_INDEX" "$BYTES" "$allocated" "$ACTIVE" "$TOKEN" "$(json_escape "$EXPORT")" "$np" "$gp" "$(json_escape "$FILE")"
-}
-receiver_list(){ local f first=true; printf '['; for f in "$RECEIVER_ROOT"/*.conf; do [[ -f $f ]] || continue; $first || printf ','; first=false; receiver_show "$(basename "$f" .conf)"; done; printf ']\n'; }
-restore_receivers(){ ensure_dirs; local f id failed=0; for f in "$RECEIVER_ROOT"/*.conf; do [[ -f $f ]] || continue; id=$(basename "$f" .conf); load_receiver "$id"; [[ $ACTIVE == true ]] || continue; receiver_start_existing "$id" || { echo "Failed to restore replication receiver $id" >&2; failed=1; }; done; render_web; return "$failed"; }
-
-peer_field(){ local json=$1 key=$2; printf '%s' "$json" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -n1; }
-peer_profile(){ "$PEERCTL" overlay-profile "$1"; }
-parse_ws_endpoint(){ local url=$1; [[ $url =~ ^(wss?|WSS?)://([A-Za-z0-9.-]+)(:([0-9]{1,5}))?(/.*)?$ ]] || die 'Peer endpoint is not a valid WebSocket URL'; ORIGIN_SCHEME=${BASH_REMATCH[1],,}; ORIGIN_HOST=${BASH_REMATCH[2]}; ORIGIN_PORT=${BASH_REMATCH[4]}; [[ -n $ORIGIN_PORT ]] || { [[ $ORIGIN_SCHEME == wss ]] && ORIGIN_PORT=443 || ORIGIN_PORT=80; }; }
-source_gost_running(){ local vm=$1 idx=$2 f="$(job_dir "$vm")/disk$idx.gost.pid" cfg="$(job_dir "$vm")/disk$idx.gost.yaml"; pid_owned "$f" "$cfg"; }
-start_tunnel(){
-  local vm=$1 idx=$2 peer=$3 path=$4 local_port=$5 profile user pass header endpoint cfg pidfile
-  profile=$(peer_profile "$peer"); user=$(peer_field "$profile" username); pass=$(peer_field "$profile" password); endpoint=$(peer_field "$profile" endpoint); [[ -n $user && -n $pass && -n $endpoint ]] || die 'Peer replication profile is unavailable'; parse_ws_endpoint "$endpoint"; header=$(printf '%s:%s' "$user" "$pass" | base64 | tr -d '\n'); cfg="$(job_dir "$vm")/disk$idx.gost.yaml"; pidfile="$(job_dir "$vm")/disk$idx.gost.pid"
-  kill_owned "$pidfile" "$cfg" 2>/dev/null || true; port_in_use "$local_port" && die "Local replication port is in use: $local_port"
-  cat > "$cfg" <<CFG
-services:
-- name: replication-source-$idx
-  addr: "127.0.0.1:$local_port"
-  handler:
-    type: tcp
-    chain: replication-chain-$idx
-  listener:
-    type: tcp
-chains:
-- name: replication-chain-$idx
-  hops:
-  - name: peer
-    nodes:
-    - name: destination
-      addr: "$ORIGIN_HOST:$ORIGIN_PORT"
-      connector:
-        type: forward
-      dialer:
-        type: $ORIGIN_SCHEME
-CFG
-  if [[ $ORIGIN_SCHEME == wss ]]; then cat >> "$cfg" <<CFG
-        tls:
-          secure: true
-          serverName: "$ORIGIN_HOST"
-CFG
-  fi
-  cat >> "$cfg" <<CFG
-        metadata:
-          path: "$path"
-          keepAlive: true
-          ttl: 15s
-          header:
-            Authorization: "Basic $header"
-CFG
-  chmod 0600 "$cfg"; "$GOST" -C "$cfg" </dev/null >>"$(job_dir "$vm")/disk$idx.gost.log" 2>&1 & echo $! > "$pidfile"; wait_listen "$local_port" && source_gost_running "$vm" "$idx" || die 'Replication WebSocket tunnel failed to start'
-}
-qmp(){ local vm=$1 payload=$2 sock="$(vm_dir "$vm")/runtime/qmp.sock"; [[ -S $sock ]] || die "QMP socket is unavailable for $vm"; need_cmd "$SOCAT"; { printf '%s\n' '{"execute":"qmp_capabilities"}'; sleep .03; printf '%s\n' "$payload"; sleep .08; } | "$SOCAT" -T 5 - "UNIX-CONNECT:$sock"; }
 qmp_ok(){ [[ $1 != *'"error"'* ]] || die "QMP rejected replication request: $1"; }
 disk_qemu_id(){ local conf=$1 idx=$2 bus; bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" virtio); [[ $bus == virtio ]] && printf 'drive%s' "$idx" || printf 'disk%s' "$idx"; }
 query_job_json(){
   local vm=$1 job=$2 out compact
   out=$(qmp "$vm" '{"execute":"query-block-jobs"}' 2>/dev/null || true)
-  # QEMU's JSON serializer normally inserts spaces after separators. Compact
-  # structural whitespace before the intentionally small block-job match so
-  # status parsing is stable across QEMU versions without adding jq/Python as
-  # a runtime dependency.
   compact=$(printf '%s' "$out" | tr -d ' \t\r\n')
   printf '%s' "$compact" | grep -o '{[^{}]*"device":"'"$job"'"[^{}]*}' | head -n1 || true
 }
 cancel_job(){ local vm=$1 job=$2; qmp "$vm" '{"execute":"block-job-cancel","arguments":{"device":"'"$job"'"}}' >/dev/null 2>&1 || true; }
-start_mirror_job(){ local vm=$1 idx=$2 port=$3 export=$4 job=$5 speed=$6 conf qid payload out; conf=$(vm_conf "$vm"); qid=$(disk_qemu_id "$conf" "$idx"); payload='{"execute":"drive-mirror","arguments":{"device":"'"$qid"'","job-id":"'"$job"'","target":"nbd://127.0.0.1:'"$port"'/'"$export"'","sync":"full","mode":"existing"'; ((speed>0)) && payload+=',"speed":'"$speed"; payload+='}}'; out=$(qmp "$vm" "$payload"); qmp_ok "$out"; }
-start_replication(){
-  ensure_dirs; local vm=${1:?VM required} peer=${2:?peer required} speed=${3:-0}; validate_vm_name "$vm"; valid_peer_id "$peer"; require_vm "$vm"; require_running "$vm"; validate_int "$speed"; need_cmd "$GOST"; need_cmd "$QEMU_IMG"; need_cmd openssl; need_cmd ss
-  local dir state conf idx file bytes resp rid path export lport job; dir=$(job_dir "$vm"); [[ ! -e $dir ]] || die "Replication already configured for $vm"; install -d -m 0700 "$dir"; state="$dir/state.conf"; printf 'PEER=%q\nSPEED=%q\n' "$peer" "$speed" > "$state"; conf=$(vm_conf "$vm")
-  trap 'stop_replication "$vm" true >/dev/null 2>&1 || true' ERR
-  while read -r idx; do
-    file=$(vm_disk_path "$vm" "$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')"); [[ -f $file ]] || die "Disk file missing: $file"; bytes=$("$QEMU_IMG" info --output=json "$file" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1); validate_positive_int "$bytes"
-    resp=$("$PEERCTL" proxy "$peer" POST "/replications/receivers?vm=$vm&disk_index=$idx&bytes=$bytes" application/x-www-form-urlencoded </dev/null); rid=$(peer_field "$resp" id); path=$(peer_field "$resp" path); export=$(peer_field "$resp" export); valid_receiver_id "$rid"; [[ $path == /replication/* && -n $export ]] || die 'Peer returned invalid replication receiver'; lport=$(free_port 55000 62999); job="repl-$idx"
-    printf 'DISK_%s_RECEIVER=%q\nDISK_%s_JOB=%q\nDISK_%s_PORT=%q\nDISK_%s_PATH=%q\nDISK_%s_EXPORT=%q\n' "$idx" "$rid" "$idx" "$job" "$idx" "$lport" "$idx" "$path" "$idx" "$export" >> "$state"
-    start_tunnel "$vm" "$idx" "$peer" "$path" "$lport"; start_mirror_job "$vm" "$idx" "$lport" "$export" "$job" "$speed"
-  done < <(indexes_for "$conf" DISK)
-  trap - ERR; status_replication "$vm"
+
+meta_get(){ local f=$1 k=$2; sed -n "s/^$k=//p" "$f" | head -n1; }
+read_meta(){
+  local meta=$1
+  OWNER=$(meta_get "$meta" OWNER); VM=$(meta_get "$meta" VM); DISK_INDEX=$(meta_get "$meta" DISK_INDEX)
+  BYTES=$(meta_get "$meta" BYTES); FILE_NAME=$(meta_get "$meta" FILE_NAME); ACTIVE=$(meta_get "$meta" ACTIVE); UPDATED=$(meta_get "$meta" UPDATED)
 }
+write_meta(){
+  local meta=$1 owner=$2 vm=$3 idx=$4 bytes=$5 file=$6 active=$7 tmp
+  valid_peer_id "$owner"; validate_vm_name "$vm"; validate_int "$idx"; validate_positive_int "$bytes"
+  [[ $file =~ ^[A-Za-z0-9._-]+$ ]] || die 'Invalid replica metadata file name'
+  tmp="${meta}.tmp.$$"
+  printf 'OWNER=%s\nVM=%s\nDISK_INDEX=%s\nBYTES=%s\nFILE_NAME=%s\nACTIVE=%s\nUPDATED=%s\n' \
+    "$owner" "$vm" "$idx" "$bytes" "$file" "$active" "$(date +%s)" > "$tmp"
+  chmod 0640 "$tmp"; mv -f "$tmp" "$meta"
+}
+
+refresh_meta(){
+  local meta=$1 active=${2:-true}
+  [[ -r $meta ]] || return 0
+  read_meta "$meta"
+  [[ -n $OWNER && -n $VM && -n $DISK_INDEX && -n $BYTES && -n $FILE_NAME ]] || return 0
+  write_meta "$meta" "$OWNER" "$VM" "$DISK_INDEX" "$BYTES" "$FILE_NAME" "$active"
+}
+
+ensure_replica_file(){
+  local file=$1 bytes=$2
+  need_cmd "$QEMU_IMG"
+  if [[ -f $file ]]; then
+    local current
+    current=$("$QEMU_IMG" info --output=json "$file" 2>/dev/null | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    if [[ $current != "$bytes" ]]; then
+      rm -f -- "$file"
+      "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null
+    fi
+  else
+    "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null
+  fi
+}
+
+start_mirror_job(){
+  local vm=$1 idx=$2 target=$3 job=$4 speed=$5 conf qid escaped payload out
+  conf=$(vm_conf "$vm"); qid=$(disk_qemu_id "$conf" "$idx"); escaped=$(json_escape "$target")
+  payload='{"execute":"drive-mirror","arguments":{"device":"'"$qid"'","job-id":"'"$job"'","target":"'"$escaped"'","format":"qcow2","sync":"full","mode":"existing"'
+  ((speed>0)) && payload+=',"speed":'"$speed"
+  payload+='}}'
+  out=$(qmp "$vm" "$payload"); qmp_ok "$out"
+}
+
+backplane_ready(){
+  local peer=$1 out
+  out=$("$BACKPLANECTL" show "$peer" 2>/dev/null || true)
+  [[ $out == *'"mounted":true'* && $out == *'"tunnel_running":true'* ]]
+}
+
+start_replication(){
+  ensure_dirs
+  local vm=${1:?VM required} peer=${2:?peer required} speed=${3:-0}
+  validate_vm_name "$vm"; valid_peer_id "$peer"; require_vm "$vm"; require_running "$vm"; validate_int "$speed"
+  need_cmd "$BACKPLANECTL"; need_cmd "$QEMU_IMG"; need_cmd sha256sum
+  local dir state conf idx source bytes remote target meta job owner
+  dir=$(job_dir "$vm"); [[ ! -e $dir ]] || die "Replication already configured for $vm"
+  remote=$("$BACKPLANECTL" path "$peer" replicas "$vm")
+  [[ $remote == /* && -d $remote ]] || die 'Peer backplane replica directory is unavailable'
+  owner=$("$PEERCTL" identity | sed -n 's/.*"node_id":"\([a-fA-F0-9]*\)".*/\1/p' | head -n1)
+  valid_peer_id "$owner"; owner=${owner,,}
+  install -d -m 0700 "$dir"; state="$dir/state.conf"
+  printf 'PEER=%q\nSPEED=%q\nOWNER=%q\n' "${peer,,}" "$speed" "$owner" > "$state"
+  conf=$(vm_conf "$vm")
+  trap 'stop_replication "$vm" true >/dev/null 2>&1 || true' ERR
+  while IFS= read -r idx; do
+    source=$(vm_disk_path "$vm" "$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')")
+    [[ -f $source ]] || die "Disk file missing: $source"
+    bytes=$("$QEMU_IMG" info --output=json "$source" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    validate_positive_int "$bytes"
+    target="$remote/disk${idx}.qcow2"; meta="$remote/disk${idx}.meta"; job="repl-$idx"
+    ensure_replica_file "$target" "$bytes"
+    write_meta "$meta" "$owner" "$vm" "$idx" "$bytes" "disk${idx}.qcow2" true
+    printf 'DISK_%s_JOB=%q\nDISK_%s_TARGET=%q\nDISK_%s_META=%q\nDISK_%s_BYTES=%q\n' \
+      "$idx" "$job" "$idx" "$target" "$idx" "$meta" "$idx" "$bytes" >> "$state"
+    start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
+  done < <(indexes_for "$conf" DISK)
+  trap - ERR
+  status_replication "$vm"
+}
+
 resume_replication(){
-  local vm=${1:?}; validate_vm_name "$vm"; local dir state peer speed idx job rid port path export obj; dir=$(job_dir "$vm"); state="$dir/state.conf"; [[ -r $state ]] || return 0; require_vm "$vm"; [[ $(vm_state "$vm") == running ]] || return 0; PEER='' SPEED=0; source "$state"; peer=$PEER; speed=${SPEED:-0}; valid_peer_id "$peer"; validate_int "$speed"
-  while read -r idx; do
-    eval "job=\${DISK_${idx}_JOB:-}"; eval "rid=\${DISK_${idx}_RECEIVER:-}"; eval "port=\${DISK_${idx}_PORT:-}"; eval "path=\${DISK_${idx}_PATH:-}"; eval "export=\${DISK_${idx}_EXPORT:-}"; [[ -n $job && -n $rid && -n $port && -n $path && -n $export ]] || die "Replication state is incomplete for $vm disk $idx"
-    "$PEERCTL" proxy "$peer" POST "/replications/receivers/$rid/restart" application/x-www-form-urlencoded </dev/null >/dev/null
+  local vm=${1:?VM required} dir state peer speed idx job target meta bytes obj
+  validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"; [[ -r $state ]] || return 0
+  require_vm "$vm"; [[ $(vm_state "$vm") == running ]] || return 0
+  PEER=''; SPEED=0; OWNER=''; source "$state"; peer=$PEER; speed=${SPEED:-0}
+  valid_peer_id "$peer"; validate_int "$speed"
+  "$BACKPLANECTL" connect "$peer" >/dev/null
+  while IFS= read -r idx; do
+    eval "job=\${DISK_${idx}_JOB:-}"; eval "target=\${DISK_${idx}_TARGET:-}"; eval "meta=\${DISK_${idx}_META:-}"; eval "bytes=\${DISK_${idx}_BYTES:-}"
+    [[ -n $job && -n $target && -n $meta && -n $bytes ]] || die "Replication state is incomplete for $vm disk $idx"
+    ensure_replica_file "$target" "$bytes"
+    refresh_meta "$meta" true
     obj=$(query_job_json "$vm" "$job")
-    if [[ -n $obj ]] && source_gost_running "$vm" "$idx"; then continue; fi
-    [[ -z $obj ]] || { cancel_job "$vm" "$job"; sleep .1; }
-    source_gost_running "$vm" "$idx" || start_tunnel "$vm" "$idx" "$peer" "$path" "$port"
-    start_mirror_job "$vm" "$idx" "$port" "$export" "$job" "$speed"
+    [[ -n $obj ]] || start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
   done < <(state_disk_indexes "$state")
 }
+
 status_replication(){
-  local vm=${1:?}; validate_vm_name "$vm"; local dir state peer idx job rid obj ready=false offset=0 len=0 first=true tunnel=false; dir=$(job_dir "$vm"); state="$dir/state.conf"; [[ -r $state ]] || { printf '{"vm":"%s","configured":false}\n' "$vm"; return; }; PEER=''; source "$state"; peer=$PEER
-  printf '{"vm":"%s","configured":true,"peer_id":"%s","running":%s,"disks":[' "$vm" "$peer" "$([[ $(vm_state "$vm") == running ]] && echo true || echo false)"
-  while read -r idx; do eval "job=\${DISK_${idx}_JOB:-}"; eval "rid=\${DISK_${idx}_RECEIVER:-}"; ready=false; offset=0; len=0; obj=''; [[ $(vm_state "$vm") == running ]] && obj=$(query_job_json "$vm" "$job"); [[ $obj == *'"ready":true'* ]] && ready=true; offset=$(printf '%s' "$obj" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p' | head -n1); offset=${offset:-0}; len=$(printf '%s' "$obj" | sed -n 's/.*"len":\([0-9][0-9]*\).*/\1/p' | head -n1); len=${len:-0}; tunnel=false; source_gost_running "$vm" "$idx" && tunnel=true; $first || printf ','; first=false; printf '{"index":%s,"job":"%s","receiver":"%s","ready":%s,"offset":%s,"length":%s,"tunnel_running":%s}' "$idx" "$job" "$rid" "$ready" "$offset" "$len" "$tunnel"; done < <(state_disk_indexes "$state"); printf ']}\n'
+  local vm=${1:?VM required} dir state peer idx job meta obj ready offset len first=true connected=false
+  validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"
+  [[ -r $state ]] || { printf '{"vm":"%s","configured":false}\n' "$vm"; return; }
+  PEER=''; source "$state"; peer=$PEER; backplane_ready "$peer" && connected=true
+  printf '{"vm":"%s","configured":true,"peer_id":"%s","running":%s,"transport":"nfs4-wss-backplane","disks":[' \
+    "$vm" "$peer" "$([[ $(vm_state "$vm") == running ]] && echo true || echo false)"
+  while IFS= read -r idx; do
+    eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
+    ready=false; offset=0; len=0; obj=''
+    [[ $(vm_state "$vm") == running ]] && obj=$(query_job_json "$vm" "$job")
+    [[ $obj == *'"ready":true'* ]] && ready=true
+    offset=$(printf '%s' "$obj" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p' | head -n1); offset=${offset:-0}
+    len=$(printf '%s' "$obj" | sed -n 's/.*"len":\([0-9][0-9]*\).*/\1/p' | head -n1); len=${len:-0}
+    [[ -z $meta ]] || refresh_meta "$meta" true
+    $first || printf ','; first=false
+    printf '{"index":%s,"job":"%s","ready":%s,"offset":%s,"length":%s,"tunnel_running":%s,"backplane_connected":%s}' \
+      "$idx" "$job" "$ready" "$offset" "$len" "$connected" "$connected"
+  done < <(state_disk_indexes "$state")
+  printf ']}\n'
 }
+
 stop_replication(){
-  local vm=${1:?} quiet=${2:-false}; validate_vm_name "$vm"; local dir state peer idx job rid cfg pid; dir=$(job_dir "$vm"); state="$dir/state.conf"; [[ -r $state ]] || { $quiet || printf '{"stopped":true,"vm":"%s"}\n' "$vm"; return; }; PEER=''; source "$state"; peer=$PEER
-  while read -r idx; do eval "job=\${DISK_${idx}_JOB:-}"; eval "rid=\${DISK_${idx}_RECEIVER:-}"; [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"; [[ -n $rid ]] && "$PEERCTL" proxy "$peer" DELETE "/replications/receivers/$rid" application/x-www-form-urlencoded </dev/null >/dev/null 2>&1 || true; cfg="$dir/disk$idx.gost.yaml"; pid="$dir/disk$idx.gost.pid"; kill_owned "$pid" "$cfg" 2>/dev/null || true; done < <(state_disk_indexes "$state"); rm -rf -- "$dir"; $quiet || printf '{"stopped":true,"vm":"%s"}\n' "$vm"
+  local vm=${1:?VM required} quiet=${2:-false} dir state idx job meta
+  validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"
+  [[ -r $state ]] || { $quiet || printf '{"stopped":true,"vm":"%s"}\n' "$vm"; return; }
+  while IFS= read -r idx; do
+    eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
+    [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"
+    [[ -z $meta ]] || refresh_meta "$meta" false
+  done < <(state_disk_indexes "$state")
+  rm -rf -- "$dir"
+  $quiet || printf '{"stopped":true,"vm":"%s","replica_retained":true}\n' "$vm"
 }
-list_replications(){ local d first=true; printf '['; for d in "$JOB_ROOT"/*; do [[ -d $d ]] || continue; $first || printf ','; first=false; status_replication "$(basename "$d")"; done; printf ']\n'; }
-resume_all(){ local d vm; for d in "$JOB_ROOT"/*; do [[ -d $d ]] || continue; vm=$(basename "$d"); [[ -f $(vm_conf "$vm") && $(vm_state "$vm") == running ]] || continue; resume_replication "$vm" || echo "Could not resume replication for $vm" >&2; done; }
+
+list_replications(){
+  local d first=true
+  printf '['
+  for d in "$JOB_ROOT"/*; do
+    [[ -d $d ]] || continue
+    $first || printf ','; first=false
+    status_replication "$(basename "$d")" | tr -d '\n'
+  done
+  printf ']\n'
+}
+
+resume_all(){
+  local d vm
+  for d in "$JOB_ROOT"/*; do
+    [[ -d $d ]] || continue
+    vm=$(basename "$d")
+    [[ -f $(vm_conf "$vm") && $(vm_state "$vm") == running ]] || continue
+    resume_replication "$vm" || echo "Could not resume replication for $vm" >&2
+  done
+}
+
+find_replica_meta(){
+  local wanted=$1 meta owner vm idx
+  valid_replica_id "$wanted"; shopt -s nullglob
+  for meta in "$BACKPLANE_ROOT"/peers/*/replicas/*/disk*.meta; do
+    [[ -f $meta ]] || continue
+    OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''
+    read_meta "$meta"; owner=$OWNER; vm=$VM; idx=$DISK_INDEX
+    [[ -n $owner && -n $vm && -n $idx ]] || continue
+    if [[ $(replica_id "$owner" "$vm" "$idx") == "$wanted" ]]; then printf '%s\n' "$meta"; shopt -u nullglob; return 0; fi
+  done
+  shopt -u nullglob; return 1
+}
+
+replica_show(){
+  local id=${1:?id required} meta now active=false allocated=0
+  meta=$(find_replica_meta "$id") || die 'Replica not found'
+  OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''
+  read_meta "$meta"
+  validate_vm_name "$VM"; validate_int "$DISK_INDEX"; validate_positive_int "$BYTES"; [[ $FILE_NAME =~ ^[A-Za-z0-9._-]+$ ]] || die 'Replica metadata has an invalid file name'
+  local FILE="$(dirname "$meta")/$FILE_NAME"
+  now=$(date +%s)
+  if [[ $ACTIVE == true && $UPDATED =~ ^[0-9]+$ && $((now-UPDATED)) -le $STALE_SECONDS ]]; then active=true; fi
+  [[ -f $FILE ]] && allocated=$(( $(du -k "$FILE" 2>/dev/null | awk '{print $1+0}') * 1024 ))
+  printf '{"id":"%s","owner":"%s","vm":"%s","disk_index":%s,"bytes":%s,"allocated_bytes":%s,"active":%s,"nbd_running":false,"websocket_running":%s,"backplane":true,"transport":"nfs4-wss-backplane","replica":"%s"}\n' \
+    "$id" "$(json_escape "$OWNER")" "$(json_escape "$VM")" "$DISK_INDEX" "$BYTES" "$allocated" "$active" "$active" "$(json_escape "$FILE")"
+}
+
+replica_list(){
+  local meta owner vm idx id first=true
+  printf '['; shopt -s nullglob
+  for meta in "$BACKPLANE_ROOT"/peers/*/replicas/*/disk*.meta; do
+    [[ -f $meta ]] || continue
+    OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''
+    read_meta "$meta"; owner=$OWNER; vm=$VM; idx=$DISK_INDEX
+    [[ -n $owner && -n $vm && $idx =~ ^[0-9]+$ ]] || continue
+    id=$(replica_id "$owner" "$vm" "$idx")
+    $first || printf ','; first=false
+    replica_show "$id" | tr -d '\n'
+  done
+  shopt -u nullglob; printf ']\n'
+}
+
+replica_purge(){
+  local id=${1:?id required} delete_file=${2:-false} meta now active=false replica
+  validate_bool "$delete_file"; meta=$(find_replica_meta "$id") || die 'Replica not found'
+  OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''; read_meta "$meta"
+  [[ $FILE_NAME =~ ^[A-Za-z0-9._-]+$ ]] || die 'Replica metadata has an invalid file name'
+  local FILE="$(dirname "$meta")/$FILE_NAME"
+  now=$(date +%s)
+  [[ $ACTIVE != true || ! $UPDATED =~ ^[0-9]+$ || $((now-UPDATED)) -gt $STALE_SECONDS ]] || die 'Cannot purge an active replica'
+  replica=$FILE; rm -f -- "$meta"; $delete_file && rm -f -- "$replica"
+  printf '{"purged":true,"deleted_file":%s,"id":"%s","replica":"%s"}\n' "$delete_file" "$id" "$(json_escape "$replica")"
+}
+
 revoke_peer(){
-  local peer=${1:?peer node id required} owner=${2:?peer username required} d vm state f id; valid_peer_id "$peer"; valid_owner "$owner"
-  for d in "$JOB_ROOT"/*; do [[ -d $d ]] || continue; state="$d/state.conf"; [[ -r $state ]] || continue; PEER=''; source "$state"; [[ $PEER == "$peer" ]] || continue; vm=$(basename "$d"); stop_replication "$vm" true || true; done
-  for f in "$RECEIVER_ROOT"/*.conf; do [[ -f $f ]] || continue; id=$(basename "$f" .conf); load_receiver "$id"; [[ $OWNER == "$owner" ]] || continue; receiver_delete "$id" >/dev/null || true; done
+  local peer=${1:?peer required} _owner=${2:-} d state vm
+  valid_peer_id "$peer"; peer=${peer,,}
+  for d in "$JOB_ROOT"/*; do
+    [[ -d $d ]] || continue; state="$d/state.conf"; [[ -r $state ]] || continue
+    PEER=''; source "$state"; [[ $PEER == "$peer" ]] || continue
+    vm=$(basename "$d"); stop_replication "$vm" true || true
+  done
 }
-daemon_cleanup(){ local f id d vm state idx job cfg pid; for f in "$RECEIVER_ROOT"/*.conf; do [[ -f $f ]] || continue; id=$(basename "$f" .conf); receiver_stop_processes "$id" 2>/dev/null || true; done; for d in "$JOB_ROOT"/*; do [[ -d $d ]] || continue; vm=$(basename "$d"); state="$d/state.conf"; [[ -r $state ]] || continue; source "$state"; while read -r idx; do eval "job=\${DISK_${idx}_JOB:-}"; [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"; cfg="$d/disk$idx.gost.yaml"; pid="$d/disk$idx.gost.pid"; kill_owned "$pid" "$cfg" 2>/dev/null || true; done < <(state_disk_indexes "$state"); done; }
-suspend(){ daemon_cleanup; clear_web; printf '{"suspended":true}\n'; }
-daemon(){ ensure_dirs; trap 'daemon_cleanup; exit 0' TERM INT; restore_receivers || true; while :; do local f id d vm; for f in "$RECEIVER_ROOT"/*.conf; do [[ -f $f ]] || continue; id=$(basename "$f" .conf); load_receiver "$id"; [[ $ACTIVE == true ]] || continue; if ! receiver_nbd_running || ! receiver_gost_running; then receiver_start_existing "$id" || echo "Could not restore receiver $id" >&2; fi; done; resume_all; sleep "$DAEMON_INTERVAL" & wait $!; done; }
+
+daemon_cleanup(){
+  local d vm state idx job meta
+  for d in "$JOB_ROOT"/*; do
+    [[ -d $d ]] || continue; vm=$(basename "$d"); state="$d/state.conf"; [[ -r $state ]] || continue
+    while IFS= read -r idx; do
+      eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
+      [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"
+      [[ -z $meta ]] || refresh_meta "$meta" false
+    done < <(state_disk_indexes "$state")
+  done
+}
+suspend(){ daemon_cleanup; printf '{"suspended":true}\n'; }
+daemon(){
+  ensure_dirs; trap 'daemon_cleanup; exit 0' TERM INT
+  while :; do resume_all; sleep "$DAEMON_INTERVAL" & wait $!; done
+}
 
 case ${1:-help} in
-  receiver-create) shift; receiver_create "$@";; receiver-delete) shift; receiver_delete "$@";; receiver-purge) shift; receiver_purge "$@";; receiver-show) shift; receiver_show "$@";; receiver-list) receiver_list;; receiver-start) shift; receiver_start_existing "$1"; receiver_show "$1";; restore-receivers) restore_receivers;;
-  start) shift; start_replication "$@";; suspend) suspend;; revoke-peer) shift; revoke_peer "$@";; resume) shift; resume_replication "$@"; status_replication "$1";; resume-all) resume_all;; status) shift; status_replication "$@";; stop) shift; stop_replication "$@";; list) list_replications;; daemon) daemon;; render-web) ensure_dirs; render_web;;
-  help|-h|--help) printf '%s\n' 'replicationctl start VM PEER_ID [BYTES_PER_SEC] | resume VM | status VM | stop VM | list | daemon | suspend | receiver-create OWNER VM INDEX BYTES | receiver-start ID | receiver-delete ID | receiver-purge ID [true|false] | receiver-show ID | receiver-list';;
+  start) shift; start_replication "$@";;
+  resume) shift; resume_replication "$@"; status_replication "$1";;
+  resume-all) resume_all;;
+  status) shift; status_replication "$@";;
+  stop) shift; stop_replication "$@";;
+  list) list_replications;;
+  replica-show) shift; replica_show "$@";;
+  replica-list) replica_list;;
+  replica-purge) shift; replica_purge "$@";;
+  revoke-peer) shift; revoke_peer "$@";;
+  suspend) suspend;;
+  daemon) daemon;;
+  help|-h|--help) echo 'replicationctl start VM PEER_ID [BYTES_PER_SEC] | resume VM | status VM | stop VM | list | replica-list | replica-show ID | replica-purge ID [true|false] | daemon';;
   *) die "Unknown replication command: ${1:-}";;
 esac

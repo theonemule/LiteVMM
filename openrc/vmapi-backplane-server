@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+name="vmapi-backplane-server"
+description="LiteVMM loopback-only NFSv4 storage backplane server"
+supervisor="supervise-daemon"
+command="/usr/local/bin/backplanectl"
+command_args="server-daemon"
+command_background="no"
+respawn_delay="3"
+respawn_max="0"
+output_log="/var/log/vmapi-backplane-server.log"
+error_log="/var/log/vmapi-backplane-server.log"
+depend() {
+  need net localmount
+  before vmapi-backplane docker vmapi-replication
+}

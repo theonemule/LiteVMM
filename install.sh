@@ -38,7 +38,7 @@ The LiteVMM API is always installed. Workload profiles are mutually exclusive:
   virtualization  QEMU/KVM, VM networking/consoles, and VM backups
   docker                  Docker/Compose management and container terminals
   virtualization-docker   QEMU/KVM + backups + Docker/Compose
-  backup                  paired backup receiver and archive management only
+  backup                  paired backup storage and archive management only
 TXT
 }
 valid_port() { [[ ${1:-} =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535)); }
@@ -55,7 +55,7 @@ parse_args() {
 }
 choose_profile() {
   if [[ -z $PROFILE && -t 0 ]]; then
-    printf '%s\n' 'Select LiteVMM installation profile:' '  1) virtualization         QEMU/KVM + backups' '  2) docker                 Docker/Compose' '  3) virtualization-docker  QEMU/KVM + backups + Docker/Compose' '  4) backup                 backup receiver only'
+    printf '%s\n' 'Select LiteVMM installation profile:' '  1) virtualization         QEMU/KVM + backups' '  2) docker                 Docker/Compose' '  3) virtualization-docker  QEMU/KVM + backups + Docker/Compose' '  4) backup                 backup storage only'
     read -r -p 'Profile [1]: ' choice
     case ${choice:-1} in 1) PROFILE=virtualization;; 2) PROFILE=docker;; 3) PROFILE=virtualization-docker;; 4) PROFILE=backup;; *) die 'Invalid profile selection';; esac
   fi
@@ -98,10 +98,10 @@ install_packages() {
       apk update
       apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client
       case $PROFILE in
-        virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso python3;;
-        docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd python3 py3-pyfuse3 fuse3;;
-        virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso docker docker-openrc docker-cli-compose python3 py3-pyfuse3 fuse3;;
-        backup) apk add --no-cache qemu-img iproute2 python3;;
+        virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso nfs-utils websocat;;
+        docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websocat;;
+        virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso docker docker-openrc docker-cli-compose nfs-utils websocat;;
+        backup) apk add --no-cache iproute2 nfs-utils websockify;;
       esac
       if [[ $INSTALL_CERTBOT == true ]]; then apk add --no-cache certbot lighttpd-mod_openssl; fi
       ;;
@@ -110,15 +110,30 @@ install_packages() {
       apt-get update
       apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils
       case $PROFILE in
-        virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso;;
-        docker) apt-get install -y --no-install-recommends docker.io ttyd python3 python3-pyfuse3 fuse3;;
-        virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso python3 python3-pyfuse3 fuse3;;
-        backup) apt-get install -y --no-install-recommends qemu-utils iproute2;;
+        virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso nfs-common nfs-kernel-server websockify;;
+        docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common;;
+        virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso nfs-common nfs-kernel-server websockify;;
+        backup) apt-get install -y --no-install-recommends iproute2 nfs-common nfs-kernel-server websockify;;
       esac
       if [[ $INSTALL_CERTBOT == true ]]; then apt-get install -y --no-install-recommends certbot; fi
       ;;
   esac
   update-ca-certificates 2>/dev/null || true
+}
+
+install_websocat() {
+  command -v websocat >/dev/null 2>&1 && return
+  local asset sha work
+  case $(uname -m) in
+    x86_64|amd64) asset=websocat.x86_64-unknown-linux-musl; sha=66f8dd3a0394761556339117f8bb5123bddefd44e087af2a72ec22b0bd08d514 ;;
+    aarch64|arm64) asset=websocat.aarch64-unknown-linux-musl; sha=711a69576a2ff473fb01a90ffafb571c2ed019e55479d7ae71b12c2eadeb7011 ;;
+    *) die "Unsupported CPU for bundled Websocat v1.14.1: $(uname -m)" ;;
+  esac
+  work=$(mktemp -d); trap 'rm -rf -- "$work"' RETURN
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 3     -o "$work/websocat" "https://github.com/vi/websocat/releases/download/v1.14.1/$asset"
+  echo "$sha  $work/websocat" | sha256sum -c -
+  install -m 0755 "$work/websocat" /usr/local/bin/websocat
+  trap - RETURN; rm -rf -- "$work"
 }
 
 install_gost() {
@@ -159,28 +174,36 @@ set_host_config() {
   cat "$tmp" > "$file"; rm -f "$tmp"
 }
 
+disable_native_nfs() {
+  case $PLATFORM in
+    alpine)
+      for svc in nfs nfs-server; do rc-update del "$svc" default >/dev/null 2>&1 || true; rc-service "$svc" stop >/dev/null 2>&1 || true; done;;
+    debian)
+      systemctl disable --now nfs-server.service nfs-kernel-server.service >/dev/null 2>&1 || true;;
+  esac
+}
+
 install_common_files() {
   local tool spec wrapper sub asset relative
-  for required in etc/vmapi.conf lib/common.sh cgi/api.cgi cgi/peer-api.cgi cgi/remote-fs-ws.py lighttpd/vmapi.conf nginx/vmapi.conf; do need_source "$required"; done
+  for required in etc/vmapi.conf lib/common.sh cgi/api.cgi cgi/peer-api.cgi lighttpd/vmapi.conf nginx/vmapi.conf; do need_source "$required"; done
   install -d -m 0755 /etc/vmapi /usr/local/lib/vmapi /usr/local/bin /usr/lib/vmapi/cgi /usr/share/vmapi/www
   install -d -o root -g vmapi -m 0750 /etc/vmapi/overlays
-  install -d -o vmapi -g vmapi -m 0750 /var/lib/vmapi /var/lib/vmapi/vms /var/lib/vmapi/disks /var/lib/vmapi/isos /var/lib/vmapi/backup-jobs /var/lib/vmapi/replicas /var/lib/vmapi/replication-jobs /var/lib/vmapi/replication-receivers /var/lib/vmapi/remote-volume-mounts /var/log/vmapi/backups
-  install -d -m 0750 /var/lib/vmapi/remote-volumes /var/lib/vmapi/remote-volume-shares
-  if getent group lighttpd >/dev/null 2>&1; then chown root:lighttpd /var/lib/vmapi/remote-volumes /var/lib/vmapi/remote-volume-shares; fi
-  install -d -m 0755 /var/lib/vmapi/remote-mounts
+  install -d -o vmapi -g vmapi -m 0750 /var/lib/vmapi /var/lib/vmapi/vms /var/lib/vmapi/disks /var/lib/vmapi/isos /var/lib/vmapi/backup-jobs /var/lib/vmapi/replication-jobs /var/lib/vmapi/peer-volume-bindings /var/log/vmapi/backups
+  install -d -m 0750 /var/lib/vmapi/backplane /var/lib/vmapi/backplane-peers
+  install -d -m 0770 /var/lib/vmapi/backplane/peers
+  install -d -m 0755 /var/lib/vmapi/peer-storage
   install -d -m 0700 /var/lib/vmapi/peers /etc/vmapi/identity
   [[ -f /etc/vmapi/vmapi.conf ]] || install -m 0644 "$BASE/etc/vmapi.conf" /etc/vmapi/vmapi.conf
   set_host_config VMAPI_PROFILE "$PROFILE"
   set_host_config VMAPI_HTTP_PORT "$HTTP_PORT"
-  if [[ $PLATFORM == alpine ]]; then set_host_config VMAPI_REMOTE_FS_SERVER true; else set_host_config VMAPI_REMOTE_FS_SERVER false; fi
+  if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker || $PROFILE == backup ]]; then set_host_config VMAPI_BACKPLANE_SERVER true; else set_host_config VMAPI_BACKPLANE_SERVER false; fi
   install -m 0644 "$BASE/lib/common.sh" /usr/local/lib/vmapi/common.sh
   install -m 0644 "$BASE/VERSION" /usr/share/vmapi/VERSION
-  for tool in vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl metricsctl consolectl peerctl vmbackupctl replicationctl registryctl remote-volumectl litevmm-remote-fuse.py filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
+  for tool in vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl metricsctl consolectl peerctl vmbackupctl replicationctl registryctl peer-volumectl backplanectl filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
     need_source "bin/$tool"; install -m 0755 "$BASE/bin/$tool" "/usr/local/bin/$tool"
   done
   install -m 0755 "$BASE/cgi/api.cgi" /usr/lib/vmapi/cgi/api.cgi
   install -m 0755 "$BASE/cgi/peer-api.cgi" /usr/lib/vmapi/cgi/peer-api.cgi
-  install -m 0755 "$BASE/cgi/remote-fs-ws.py" /usr/lib/vmapi/cgi/remote-fs-ws.py
   while IFS= read -r -d '' asset; do relative=${asset#"$BASE/www/"}; install -D -m 0644 "$asset" "/usr/share/vmapi/www/$relative"; done < <(find "$BASE/www" -type f -print0)
   for spec in 'vm-list list' 'vm-show show' 'vm-status status' 'vm-create create' 'vm-set set' 'vm-start start' 'vm-stop stop' 'vm-shutdown shutdown' 'vm-reboot reboot' 'vm-restart restart' 'vm-delete delete' 'vm-disk-add disk-add' 'vm-disk-remove disk-remove' 'vm-disk-resize disk-resize' 'vm-disk-set disk-set' 'vm-nic-add nic-add' 'vm-nic-remove nic-remove' 'vm-nic-set nic-set' 'vm-pci-add pci-add' 'vm-pci-remove pci-remove' 'vm-cloud-init-set cloud-init-set' 'vm-cloud-init-show cloud-init-show' 'vm-cloud-init-disable cloud-init-disable' 'vm-console-info console-info' 'vm-command command'; do
     set -- $spec; wrapper=$1; sub=$2
@@ -200,7 +223,8 @@ write_sudoers() {
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/logctl *'
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl disable'
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl identity, /usr/local/bin/peerctl request, /usr/local/bin/peerctl request *, /usr/local/bin/peerctl pending, /usr/local/bin/peerctl cancel-pending, /usr/local/bin/peerctl accept *, /usr/local/bin/peerctl complete *, /usr/local/bin/peerctl list, /usr/local/bin/peerctl set-url *, /usr/local/bin/peerctl authorize-user *, /usr/local/bin/peerctl cors-origin *, /usr/local/bin/peerctl proxy *, /usr/local/bin/peerctl revoke *'
-    echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/remote-volumectl share-create *, /usr/local/bin/remote-volumectl share-start *, /usr/local/bin/remote-volumectl share-stop *, /usr/local/bin/remote-volumectl share-show *, /usr/local/bin/remote-volumectl share-list, /usr/local/bin/remote-volumectl share-list *, /usr/local/bin/remote-volumectl share-stop-admin *, /usr/local/bin/remote-volumectl share-purge *'
+    echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/backplanectl list, /usr/local/bin/backplanectl show *, /usr/local/bin/backplanectl server-status'
+    echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peer-volumectl list-hosted, /usr/local/bin/peer-volumectl list-hosted *, /usr/local/bin/peer-volumectl show-hosted *, /usr/local/bin/peer-volumectl delete-hosted *'
     case $PROFILE in
       virtualization)
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl *'
@@ -212,12 +236,13 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/storagectl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmctl delete *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl migrate *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl transport-profile *, /usr/local/bin/peerctl migrate *'
         ;;
       docker)
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/dockerexecctl start *, /usr/local/bin/dockerexecctl info *, /usr/local/bin/dockerexecctl touch *, /usr/local/bin/dockerexecctl stop *, /usr/local/bin/dockerexecctl gc'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/registryctl *'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/remote-volumectl attach *, /usr/local/bin/remote-volumectl detach *, /usr/local/bin/remote-volumectl mount-show *, /usr/local/bin/remote-volumectl mount-list'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl transport-profile *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peer-volumectl attach *, /usr/local/bin/peer-volumectl detach *, /usr/local/bin/peer-volumectl mount-show *, /usr/local/bin/peer-volumectl mount-list'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
         ;;
@@ -228,17 +253,17 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/consolectl start *, /usr/local/bin/consolectl info *, /usr/local/bin/consolectl touch *, /usr/local/bin/consolectl stop *, /usr/local/bin/consolectl gc'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/dockerexecctl start *, /usr/local/bin/dockerexecctl info *, /usr/local/bin/dockerexecctl touch *, /usr/local/bin/dockerexecctl stop *, /usr/local/bin/dockerexecctl gc'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/registryctl *'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/remote-volumectl attach *, /usr/local/bin/remote-volumectl detach *, /usr/local/bin/remote-volumectl mount-show *, /usr/local/bin/remote-volumectl mount-list'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peer-volumectl attach *, /usr/local/bin/peer-volumectl detach *, /usr/local/bin/peer-volumectl mount-show *, /usr/local/bin/peer-volumectl mount-list'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/storagectl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmctl delete *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/overlayctl list, /usr/local/bin/overlayctl show *, /usr/local/bin/overlayctl health *, /usr/local/bin/overlayctl stage *, /usr/local/bin/overlayctl validate *, /usr/local/bin/overlayctl activate *, /usr/local/bin/overlayctl create *, /usr/local/bin/overlayctl delete *, /usr/local/bin/overlayctl reset'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl migrate *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl transport-profile *, /usr/local/bin/peerctl migrate *'
         ;;
       backup)
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list, /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl receive *, /usr/local/bin/vmbackupctl delete *'
-        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/replicationctl receiver-create *, /usr/local/bin/replicationctl receiver-delete *, /usr/local/bin/replicationctl receiver-purge *, /usr/local/bin/replicationctl receiver-start *, /usr/local/bin/replicationctl receiver-show *, /usr/local/bin/replicationctl receiver-list, /usr/local/bin/replicationctl render-web'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list, /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl delete *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/replicationctl replica-purge *, /usr/local/bin/replicationctl replica-show *, /usr/local/bin/replicationctl replica-list'
         ;;
     esac
   } > /etc/sudoers.d/vmapi
@@ -257,8 +282,9 @@ configure_alpine() {
   install -m 0755 "$BASE/openrc/vmapi-overlay" /etc/init.d/vmapi-overlay
   install -m 0755 "$BASE/openrc/vmapi-network" /etc/init.d/vmapi-network
   install -m 0755 "$BASE/openrc/vmapi-replication" /etc/init.d/vmapi-replication
-  install -m 0755 "$BASE/openrc/vmapi-remote-volume" /etc/init.d/vmapi-remote-volume
-  sed -i 's/\r$//' /etc/init.d/fcgiwrap-vmapi /etc/init.d/vmapi-autostart /etc/init.d/vmapi-console-gc /etc/init.d/websockify-vmapi /etc/init.d/ttyd-vmapi /etc/init.d/ttyd-host-vmapi /etc/init.d/vmapi-overlay /etc/init.d/vmapi-network /etc/init.d/vmapi-replication /etc/init.d/vmapi-remote-volume
+  install -m 0755 "$BASE/openrc/vmapi-backplane" /etc/init.d/vmapi-backplane
+  install -m 0755 "$BASE/openrc/vmapi-backplane-server" /etc/init.d/vmapi-backplane-server
+  sed -i 's/\r$//' /etc/init.d/fcgiwrap-vmapi /etc/init.d/vmapi-autostart /etc/init.d/vmapi-console-gc /etc/init.d/websockify-vmapi /etc/init.d/ttyd-vmapi /etc/init.d/ttyd-host-vmapi /etc/init.d/vmapi-overlay /etc/init.d/vmapi-network /etc/init.d/vmapi-replication /etc/init.d/vmapi-backplane /etc/init.d/vmapi-backplane-server
   install -d -m 0755 /etc/lighttpd/conf.d /run/vmapi/consoles /run/vmapi/docker-exec
   chown vmapi:vmapi /run/vmapi /run/vmapi/consoles /run/vmapi/docker-exec
   : > /run/vmapi/console.tokens; chmod 0640 /run/vmapi/console.tokens; chown vmapi:vmapi /run/vmapi/console.tokens
@@ -282,27 +308,29 @@ configure_alpine() {
   sed -i -E 's|^[#[:space:]]*server\.document-root[[:space:]]*=.*|server.document-root = "/usr/share/vmapi/www"|' /etc/lighttpd/lighttpd.conf
   sed -i -E "s|^[#[:space:]]*server\\.port[[:space:]]*=.*|server.port = $HTTP_PORT|" /etc/lighttpd/lighttpd.conf
   grep -Eq '^[[:space:]]*include_shell[[:space:]]+"cat /etc/lighttpd/conf.d/\*\.conf"' /etc/lighttpd/lighttpd.conf || printf '\ninclude_shell "cat /etc/lighttpd/conf.d/*.conf"\n' >> /etc/lighttpd/lighttpd.conf
-  for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-remote-volume; do rc-update del "$svc" default >/dev/null 2>&1 || true; done
-  for svc in websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-overlay vmapi-replication vmapi-remote-volume; do rc-service "$svc" stop >/dev/null 2>&1 || true; done
+  for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update del "$svc" default >/dev/null 2>&1 || true; done
+  for svc in websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-service "$svc" stop >/dev/null 2>&1 || true; done
   for svc in fcgiwrap-vmapi lighttpd; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
   rc-service fcgiwrap-vmapi restart
   case $PROFILE in
     virtualization)
-      for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
-      rc-service websockify-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
+      for svc in vmapi-backplane-server vmapi-backplane vmapi-network vmapi-autostart websockify-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+      rc-service vmapi-backplane-server restart; rc-service vmapi-backplane restart; rc-service websockify-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
     docker)
-      rc-update add vmapi-remote-volume default >/dev/null 2>&1 || true
-      rc-service vmapi-remote-volume start || true
+      rc-update add vmapi-backplane default >/dev/null 2>&1 || true
+      rc-service vmapi-backplane start || true
       rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
       for svc in ttyd-vmapi ttyd-host-vmapi; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
       rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart;;
     virtualization-docker)
-      rc-update add vmapi-remote-volume default >/dev/null 2>&1 || true
-      rc-service vmapi-remote-volume start || true
+      rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true
+      rc-service vmapi-backplane-server start || true
+      rc-update add vmapi-backplane default >/dev/null 2>&1 || true
+      rc-service vmapi-backplane start || true
       rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
-      for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-remote-volume; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+      for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
       rc-service websockify-vmapi restart; rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
-    backup) rc-update add vmapi-replication default >/dev/null 2>&1 || true;;
+    backup) rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true; rc-service vmapi-backplane-server restart || true;;
   esac
 }
 
@@ -314,27 +342,27 @@ configure_debian() {
   install -m 0644 "$BASE/systemd/vmapi-overlay.service" /etc/systemd/system/vmapi-overlay.service
   install -m 0644 "$BASE/systemd/vmapi-network.service" /etc/systemd/system/vmapi-network.service
   install -m 0644 "$BASE/systemd/vmapi-replication.service" /etc/systemd/system/vmapi-replication.service
-  install -m 0644 "$BASE/systemd/vmapi-remote-volume.service" /etc/systemd/system/vmapi-remote-volume.service
+  install -m 0644 "$BASE/systemd/vmapi-backplane.service" /etc/systemd/system/vmapi-backplane.service
+  install -m 0644 "$BASE/systemd/vmapi-backplane-server.service" /etc/systemd/system/vmapi-backplane-server.service
   install -m 0644 "$BASE/systemd/ttyd-vmapi.service" /etc/systemd/system/ttyd-vmapi.service
   install -m 0644 "$BASE/systemd/ttyd-host-vmapi.service" /etc/systemd/system/ttyd-host-vmapi.service
   install -m 0644 "$BASE/pam/nginx-vmapi" /etc/pam.d/nginx-vmapi
   install -d -o vmapi -g vmapi -m 0755 /run/vmapi /run/vmapi/docker-exec
   install -d -o root -g root -m 0700 /run/vmapi/host-exec
   install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
-  : > /etc/nginx/vmapi-replication.conf
   : > /etc/nginx/vmapi-registry.conf
   sed "s/listen 127\.0\.0\.1:5186;/listen 127.0.0.1:$HTTP_PORT;/" "$BASE/nginx/vmapi.conf" > /etc/nginx/sites-available/vmapi
   ln -sfn /etc/nginx/sites-available/vmapi /etc/nginx/sites-enabled/vmapi
   systemctl daemon-reload
-  systemctl disable --now ttyd-vmapi.service ttyd-host-vmapi.service vmapi-overlay.service vmapi-replication.service vmapi-remote-volume.service >/dev/null 2>&1 || true
+  systemctl disable --now ttyd-vmapi.service ttyd-host-vmapi.service vmapi-overlay.service vmapi-replication.service vmapi-backplane.service vmapi-backplane-server.service >/dev/null 2>&1 || true
   systemctl disable vmapi-network.service vmapi-autostart.service vmapi-replication.service >/dev/null 2>&1 || true
   systemctl enable --now fcgiwrap-vmapi.socket
   systemctl try-restart fcgiwrap-vmapi.service >/dev/null 2>&1 || true
   case $PROFILE in
-    virtualization) systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-host-vmapi.service;;
-    docker) systemctl enable vmapi-remote-volume.service; systemctl enable --now vmapi-remote-volume.service; systemctl enable --now docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
-    virtualization-docker) systemctl enable vmapi-remote-volume.service; systemctl enable --now vmapi-remote-volume.service; systemctl enable --now docker.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
-    backup) systemctl enable vmapi-replication.service;;
+    virtualization) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-host-vmapi.service;;
+    docker) systemctl enable --now vmapi-backplane.service; systemctl enable --now docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
+    virtualization-docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now docker.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
+    backup) systemctl enable --now vmapi-backplane-server.service;;
   esac
   nginx -t && systemctl reload nginx
 }
@@ -359,12 +387,10 @@ finalize() {
   case $PLATFORM in
     alpine)
       lighttpd -tt -f /etc/lighttpd/lighttpd.conf; rc-service lighttpd restart
-      [[ $PROFILE == virtualization || $PROFILE == virtualization-docker || $PROFILE == backup ]] && rc-service vmapi-replication restart || true
-      [[ $PROFILE == docker || $PROFILE == virtualization-docker ]] && rc-service vmapi-remote-volume restart || true;;
+      [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]] && rc-service vmapi-replication restart || true;;
     debian)
       nginx -t >/dev/null; systemctl reload nginx
-      [[ $PROFILE == virtualization || $PROFILE == virtualization-docker || $PROFILE == backup ]] && systemctl restart vmapi-replication.service || true
-      [[ $PROFILE == docker || $PROFILE == virtualization-docker ]] && systemctl restart vmapi-remote-volume.service || true;;
+      [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]] && systemctl restart vmapi-replication.service || true;;
   esac
 }
 
@@ -388,6 +414,7 @@ choose_profile
 detect_platform
 ensure_admin_user
 install_packages
+if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker || $PROFILE == backup ]]; then disable_native_nfs; fi
 getent group vmapi-admin >/dev/null || groupadd --system vmapi-admin
 getent group vmapi >/dev/null || groupadd --system vmapi
 case $PROFILE in virtualization) getent group kvm >/dev/null || groupadd --system kvm;; docker) getent group docker >/dev/null || groupadd --system docker;; virtualization-docker) getent group kvm >/dev/null || groupadd --system kvm; getent group docker >/dev/null || groupadd --system docker;; esac
@@ -400,7 +427,8 @@ case $PROFILE in
 esac
 [[ -z $ADMIN_USER ]] || usermod -aG vmapi-admin "$ADMIN_USER"
 if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then ensure_tun; fi
-if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker || $PROFILE == backup ]]; then install_gost; fi
+if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then install_gost; fi
+if [[ $PLATFORM == debian && ( $PROFILE == virtualization || $PROFILE == docker || $PROFILE == virtualization-docker ) ]]; then install_websocat; fi
 install_common_files
 write_sudoers
 case $PLATFORM in alpine) configure_alpine;; debian) configure_debian;; esac

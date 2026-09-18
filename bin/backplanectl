@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# LiteVMM trusted peer storage backplane: NFSv4 over the existing peer WebSocket endpoint.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+WEBSOCAT=${VMAPI_WEBSOCAT:-$(command -v websocat 2>/dev/null || printf %s /usr/local/bin/websocat)}
+WEBSOCKIFY=${VMAPI_WEBSOCKIFY:-/usr/bin/websockify}
+MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
+UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
+EXPORTFS=${VMAPI_EXPORTFS:-$(command -v exportfs 2>/dev/null || printf %s /usr/sbin/exportfs)}
+RPC_NFSD=${VMAPI_RPC_NFSD:-$(command -v rpc.nfsd 2>/dev/null || printf %s /usr/sbin/rpc.nfsd)}
+NFS_EXPORTD=${VMAPI_NFS_EXPORTD:-$(command -v nfsv4.exportd 2>/dev/null || printf %s /usr/sbin/nfsv4.exportd)}
+SS=${VMAPI_SS:-/usr/bin/ss}
+
+BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
+MOUNT_ROOT=${VMAPI_BACKPLANE_MOUNT_ROOT:-/var/lib/vmapi/peer-storage}
+STATE_ROOT=${VMAPI_BACKPLANE_STATE_ROOT:-/var/lib/vmapi/backplane-peers}
+RUN_ROOT=${VMAPI_BACKPLANE_RUN_ROOT:-/run/vmapi-backplane}
+NFS_BIND=${VMAPI_BACKPLANE_NFS_BIND:-127.0.0.1}
+NFS_PORT=${VMAPI_BACKPLANE_NFS_PORT:-2049}
+NFS_EXPORT_CLIENT=${VMAPI_BACKPLANE_NFS_EXPORT_CLIENT:-127.0.0.1}
+WS_BIND=${VMAPI_BACKPLANE_WS_BIND:-127.0.0.1}
+WS_PORT=${VMAPI_BACKPLANE_WS_PORT:-6091}
+DAEMON_INTERVAL=${VMAPI_BACKPLANE_DAEMON_INTERVAL:-10}
+SERVER_ENABLED=${VMAPI_BACKPLANE_SERVER:-false}
+NFS_THREADS=${VMAPI_BACKPLANE_NFS_THREADS:-8}
+
+valid_peer(){ [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
+valid_kind(){ [[ ${1:-} =~ ^(backups|replicas|docker-volumes|docker-images|registry|artifacts)$ ]] || die "Invalid backplane storage class: ${1:-}"; }
+valid_name(){ [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || die "Invalid backplane name: ${1:-}"; }
+valid_port(){ validate_positive_int "$1"; ((10#$1 <= 65535)) || die 'Invalid port'; }
+valid_ipv4_bind(){ [[ ${1:-} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die 'Backplane NFS bind must be an IPv4 address'; }
+state_file(){ valid_peer "$1"; printf '%s/%s.conf\n' "$STATE_ROOT" "${1,,}"; }
+pid_file(){ valid_peer "$1"; printf '%s/%s.websocat.pid\n' "$RUN_ROOT" "${1,,}"; }
+log_file(){ valid_peer "$1"; printf '%s/%s.websocat.log\n' "$RUN_ROOT" "${1,,}"; }
+mountpoint(){ valid_peer "$1"; printf '%s/%s\n' "$MOUNT_ROOT" "${1,,}"; }
+
+ensure_dirs(){
+  install -d -m 0750 "$BACKPLANE_ROOT" "$STATE_ROOT"
+  install -d -m 0755 "$MOUNT_ROOT"
+  install -d -m 0700 "$RUN_ROOT"
+  install -d -m 0770 "$BACKPLANE_ROOT/peers"
+}
+
+json_field(){ local json=$1 key=$2; printf '%s' "$json" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -n1; }
+json_has_cap(){ local json=$1 cap=$2; printf '%s' "$json" | grep -Fq '"'"$cap"'"'; }
+
+local_node_id(){
+  local out id
+  out=$("$PEERCTL" identity)
+  id=$(json_field "$out" node_id)
+  valid_peer "$id"
+  printf '%s\n' "${id,,}"
+}
+
+peer_profile(){ "$PEERCTL" transport-profile "$1"; }
+
+peer_supports_backplane(){
+  local peer=$1 out
+  valid_peer "$peer"
+  out=$("$PEERCTL" proxy "$peer" GET / 2>/dev/null || true)
+  [[ -n $out ]] && json_has_cap "$out" storage-backplane
+}
+
+load_state(){
+  local peer=$1 f
+  f=$(state_file "$peer")
+  [[ -r $f ]] || return 1
+  PEER='' PORT='' MOUNTPOINT=''
+  source "$f"
+  valid_peer "$PEER"; valid_port "$PORT"
+  [[ $MOUNTPOINT == "$(mountpoint "$PEER")" ]] || die 'Invalid backplane mount state'
+}
+
+write_state(){
+  local peer=$1 port=$2 mp tmp
+  valid_peer "$peer"; valid_port "$port"; mp=$(mountpoint "$peer")
+  tmp=$(mktemp "$STATE_ROOT/.peer.XXXXXX")
+  printf 'PEER=%q\nPORT=%q\nMOUNTPOINT=%q\n' "${peer,,}" "$port" "$mp" > "$tmp"
+  chmod 0600 "$tmp"; mv "$tmp" "$(state_file "$peer")"
+}
+
+pid_from_file(){ local f=$1 p=''; [[ -r $f ]] && read -r p < "$f" || true; [[ $p =~ ^[0-9]+$ ]] && printf '%s\n' "$p"; }
+pid_alive(){ local p; p=$(pid_from_file "$1" || true); [[ -n $p ]] && kill -0 "$p" 2>/dev/null; }
+kill_pidfile(){
+  local f=$1 p; p=$(pid_from_file "$f" || true)
+  if [[ -n $p ]] && kill -0 "$p" 2>/dev/null; then
+    kill "$p" 2>/dev/null || true
+    for _ in {1..30}; do kill -0 "$p" 2>/dev/null || break; sleep .05; done
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  fi
+  rm -f -- "$f"
+}
+
+port_in_use(){ "$SS" -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$1$"; }
+free_port(){
+  local start=${1:-32000} end=${2:-38999} p
+  for _ in {1..700}; do
+    p=$((start + RANDOM % (end-start+1)))
+    port_in_use "$p" || { printf '%s\n' "$p"; return; }
+  done
+  die 'Could not allocate a loopback port for the peer backplane'
+}
+wait_port(){ local p=$1; for _ in {1..100}; do port_in_use "$p" && return 0; sleep .05; done; return 1; }
+is_mounted(){ local mp=$1; awk -v p="$mp" '$2==p && $3 ~ /^nfs/ {found=1} END{exit !found}' /proc/mounts; }
+
+ws_url(){
+  local peer=$1 profile endpoint
+  profile=$(peer_profile "$peer"); endpoint=$(json_field "$profile" endpoint)
+  [[ $endpoint =~ ^wss?:// ]] || die 'Peer has no WebSocket-capable endpoint'
+  printf '%s/backplane/storage\n' "${endpoint%/}"
+}
+
+start_tunnel(){
+  local peer=$1 port=$2 profile user pass auth url pf lf
+  need_cmd "$WEBSOCAT"; need_cmd "$SS"
+  profile=$(peer_profile "$peer")
+  user=$(json_field "$profile" username); pass=$(json_field "$profile" password)
+  [[ -n $user && -n $pass ]] || die 'Peer backplane credentials are unavailable'
+  auth="$user:$pass"
+  url=$(ws_url "$peer"); pf=$(pid_file "$peer"); lf=$(log_file "$peer")
+  kill_pidfile "$pf"
+  port_in_use "$port" && die "Backplane loopback port is already in use: $port"
+  : > "$lf"; chmod 0600 "$lf"
+  WEBSOCAT_BASIC_AUTH="$auth" "$WEBSOCAT" --binary --ping-interval 20 --ping-timeout 60 "tcp-l:127.0.0.1:$port" "$url" </dev/null >>"$lf" 2>&1 &
+  echo $! > "$pf"
+  wait_port "$port" && pid_alive "$pf" || { tail -40 "$lf" >&2 2>/dev/null || true; die 'Peer backplane WebSocket tunnel failed to start'; }
+}
+
+mount_peer(){
+  local peer=$1 port=$2 mp id
+  need_cmd "$MOUNT_BIN"
+  mp=$(mountpoint "$peer"); install -d -m 0755 "$mp"
+  is_mounted "$mp" || "$MOUNT_BIN" -t nfs -o "vers=4.2,proto=tcp,port=$port,nconnect=1,hard,timeo=600,retrans=2" 127.0.0.1:/ "$mp"
+  id=$(local_node_id)
+  install -d -m 0770 "$mp/peers/$id"
+  install -d -m 0770 "$mp/peers/$id"/{backups,replicas,docker-volumes,docker-images,registry,artifacts}
+}
+
+connect_peer(){
+  ensure_dirs
+  local peer=${1:?peer required} port mp
+  valid_peer "$peer"; peer=${peer,,}; mp=$(mountpoint "$peer")
+  peer_supports_backplane "$peer" || die 'Paired host does not advertise the storage-backplane capability'
+  if load_state "$peer" 2>/dev/null; then port=$PORT; else port=$(free_port); write_state "$peer" "$port"; fi
+  if is_mounted "$mp" && pid_alive "$(pid_file "$peer")"; then show_peer "$peer"; return; fi
+  is_mounted "$mp" && "$UMOUNT_BIN" "$mp" >/dev/null 2>&1 || true
+  pid_alive "$(pid_file "$peer")" || start_tunnel "$peer" "$port"
+  mount_peer "$peer" "$port"
+  show_peer "$peer"
+}
+
+disconnect_peer(){
+  local peer=${1:?peer required} forget=${2:-false} mp
+  valid_peer "$peer"; validate_bool "$forget"; peer=${peer,,}; mp=$(mountpoint "$peer")
+  if is_mounted "$mp"; then "$UMOUNT_BIN" "$mp" || "$UMOUNT_BIN" -l "$mp" || true; fi
+  kill_pidfile "$(pid_file "$peer")"
+  $forget && rm -f -- "$(state_file "$peer")" "$(log_file "$peer")"
+  rmdir "$mp" 2>/dev/null || true
+}
+
+show_peer(){
+  local peer=${1:?peer required} mounted=false tunnel=false port=0 mp
+  valid_peer "$peer"; peer=${peer,,}; mp=$(mountpoint "$peer")
+  if load_state "$peer" 2>/dev/null; then port=$PORT; fi
+  is_mounted "$mp" && mounted=true
+  pid_alive "$(pid_file "$peer")" && tunnel=true
+  printf '{"peer_id":"%s","mountpoint":"%s","port":%s,"mounted":%s,"tunnel_running":%s}\n' "$peer" "$(json_escape "$mp")" "$port" "$mounted" "$tunnel"
+}
+
+list_peers(){
+  ensure_dirs
+  local f first=true
+  printf '['
+  shopt -s nullglob
+  for f in "$STATE_ROOT"/*.conf; do
+    $first || printf ','; first=false
+    show_peer "$(basename "$f" .conf)" | tr -d '\n'
+  done
+  shopt -u nullglob
+  printf ']\n'
+}
+
+path_for(){
+  local peer=${1:?peer required} kind=${2:?storage class required} name=${3:-} id base
+  valid_peer "$peer"; valid_kind "$kind"; [[ -z $name ]] || valid_name "$name"
+  connect_peer "$peer" >/dev/null
+  id=$(local_node_id)
+  base="$(mountpoint "$peer")/peers/$id/$kind"
+  install -d -m 0770 "$base"
+  if [[ -n $name ]]; then install -d -m 0770 "$base/$name"; printf '%s/%s\n' "$base" "$name"; else printf '%s\n' "$base"; fi
+}
+
+reconcile(){
+  ensure_dirs
+  local peers peer f failed=0
+  peers=$("$PEERCTL" list 2>/dev/null || printf '[]')
+  while IFS= read -r peer; do
+    [[ -n $peer ]] || continue
+    peer_supports_backplane "$peer" || continue
+    connect_peer "$peer" >/dev/null || { echo "Could not connect storage backplane for peer $peer" >&2; failed=1; }
+  done < <(printf '%s' "$peers" | grep -o '"node_id":"[a-fA-F0-9]\{32\}"' | cut -d'"' -f4)
+  shopt -s nullglob
+  for f in "$STATE_ROOT"/*.conf; do
+    peer=$(basename "$f" .conf)
+    printf '%s' "$peers" | grep -Fq "\"node_id\":\"$peer\"" || disconnect_peer "$peer" true
+  done
+  shopt -u nullglob
+  return "$failed"
+}
+
+suspend(){
+  local f peer
+  ensure_dirs; shopt -s nullglob
+  for f in "$STATE_ROOT"/*.conf; do peer=$(basename "$f" .conf); disconnect_peer "$peer" false; done
+  shopt -u nullglob
+  printf '{"suspended":true}\n'
+}
+
+revoke_peer(){ local peer=${1:?peer required}; valid_peer "$peer"; disconnect_peer "$peer" true; }
+
+listener_addresses(){
+  local port=$1 proto=${2:-tcp}
+  if [[ $proto == tcp ]]; then "$SS" -ltnH 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $4}'; else "$SS" -lunH 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $4}'; fi
+}
+
+server_verify(){
+  valid_ipv4_bind "$NFS_BIND"; valid_port "$NFS_PORT"; valid_port "$WS_PORT"; need_cmd "$SS"
+  local addr external=false nfs_ok=false ws_ok=false
+  [[ $NFS_BIND == 127.0.0.1 ]] || external=true
+  [[ $NFS_EXPORT_CLIENT == 127.0.0.1 ]] || external=true
+  [[ $WS_BIND == 127.0.0.1 ]] || external=true
+  while IFS= read -r addr; do
+    [[ -n $addr ]] || continue
+    [[ $addr == "$NFS_BIND:$NFS_PORT" ]] && nfs_ok=true || external=true
+  done < <(listener_addresses "$NFS_PORT" tcp)
+  while IFS= read -r addr; do
+    [[ -n $addr ]] || continue
+    [[ $addr == "$WS_BIND:$WS_PORT" ]] && ws_ok=true || external=true
+  done < <(listener_addresses "$WS_PORT" tcp)
+  if listener_addresses "$NFS_PORT" udp | grep -q .; then external=true; fi
+  printf '{"server_enabled":%s,"nfs_bind":"%s","nfs_export_client":"%s","nfs_port":%s,"nfs_listening":%s,"websocket_bind":"%s","websocket_port":%s,"websocket_listening":%s,"external_exposure":%s}\n' "$SERVER_ENABLED" "$NFS_BIND" "$(json_escape "$NFS_EXPORT_CLIENT")" "$NFS_PORT" "$nfs_ok" "$WS_BIND" "$WS_PORT" "$ws_ok" "$external"
+  $nfs_ok && $ws_ok
+}
+
+server_cleanup(){
+  [[ -r "$RUN_ROOT/websockify.pid" ]] && kill_pidfile "$RUN_ROOT/websockify.pid" || true
+  [[ -r "$RUN_ROOT/exportd.pid" ]] && kill_pidfile "$RUN_ROOT/exportd.pid" || true
+  "$RPC_NFSD" 0 >/dev/null 2>&1 || true
+  "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
+}
+
+server_daemon(){
+  [[ $SERVER_ENABLED == true ]] || die 'Storage backplane server is disabled'
+  ensure_dirs
+  need_cmd "$EXPORTFS"; need_cmd "$RPC_NFSD"; need_cmd "$NFS_EXPORTD"; need_cmd "$WEBSOCKIFY"; need_cmd "$SS"
+  valid_ipv4_bind "$NFS_BIND"; valid_port "$NFS_PORT"; valid_port "$WS_PORT"; validate_positive_int "$NFS_THREADS"
+  install -d -m 0755 /proc/fs/nfsd
+  mountpoint -q /proc/fs/nfsd || "$MOUNT_BIN" -t nfsd nfsd /proc/fs/nfsd
+  "$RPC_NFSD" 0 >/dev/null 2>&1 || true
+  "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
+  "$EXPORTFS" -i -o rw,sync,no_subtree_check,no_root_squash,insecure,fsid=0 "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT"
+  "$NFS_EXPORTD" -F </dev/null >>"$RUN_ROOT/exportd.log" 2>&1 & echo $! > "$RUN_ROOT/exportd.pid"
+  "$RPC_NFSD" --host "$NFS_BIND" --port "$NFS_PORT" --no-udp --no-nfs-version 3 --no-nfs-version 4.0 --nfs-version 4.1 --nfs-version 4.2 "$NFS_THREADS"
+  "$WEBSOCKIFY" "$WS_BIND:$WS_PORT" "$NFS_BIND:$NFS_PORT" </dev/null >>"$RUN_ROOT/websockify.log" 2>&1 & echo $! > "$RUN_ROOT/websockify.pid"
+  trap 'server_cleanup; exit 0' TERM INT EXIT
+  for _ in {1..100}; do server_verify >/dev/null 2>&1 && break; sleep .05; done
+  server_verify >/dev/null || die 'Storage backplane did not bind to the configured loopback endpoints'
+  while :; do
+    pid_alive "$RUN_ROOT/exportd.pid" || die 'NFSv4 export daemon exited'
+    pid_alive "$RUN_ROOT/websockify.pid" || die 'Backplane websockify process exited'
+    sleep "$DAEMON_INTERVAL" & wait $!
+  done
+}
+
+daemon(){
+  trap 'suspend >/dev/null 2>&1 || true; exit 0' TERM INT
+  while :; do reconcile || true; sleep "$DAEMON_INTERVAL" & wait $!; done
+}
+
+case ${1:-help} in
+  connect) shift; connect_peer "$@";;
+  disconnect) shift; disconnect_peer "$@" ;;
+  show) shift; show_peer "$@";;
+  list) list_peers;;
+  path) shift; path_for "$@";;
+  reconcile) reconcile;;
+  revoke-peer) shift; revoke_peer "$@";;
+  suspend) suspend;;
+  daemon) daemon;;
+  server-daemon) server_daemon;;
+  server-status|server-verify) server_verify;;
+  help|-h|--help) echo 'backplanectl connect PEER | disconnect PEER [FORGET] | show PEER | list | path PEER CLASS [NAME] | reconcile | revoke-peer PEER | daemon | server-daemon | server-status';;
+  *) die "Unknown backplane command: ${1:-}";;
+esac

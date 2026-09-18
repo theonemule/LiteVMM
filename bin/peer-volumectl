@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Docker named volumes backed by the shared LiteVMM peer NFSv4/WebSocket backplane.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+source "$LIB"
+
+BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
+STATE_ROOT=${VMAPI_PEER_VOLUME_STATE_ROOT:-/var/lib/vmapi/peer-volume-bindings}
+
+valid_name(){ [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "Invalid peer volume name: ${1:-}"; }
+valid_peer(){ [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
+valid_id(){ [[ ${1:-} =~ ^[a-f0-9]{24}$ ]] || die 'Invalid hosted volume id'; }
+state_file(){ valid_name "$1"; printf '%s/%s.conf\n' "$STATE_ROOT" "$1"; }
+ensure_dirs(){ install -d -m 0750 "$STATE_ROOT"; }
+volume_id(){ printf '%s' "$1/$2" | sha256sum | cut -c1-24; }
+dir_bytes(){ local d=$1; [[ -d $d ]] || { echo 0; return; }; echo $(( $(du -sk "$d" 2>/dev/null | awk '{print $1+0}') * 1024 )); }
+
+load_mount(){
+  local name=$1 f
+  f=$(state_file "$name"); [[ -r $f ]] || die "Remote volume not found: $name"
+  PEER='' REMOTE_NAME='' DATA_PATH=''
+  source "$f"
+  valid_peer "$PEER"; valid_name "$REMOTE_NAME"
+  [[ $DATA_PATH == /* ]] || die 'Remote volume state has an invalid backing path'
+}
+
+write_mount(){
+  local name=$1 peer=$2 remote=$3 path=$4 tmp
+  ensure_dirs; tmp=$(mktemp "$STATE_ROOT/.volume.XXXXXX")
+  printf 'PEER=%q\nREMOTE_NAME=%q\nDATA_PATH=%q\n' "${peer,,}" "$remote" "$path" > "$tmp"
+  chmod 0600 "$tmp"; mv "$tmp" "$(state_file "$name")"
+}
+
+backplane_mounted(){
+  local peer=$1 out
+  out=$("$BACKPLANECTL" show "$peer" 2>/dev/null || true)
+  [[ $out == *'"mounted":true'* && $out == *'"tunnel_running":true'* ]]
+}
+
+mount_show(){
+  local name=$1 mounted=false docker=false
+  load_mount "$name"
+  backplane_mounted "$PEER" && mounted=true
+  "$DOCKER_BIN" volume inspect "$name" >/dev/null 2>&1 && docker=true
+  printf '{"name":"%s","peer_id":"%s","remote_name":"%s","mountpoint":"%s","mounted":%s,"docker_volume":"%s","docker_present":%s,"transport":"nfs4-wss-backplane"}\n' \
+    "$(json_escape "$name")" "$PEER" "$(json_escape "$REMOTE_NAME")" "$(json_escape "$DATA_PATH")" "$mounted" "$(json_escape "$name")" "$docker"
+}
+
+mount_list(){
+  ensure_dirs
+  local f first=true
+  printf '['; shopt -s nullglob
+  for f in "$STATE_ROOT"/*.conf; do
+    $first || printf ','; first=false
+    mount_show "$(basename "$f" .conf)" | tr -d '\n'
+  done
+  shopt -u nullglob; printf ']\n'
+}
+
+mount_attach(){
+  ensure_dirs
+  local peer=${1:?peer required} remote=${2:?remote name required} localname=${3:-$remote} data
+  valid_peer "$peer"; valid_name "$remote"; valid_name "$localname"
+  need_cmd "$BACKPLANECTL"; need_cmd "$DOCKER_BIN"
+  [[ ! -e $(state_file "$localname") ]] || die "Remote Docker volume already exists: $localname"
+  "$DOCKER_BIN" volume inspect "$localname" >/dev/null 2>&1 && die "Docker volume already exists: $localname"
+
+  data=$("$BACKPLANECTL" path "$peer" docker-volumes "$remote")
+  [[ $data == /* && -d $data ]] || die 'Backplane did not return a usable Docker volume directory'
+  write_mount "$localname" "$peer" "$remote" "$data"
+
+  if ! "$DOCKER_BIN" volume create \
+      --driver local \
+      --label litevmm.peer-volume=true \
+      --label "litevmm.peer-id=${peer,,}" \
+      --label "litevmm.peer-volume-name=$remote" \
+      --label litevmm.peer-storage-transport=nfs4-wss-backplane \
+      --opt type=none --opt o=bind --opt "device=$data" "$localname" >/dev/null; then
+    rm -f -- "$(state_file "$localname")"
+    die 'Could not create Docker bind-backed peer volume'
+  fi
+  mount_show "$localname"
+}
+
+mount_detach(){
+  local name=${1:?Docker volume required}
+  valid_name "$name"; load_mount "$name"; need_cmd "$DOCKER_BIN"
+  if "$DOCKER_BIN" volume inspect "$name" >/dev/null 2>&1; then
+    "$DOCKER_BIN" volume rm "$name" >/dev/null
+  fi
+  rm -f -- "$(state_file "$name")"
+  printf '{"detached":true,"name":"%s","data_preserved":true}\n' "$(json_escape "$name")"
+}
+
+resume_all(){ "$BACKPLANECTL" reconcile; }
+suspend(){ printf '{"suspended":true}\n'; }
+revoke_peer(){
+  local peer=${1:?peer required} _owner=${2:-}
+  valid_peer "$peer"; ensure_dirs
+  local f name
+  shopt -s nullglob
+  for f in "$STATE_ROOT"/*.conf; do
+    name=$(basename "$f" .conf); load_mount "$name"
+    [[ $PEER == "${peer,,}" ]] || continue
+    "$DOCKER_BIN" volume rm "$name" >/dev/null 2>&1 || true
+    rm -f -- "$f"
+  done
+  shopt -u nullglob
+}
+
+hosted_emit(){
+  local owner=$1 name=$2 data=$3 id bytes
+  id=$(volume_id "$owner" "$name"); bytes=$(dir_bytes "$data")
+  printf '{"id":"%s","owner":"%s","name":"%s","active":true,"bytes":%s,"data":"%s","transport":"nfs4-wss-backplane"}' \
+    "$id" "$(json_escape "$owner")" "$(json_escape "$name")" "$bytes" "$(json_escape "$data")"
+}
+
+list_hosted(){
+  local owner_filter=${1:-} owner_dir data name owner first=true
+  [[ -z $owner_filter || $owner_filter =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid owner filter'
+  printf '['; shopt -s nullglob
+  for owner_dir in "$BACKPLANE_ROOT"/peers/*; do
+    [[ -d $owner_dir/docker-volumes ]] || continue
+    owner=$(basename "$owner_dir")
+    [[ -z $owner_filter || $owner == "$owner_filter" ]] || continue
+    for data in "$owner_dir"/docker-volumes/*; do
+      [[ -d $data ]] || continue
+      name=$(basename "$data")
+      $first || printf ','; first=false
+      hosted_emit "$owner" "$name" "$data"
+    done
+  done
+  shopt -u nullglob; printf ']\n'
+}
+
+find_hosted(){
+  local wanted=$1 owner_dir data owner name
+  valid_id "$wanted"; shopt -s nullglob
+  for owner_dir in "$BACKPLANE_ROOT"/peers/*; do
+    [[ -d $owner_dir/docker-volumes ]] || continue
+    owner=$(basename "$owner_dir")
+    for data in "$owner_dir"/docker-volumes/*; do
+      [[ -d $data ]] || continue
+      name=$(basename "$data")
+      if [[ $(volume_id "$owner" "$name") == "$wanted" ]]; then
+        printf '%s\t%s\t%s\n' "$owner" "$name" "$data"; shopt -u nullglob; return 0
+      fi
+    done
+  done
+  shopt -u nullglob; return 1
+}
+
+show_hosted(){
+  local id=${1:?id required} row owner name data
+  row=$(find_hosted "$id") || die 'Hosted backplane volume not found'
+  IFS=$'\t' read -r owner name data <<< "$row"
+  hosted_emit "$owner" "$name" "$data"; printf '\n'
+}
+
+delete_hosted(){
+  local id=${1:?id required} delete_data=${2:-false} row owner name data
+  validate_bool "$delete_data"
+  row=$(find_hosted "$id") || die 'Hosted backplane volume not found'
+  IFS=$'\t' read -r owner name data <<< "$row"
+  $delete_data || die 'Backplane volumes have no share metadata to remove; use delete_data=true to delete the stored directory'
+  rm -rf -- "$data"
+  printf '{"purged":true,"deleted_data":true,"id":"%s"}\n' "$id"
+}
+
+daemon(){
+  trap 'exit 0' TERM INT
+  while :; do resume_all >/dev/null 2>&1 || true; sleep 15 & wait $!; done
+}
+
+case ${1:-help} in
+  attach) shift; mount_attach "$@";;
+  detach) shift; mount_detach "$@";;
+  mount-show) shift; mount_show "$@";;
+  mount-list) mount_list;;
+  resume-all) resume_all;;
+  suspend) suspend;;
+  revoke-peer) shift; revoke_peer "$@";;
+  list-hosted) shift; list_hosted "$@";;
+  show-hosted) shift; show_hosted "$@";;
+  delete-hosted) shift; delete_hosted "$@";;
+  daemon) daemon;;
+  help|-h|--help) echo 'peer-volumectl attach PEER REMOTE_NAME [DOCKER_VOLUME] | detach DOCKER_VOLUME | mount-show NAME | mount-list | list-hosted [OWNER] | show-hosted ID | delete-hosted ID true';;
+  *) die "Unknown peer volume command: ${1:-}";;
+esac

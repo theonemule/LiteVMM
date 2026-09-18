@@ -1,0 +1,14 @@
+[Unit]
+Description=LiteVMM loopback-only NFSv4 storage backplane server
+After=network-online.target
+Wants=network-online.target
+Before=vmapi-backplane.service docker.service vmapi-replication.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/backplanectl server-daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

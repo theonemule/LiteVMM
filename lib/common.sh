@@ -9,7 +9,7 @@ VMAPI_CONFIG=${VMAPI_CONFIG:-/etc/vmapi/vmapi.conf}
 VMAPI_PROFILE=${VMAPI_PROFILE:-virtualization}
 VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
 VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
-VMAPI_REMOTE_FS_SERVER=${VMAPI_REMOTE_FS_SERVER:-false}
+VMAPI_BACKPLANE_SERVER=${VMAPI_BACKPLANE_SERVER:-false}
 
 valid_vmapi_profile() { [[ ${1:-} == virtualization || ${1:-} == docker || ${1:-} == virtualization-docker || ${1:-} == backup ]]; }
 vmapi_has_capability() {
@@ -18,9 +18,9 @@ vmapi_has_capability() {
     api|system|metrics|cluster|admin) return 0;;
     backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ]];;
     backup-create|qemu-kvm|vm-network|vm-console|storage|cloud-init|replication-source) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker ]];;
-    replication-receiver) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ]];;
-    remote-volume-client) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
-    remote-volume-receiver) [[ $VMAPI_REMOTE_FS_SERVER == true && ( $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ) ]];;
+    backplane-client) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
+    storage-backplane) [[ ${VMAPI_BACKPLANE_SERVER:-false} == true && ( $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ) ]];;
+    peer-volume-client) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     docker|compose|container-terminal) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     files|host-terminal) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     *) return 1;;

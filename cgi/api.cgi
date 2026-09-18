@@ -36,7 +36,8 @@ STORAGECTL=${STORAGECTL:-/usr/local/bin/storagectl}
 CERTCTL=${CERTCTL:-/usr/local/bin/certctl}
 REPLICATIONCTL=${REPLICATIONCTL:-/usr/local/bin/replicationctl}
 REGISTRYCTL=${REGISTRYCTL:-/usr/local/bin/registryctl}
-REMOTE_VOLUMECTL=${REMOTE_VOLUMECTL:-/usr/local/bin/remote-volumectl}
+PEER_VOLUMECTL=${PEER_VOLUMECTL:-/usr/local/bin/peer-volumectl}
+BACKPLANECTL=${BACKPLANECTL:-/usr/local/bin/backplanectl}
 declare -A FORM=()
 # peer-api.cgi sets this before executing us. This survives Lighttpd's internal
 # rewrite, which otherwise makes the original /peer-api route indistinguishable
@@ -60,10 +61,10 @@ require_capability() {
 capabilities_json() {
   local caps=(api system metrics cluster admin) cap first=true
   case "$VMAPI_PROFILE" in
-    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source replication-receiver files host-terminal); vmapi_has_capability remote-volume-receiver && caps+=(remote-volume-receiver);;
-    docker) caps+=(docker compose container-terminal registry remote-volume-client files host-terminal);;
-    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source replication-receiver docker compose container-terminal registry remote-volume-client files host-terminal); vmapi_has_capability remote-volume-receiver && caps+=(remote-volume-receiver);;
-    backup) caps+=(backup backup-receiver replication-receiver); vmapi_has_capability remote-volume-receiver && caps+=(remote-volume-receiver);;
+    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
+    docker) caps+=(docker compose container-terminal registry peer-volume-client backplane-client files host-terminal);;
+    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source docker compose container-terminal registry peer-volume-client backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
+    backup) caps+=(backup backup-storage); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
   esac
   printf '['
   for cap in "${caps[@]}"; do $first || printf ','; first=false; printf '"%s"' "$cap"; done
@@ -75,8 +76,8 @@ registry_cmd() {
 replication_cmd() {
   if command -v sudo >/dev/null 2>&1; then sudo -n "$REPLICATIONCTL" "$@"; else "$REPLICATIONCTL" "$@"; fi
 }
-remote_volume_cmd() {
-  if command -v sudo >/dev/null 2>&1; then sudo -n "$REMOTE_VOLUMECTL" "$@"; else "$REMOTE_VOLUMECTL" "$@"; fi
+peer_volume_cmd() {
+  if command -v sudo >/dev/null 2>&1; then sudo -n "$PEER_VOLUMECTL" "$@"; else "$PEER_VOLUMECTL" "$@"; fi
 }
 cert_cmd() {
   if command -v sudo >/dev/null 2>&1; then sudo -n "$CERTCTL" "$@"; else "$CERTCTL" "$@"; fi
@@ -246,8 +247,8 @@ fi
 # routes whose backing platform is not installed on this host.
 case "${P[0]-}" in
   backups) require_capability backup;;
-  replications) [[ ${P[1]-} == receivers || ${P[1]-} == replicas ]] && require_capability replication-receiver || require_capability replication-source;;
-  remote-volumes) require_capability remote-volume-receiver;;
+  replications) [[ ${P[1]-} == replicas ]] && require_capability storage-backplane || require_capability replication-source;;
+  backplane) require_capability storage-backplane;;
   vms|images|migrations|storage|networks|overlays) require_capability qemu-kvm;;
   docker|compose) require_capability docker;;
   files) require_capability files;;
@@ -294,15 +295,6 @@ if [[ $method == POST && ${P[0]-} == migrations && ${P[1]-} == import && -n ${P[
   reply '201 Created' "$out"
 fi
 
-# A backup receiver is deliberately available only on the signed peer API. The
-# request body is streamed directly to storage and never becomes a CGI variable.
-if [[ $method == PUT && ${P[0]-} == backups && ${P[1]-} == receive && -n ${P[2]-} && -z ${P[3]-} ]]; then
-  [[ $PEER_API_REQUEST == true ]] || error_reply '403 Forbidden' 'Backup receive is restricted to authenticated peers'
-  parse_pairs "${QUERY_STRING:-}"; args=(receive "${P[2]}"); [[ -n $(param label) ]] && args+=(--label "$(param label)"); [[ -n $(param keep) ]] && args+=(--keep "$(param keep)")
-  out=$(backup_cmd "${args[@]}" 2>&1) || error_reply '400 Bad Request' "$out"
-  reply '201 Created' "$out"
-fi
-
 # Raw file upload. The destination is carried in the query string so the body
 # can remain an arbitrary binary stream.
 if [[ $method == PUT && ${P[0]-} == files && ${P[1]-} == content && -z ${P[2]-} ]]; then
@@ -315,39 +307,27 @@ read_params
 
 if [[ -z $route ]]; then
   caps=$(capabilities_json)
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":9,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":10,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
 fi
 
 case "${P[0]-}" in
-  remote-volumes)
+  backplane)
+    [[ $PEER_API_REQUEST != true ]] || error_reply '403 Forbidden' 'Backplane inventory is a local administration endpoint'
     case "${P[1]-}" in
-      shares)
-        [[ $PEER_API_REQUEST == true ]] || error_reply '403 Forbidden' 'Remote volume shares are restricted to authenticated peers'
+      docker-volumes)
         case "${P[2]-}" in
-          '')
-            case "$method" in
-              GET) raw_json_reply '200 OK' remote_volume_cmd share-list "$REMOTE_USER";;
-              POST) name=$(param name); [[ -n $name ]] || error_reply '400 Bad Request' 'name is required'; raw_json_reply '201 Created' remote_volume_cmd share-create "$REMOTE_USER" "$name";;
-              *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
-            esac;;
+          '') [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'; raw_json_reply '200 OK' peer_volume_cmd list-hosted;;
           *)
-            if [[ ${P[3]-} == start ]]; then [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'; raw_json_reply '200 OK' remote_volume_cmd share-start "$REMOTE_USER" "${P[2]}"; fi
             case "$method" in
-              GET) raw_json_reply '200 OK' remote_volume_cmd share-show "$REMOTE_USER" "${P[2]}";;
-              DELETE) raw_json_reply '200 OK' remote_volume_cmd share-stop "$REMOTE_USER" "${P[2]}";;
+              GET) raw_json_reply '200 OK' peer_volume_cmd show-hosted "${P[2]}";;
+              DELETE) raw_json_reply '200 OK' peer_volume_cmd delete-hosted "${P[2]}" "$(param delete_data false)";;
               *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
             esac;;
         esac;;
-      hosted)
-        [[ $PEER_API_REQUEST != true ]] || error_reply '403 Forbidden' 'Hosted remote volume inventory is local administration only'
-        case "${P[2]-}" in
-          '') [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'; raw_json_reply '200 OK' remote_volume_cmd share-list;;
-          *)
-            if [[ ${P[3]-} == stop ]]; then [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'; raw_json_reply '200 OK' remote_volume_cmd share-stop-admin "${P[2]}"; fi
-            [[ $method == DELETE ]] || error_reply '405 Method Not Allowed' 'Use DELETE'
-            raw_json_reply '200 OK' remote_volume_cmd share-purge "${P[2]}" "$(param delete_data false)";;
-        esac;;
-      *) error_reply '404 Not Found' 'Unknown remote volume endpoint';;
+      status)
+        [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
+        raw_json_reply '200 OK' "$BACKPLANECTL" server-status;;
+      *) error_reply '404 Not Found' 'Unknown backplane endpoint';;
     esac;;
 
   replications)
@@ -356,35 +336,11 @@ case "${P[0]-}" in
       case "${P[2]-}" in
         '')
           [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
-          raw_json_reply '200 OK' replication_cmd receiver-list;;
+          raw_json_reply '200 OK' replication_cmd replica-list;;
         *)
           case "$method" in
-            GET) raw_json_reply '200 OK' replication_cmd receiver-show "${P[2]}";;
-            DELETE) raw_json_reply '200 OK' replication_cmd receiver-purge "${P[2]}" "$(param delete_file false)";;
-            *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
-          esac;;
-      esac
-    fi
-    if [[ ${P[1]-} == receivers ]]; then
-      [[ $PEER_API_REQUEST == true ]] || error_reply '403 Forbidden' 'Replication receivers are restricted to authenticated peers'
-      case "${P[2]-}" in
-        '')
-          case "$method" in
-            GET) raw_json_reply '200 OK' replication_cmd receiver-list;;
-            POST)
-              vm=$(param vm); idx=$(param disk_index); bytes=$(param bytes)
-              [[ -n $vm && -n $idx && -n $bytes ]] || error_reply '400 Bad Request' 'vm, disk_index, and bytes are required'
-              raw_json_reply '201 Created' replication_cmd receiver-create "$REMOTE_USER" "$vm" "$idx" "$bytes";;
-            *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
-          esac;;
-        *)
-          if [[ ${P[3]-} == restart ]]; then
-            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
-            raw_json_reply '200 OK' replication_cmd receiver-start "${P[2]}"
-          fi
-          case "$method" in
-            GET) raw_json_reply '200 OK' replication_cmd receiver-show "${P[2]}";;
-            DELETE) raw_json_reply '200 OK' replication_cmd receiver-delete "${P[2]}";;
+            GET) raw_json_reply '200 OK' replication_cmd replica-show "${P[2]}";;
+            DELETE) raw_json_reply '200 OK' replication_cmd replica-purge "${P[2]}" "$(param delete_file false)";;
             *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
           esac;;
       esac
@@ -939,23 +895,23 @@ case "${P[0]-}" in
           *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
         esac;;
 
-      remote-volumes)
-        require_capability remote-volume-client
+      peer-volumes)
+        require_capability peer-volume-client
         if [[ -z ${P[2]-} ]]; then
           case "$method" in
-            GET) raw_json_reply '200 OK' remote_volume_cmd mount-list;;
+            GET) raw_json_reply '200 OK' peer_volume_cmd mount-list;;
             POST)
               peer_id=$(param peer_id); remote_name=$(param remote_name); name=$(param name)
               [[ -n $peer_id && -n $remote_name ]] || error_reply '400 Bad Request' 'peer_id and remote_name are required'
               [[ -n $name ]] || name=$remote_name
-              raw_json_reply '201 Created' remote_volume_cmd attach "$peer_id" "$remote_name" "$name";;
+              raw_json_reply '201 Created' peer_volume_cmd attach "$peer_id" "$remote_name" "$name";;
             *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
           esac
         fi
         name=${P[2]}
         case "$method" in
-          GET) raw_json_reply '200 OK' remote_volume_cmd mount-show "$name";;
-          DELETE) raw_json_reply '200 OK' remote_volume_cmd detach "$name";;
+          GET) raw_json_reply '200 OK' peer_volume_cmd mount-show "$name";;
+          DELETE) raw_json_reply '200 OK' peer_volume_cmd detach "$name";;
           *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
         esac;;
 

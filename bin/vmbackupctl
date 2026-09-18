@@ -15,6 +15,8 @@ JOB_ROOT=${VMAPI_BACKUP_JOB_ROOT:-/var/lib/vmapi/backup-jobs}
 VMCTL=${VMCTL:-/usr/local/bin/vmctl}
 SELF=${VMAPI_BACKUPCTL:-/usr/local/bin/vmbackupctl}
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
+BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
 
 usage() { cat <<'TXT'
 vmbackupctl - VM archive backup manager
@@ -104,12 +106,37 @@ stage_vm_disks() {
     cp --reflink=auto "$source" "$stage/$name/disks/$file" 2>/dev/null || cp "$source" "$stage/$name/disks/$file"
   done < <(indexes_for "$conf" DISK)
 }
+emit_backup() {
+  local file=$1 vm owner='' target=local
+  vm=$(basename "$(dirname "$file")")
+  if [[ $file == "$BACKPLANE_ROOT"/peers/*/backups/*/*.tar.gz ]]; then
+    owner=${file#"$BACKPLANE_ROOT/peers/"}; owner=${owner%%/*}; target=backplane
+  fi
+  printf '{"vm":"%s","archive":"%s","bytes":%s,"modified":"%s","target":"%s","owner":"%s"}\n' \
+    "$(json_escape "$vm")" "$(json_escape "$(basename "$file")")" "$(stat -c %s "$file")" "$(stat -c %y "$file")" "$target" "$(json_escape "$owner")"
+}
 cmd_list() {
-  local vm=${1-} dir file
-  if [[ -n $vm ]]; then dir=$(backup_dir "$vm"); else dir="$BACKUP_ROOT"; fi
+  local vm=${1-} file owner_dir
+  [[ -z $vm ]] || validate_vm_name "$vm"
   shopt -s nullglob
-  for file in "$dir"/*/*.tar.gz "$dir"/*.tar.gz; do [[ -f $file ]] || continue; printf '{"vm":"%s","archive":"%s","bytes":%s,"modified":"%s"}\n' "$(json_escape "$(basename "$(dirname "$file")")")" "$(json_escape "$(basename "$file")")" "$(stat -c %s "$file")" "$(stat -c %y "$file")"; done
+  if [[ -n $vm ]]; then
+    for file in "$BACKUP_ROOT/$vm"/*.tar.gz "$BACKPLANE_ROOT"/peers/*/backups/"$vm"/*.tar.gz; do [[ -f $file ]] && emit_backup "$file"; done
+  else
+    for file in "$BACKUP_ROOT"/*/*.tar.gz "$BACKPLANE_ROOT"/peers/*/backups/*/*.tar.gz; do [[ -f $file ]] && emit_backup "$file"; done
+  fi
   shopt -u nullglob
+}
+find_archive() {
+  local name=$1 archive=$2 file
+  validate_vm_name "$name"; valid_archive "$archive"
+  file="$BACKUP_ROOT/$name/$archive"; [[ -f $file ]] && { printf '%s\n' "$file"; return 0; }
+  shopt -s nullglob
+  for file in "$BACKPLANE_ROOT"/peers/*/backups/"$name"/"$archive"; do
+    [[ -f $file ]] || continue
+    printf '%s\n' "$file"; shopt -u nullglob; return 0
+  done
+  shopt -u nullglob
+  return 1
 }
 prune_archives() {
   local name=$1 root=$2 label=$3 keep=$4 file
@@ -145,15 +172,21 @@ cmd_create() {
   chmod 0640 "$tmp"; chown vmapi:vmapi "$tmp" 2>/dev/null || true; mv -f "$tmp" "$dir/$archive"
   bytes=$(stat -c %s "$dir/$archive")
   if [[ -n $peer_id ]]; then
-    backup_progress 90 'Transferring archive to paired host'
-    receive_path="/backups/receive/$archive?label=$label${keep:+&keep=$keep}"
-    if ! transfer_out=$("$PEERCTL" proxy "$peer_id" PUT "$receive_path" application/gzip < "$dir/$archive" 2>&1); then
-      die "Paired-host backup transfer failed; the local staging archive was retained: $transfer_out"
+    backup_progress 90 'Writing archive to paired storage backplane'
+    local remote_root remote_dir remote_tmp remote_target
+    remote_root=$("$BACKPLANECTL" path "$peer_id" backups)
+    [[ $remote_root == /* && -d $remote_root ]] || die 'Paired-host backup backplane is unavailable'
+    remote_dir="$remote_root/$name"; install -d -m 0750 "$remote_dir"
+    remote_target="$remote_dir/$archive"; remote_tmp="$remote_dir/.${archive}.tmp.$$"
+    [[ ! -e $remote_target ]] || die "Backup already exists on paired host: $archive"
+    if ! cp -- "$dir/$archive" "$remote_tmp"; then
+      rm -f -- "$remote_tmp"; die 'Writing backup to paired storage backplane failed; the local staging archive was retained'
     fi
-    rm -f -- "$dir/$archive"
-    rmdir "$dir" 2>/dev/null || true
-    backup_progress 100 'Backup stored on paired host'
-    printf '{"vm":"%s","archive":"%s","bytes":%s,"target":"peer","peer_id":"%s"}\n' "$(json_escape "$name")" "$(json_escape "$archive")" "$bytes" "$(json_escape "$peer_id")"
+    chmod 0640 "$remote_tmp"; mv -f -- "$remote_tmp" "$remote_target"
+    [[ -z $keep ]] || prune_archives "$name" "$remote_root" "$label" "$keep"
+    rm -f -- "$dir/$archive"; rmdir "$dir" 2>/dev/null || true
+    backup_progress 100 'Backup stored on paired host backplane'
+    printf '{"vm":"%s","archive":"%s","bytes":%s,"target":"peer","peer_id":"%s","transport":"nfs4-wss-backplane"}\n' "$(json_escape "$name")" "$(json_escape "$archive")" "$bytes" "$(json_escape "$peer_id")"
   else
     backup_progress 95 'Finalizing local backup archive'
     prune_archives "$name" "$destination" "$label" "$keep"
@@ -182,7 +215,7 @@ cmd_start() {
   printf '{"id":"%s","vm":"%s","state":"running","percent":0,"message":"Queued"}\n' "$(json_escape "$job")" "$(json_escape "$name")"
 }
 cmd_job() { local job=${1:?job id required}; valid_job_id "$job"; [[ -f "$JOB_ROOT/$job.json" ]] || die 'Backup job not found'; cat "$JOB_ROOT/$job.json"; }
-cmd_download() { local name=${1:?VM name required} archive=${2:?archive required}; valid_archive "$archive"; [[ -f $(archive_path "$name" "$archive") ]] || die 'Backup archive not found'; cat "$(archive_path "$name" "$archive")"; }
+cmd_download() { local name=${1:?VM name required} archive=${2:?archive required} source; source=$(find_archive "$name" "$archive") || die 'Backup archive not found'; cat "$source"; }
 cmd_import() {
   local archive=${1:?archive required} source
   valid_archive "$archive"
@@ -190,26 +223,6 @@ cmd_import() {
   trap 'rm -f -- "$source"' RETURN
   cat > "$source"
   cmd_import_file "$archive" "$source"
-}
-cmd_receive() {
-  local archive=${1:?archive required}; shift; local source name dir target label='' keep=''
-  valid_archive "$archive"
-  while (($#)); do case "$1" in --label) label=${2:?}; shift 2;; --keep) keep=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
-  [[ -z $label || $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup label'; [[ -z $keep ]] || valid_keep "$keep"
-  source=$(mktemp); trap 'rm -f -- "$source"' RETURN
-  cat > "$source"
-  gzip -t "$source" 2>/dev/null || die 'Uploaded backup is not a valid gzip archive'
-  # Consume the full tar listing. An early-exiting reader can SIGPIPE tar and,
-  # with pipefail enabled, abort this command without a useful error message.
-  name=$(tar -tzf "$source" 2>/dev/null | awk -F/ 'NR==1 {print $1}')
-  validate_vm_name "$name"
-  tar -tzf "$source" 2>/dev/null | grep -Fx "$name/vm.conf" >/dev/null || die 'Uploaded backup does not contain a VM configuration'
-  dir=$(backup_dir "$name"); install -d -o vmapi -g vmapi -m 0750 "$BACKUP_ROOT" "$dir"
-  target="$dir/$archive"; [[ ! -e $target ]] || die "Backup already exists: $archive"
-  chmod 0640 "$source"; chown vmapi:vmapi "$source" 2>/dev/null || true; mv "$source" "$target"
-  trap - RETURN
-  [[ -z $label || -z $keep ]] || prune_archives "$name" "$BACKUP_ROOT" "$label" "$keep"
-  printf '{"received":true,"vm":"%s","archive":"%s","bytes":%s}\n' "$(json_escape "$name")" "$(json_escape "$archive")" "$(stat -c %s "$target")"
 }
 cmd_import_file() {
   local archive=${1:?archive required} source=${2:?source required} name stage diskstage conf idx file
@@ -245,11 +258,11 @@ cmd_restore() {
   local name=${1:?VM name required} archive=${2:?archive required}; shift 2; local destination=$BACKUP_ROOT source stage
   valid_archive "$archive"; validate_vm_name "$name"
   while (($#)); do case "$1" in --destination) destination=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
-  source="$(backup_dir "$name" "$destination")/$archive"; [[ -f $source ]] || die 'Backup archive not found'
+  if [[ $destination == "$BACKUP_ROOT" ]]; then source=$(find_archive "$name" "$archive") || die 'Backup archive not found'; else source="$(backup_dir "$name" "$destination")/$archive"; [[ -f $source ]] || die 'Backup archive not found'; fi
   [[ ! -e "$VM_ROOT/$name" ]] || die "VM already exists: $name; delete it before restoring"
   cmd_import_file "$archive" "$source"
 }
-cmd_delete() { local name=${1:?VM name required} archive=${2:?archive required}; valid_archive "$archive"; rm -f -- "$(archive_path "$name" "$archive")"; }
+cmd_delete() { local name=${1:?VM name required} archive=${2:?archive required} source; source=$(find_archive "$name" "$archive") || die 'Backup archive not found'; rm -f -- "$source"; }
 cmd_schedule() {
   local name=${1:?VM name required} cron=${2:?cron expression required}; shift 2; local label=scheduled destination=$BACKUP_ROOT keep='' live=false peer_id='' file live_arg='' peer_arg=''
   validate_vm_name "$name"; [[ $cron != *$'\n'* && $cron != *$'\r'* && $cron != *';'* ]] || die 'Invalid cron expression'
@@ -268,4 +281,4 @@ cmd_schedule() {
 }
 cmd_schedules() { local file NAME LABEL DESTINATION KEEP LIVE PEER_ID CRON; shopt -s nullglob; for file in "$SCHEDULE_ROOT"/*; do NAME=''; LABEL=''; DESTINATION=''; KEEP=''; LIVE=''; PEER_ID=''; CRON=''; source "$file"; printf '{"vm":"%s","cron":"%s","label":"%s","destination":"%s","keep":"%s","live":%s,"target":"%s","peer_id":"%s"}\n' "$(json_escape "$NAME")" "$(json_escape "$CRON")" "$(json_escape "$LABEL")" "$(json_escape "$DESTINATION")" "$(json_escape "$KEEP")" "${LIVE:-false}" "$([[ -n $PEER_ID ]] && printf peer || printf local)" "$(json_escape "$PEER_ID")"; done; shopt -u nullglob; }
 cmd_unschedule() { local name=${1:?VM name required} label=${2-}; validate_vm_name "$name"; if [[ -n $label ]]; then rm -f -- "$SCHEDULE_ROOT/$name-$label" "/etc/cron.d/vmapi-backup-$name-$label"; sed -i "\|# vmapi-backup:$name:$label$|d" "$CRONTAB" 2>/dev/null || true; else rm -f -- "$SCHEDULE_ROOT/$name" "$SCHEDULE_ROOT/$name-"* "/etc/cron.d/vmapi-backup-$name" "/etc/cron.d/vmapi-backup-$name-"*; sed -i "\|# vmapi-backup:$name:|d" "$CRONTAB" 2>/dev/null || true; fi; }
-case "${1:-help}" in list) shift; cmd_list "$@";; create) shift; cmd_create "$@";; start) shift; cmd_start "$@";; job) shift; cmd_job "$@";; download) shift; cmd_download "$@";; receive) shift; cmd_receive "$@";; import) shift; cmd_import "$@";; import-file) shift; cmd_import_file "$@";; restore) shift; cmd_restore "$@";; delete) shift; cmd_delete "$@";; schedule) shift; cmd_schedule "$@";; unschedule) shift; cmd_unschedule "$@";; schedules) cmd_schedules;; help|-h|--help) usage;; *) usage >&2; die "Unknown command: ${1:-}";; esac
+case "${1:-help}" in list) shift; cmd_list "$@";; create) shift; cmd_create "$@";; start) shift; cmd_start "$@";; job) shift; cmd_job "$@";; download) shift; cmd_download "$@";; import) shift; cmd_import "$@";; import-file) shift; cmd_import_file "$@";; restore) shift; cmd_restore "$@";; delete) shift; cmd_delete "$@";; schedule) shift; cmd_schedule "$@";; unschedule) shift; cmd_unschedule "$@";; schedules) cmd_schedules;; help|-h|--help) usage;; *) usage >&2; die "Unknown command: ${1:-}";; esac

@@ -28,7 +28,7 @@ verify_uri() {
   : > "$T/verify.log"
   REQUEST_METHOD=GET REQUEST_URI="$request_uri" PATH_INFO="$path_info" QUERY_STRING='filter=ready&limit=10' \
     PATH="$T/bin:$PATH" VMAPI_PEER_API=true AUTH_TYPE=Basic REMOTE_USER=paired-user VMAPI_LIB="$ROOT/lib/common.sh" PEERCTL="$T/bin/peerctl" VMAPI_VERIFY_LOG="$T/verify.log" \
-    "$ROOT/cgi/api.cgi" >/dev/null
+    bash "$ROOT/cgi/api.cgi" >/dev/null
   cat "$T/verify.log"
 }
 
@@ -43,7 +43,7 @@ rewritten_base=$(verify_uri '/peer-api.cgi' '/peer-api.cgi')
 [[ $rewritten_base == "$canonical_base" ]]
 
 for uri in /peer-api /peer-api.cgi /peer-api.cgi/cluster/identity; do
-  output=$(REQUEST_METHOD=GET REQUEST_URI="$uri" PATH_INFO="$uri" VMAPI_LIB="$ROOT/lib/common.sh" AUTH_TYPE='' REMOTE_USER='' "$ROOT/cgi/api.cgi")
+  output=$(REQUEST_METHOD=GET REQUEST_URI="$uri" PATH_INFO="$uri" VMAPI_LIB="$ROOT/lib/common.sh" AUTH_TYPE='' REMOTE_USER='' bash "$ROOT/cgi/api.cgi")
   [[ $output == *'401 Unauthorized'* ]]
 done
 echo 'peer CGI authentication and URI: PASS' 
