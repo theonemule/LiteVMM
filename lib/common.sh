@@ -15,13 +15,11 @@ DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
 valid_vmapi_profile() { [[ $1 == virtualization || $1 == docker || $1 == virtualization-docker || $1 == backup ]]; }
 
 vmapi_qemu_available() {
-  [[ $VMAPI_PROFILE != backup ]] || return 1
-  [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || -x $QEMU_BIN ]]
+  [[ -x "$QEMU_BIN" ]]
 }
 
 vmapi_docker_available() {
-  [[ $VMAPI_PROFILE != backup ]] || return 1
-  [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker || -x $DOCKER_BIN ]]
+  [[ -x "$DOCKER_BIN" ]]
 }
 
 vmapi_effective_profile() {
