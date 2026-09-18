@@ -253,15 +253,16 @@ cmd_vm() {
     rss=$(proc_rss_bytes "$pid")
   else pid=''; fi
 
-  local disk_first=true total_virtual=0 total_actual=0 idx file format bus virtual actual dir
-  dir=$(vm_dir "$name")
+  local disk_first=true total_virtual=0 total_actual=0 idx file format bus virtual actual path
   local disk_json='['
   while read -r idx; do
     file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
-    [[ -n $file && -f "$dir/$file" ]] || continue
+    [[ -n $file ]] || continue
+    path=$(vm_disk_path_index "$name" "$idx")
+    [[ -f "$path" ]] || continue
     format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" '')
     bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" '')
-    read -r virtual actual < <(qemu_image_info "$dir/$file")
+    read -r virtual actual < <(qemu_image_info "$path")
     total_virtual=$((total_virtual+virtual)); total_actual=$((total_actual+actual))
     $disk_first || disk_json+=','; disk_first=false
     disk_json+="{\"index\":$idx,\"file\":\"$(json_escape "$file")\",\"format\":\"$(json_escape "$format")\",\"bus\":\"$(json_escape "$bus")\",\"virtual_bytes\":$virtual,\"host_allocated_bytes\":$actual,\"utilization_percent\":$(num_pct "$actual" "$virtual")}" 

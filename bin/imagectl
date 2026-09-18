@@ -6,26 +6,26 @@ set -Eeuo pipefail
 LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 source "$LIB"
-mkdir -p "$ISO_ROOT"
+install -d -m 0755 "$ISO_ROOT"
 valid_image_name() {
   validate_filename "$1"
   [[ $1 =~ \.(iso|img)$ ]] || die "Installation media must be an .iso or .img file"
 }
 case ${1:-} in
   list)
-    shopt -s nullglob; for f in "$ISO_ROOT"/*; do [[ -f $f ]] && printf '%s\t%s\n' "$(basename "$f")" "$(stat -c %s "$f")"; done | sort; shopt -u nullglob;;
+    shopt -s nullglob; for f in "$ISO_ROOT"/*; do [[ -f $f ]] && printf '%s\t%s\t%s\n' "$(basename "$f")" "$(stat -c %s "$f")" "$(stat -c %y "$f")"; done | sort; shopt -u nullglob;;
   upload)
     src=${2:?source file required}; name=${3:-$(basename "$src")}; valid_image_name "$name"; [[ -f $src ]] || die "Source not found: $src"; [[ ! -e "$ISO_ROOT/$name" ]] || die "Image already exists: $name"
-    tmp=$(mktemp "$ISO_ROOT/.upload.XXXXXX"); trap 'rm -f "$tmp"' EXIT; cp "$src" "$tmp"; chmod 0640 "$tmp"; mv "$tmp" "$ISO_ROOT/$name"; trap - EXIT; printf '%s\n' "$name";;
+    tmp=$(mktemp "$ISO_ROOT/.upload.XXXXXX"); trap 'rm -f "$tmp"' EXIT; cp "$src" "$tmp"; chmod 0644 "$tmp"; mv "$tmp" "$ISO_ROOT/$name"; trap - EXIT; printf '%s\n' "$name";;
   upload-stdin)
     name=${2:?filename required}; valid_image_name "$name"; [[ ! -e "$ISO_ROOT/$name" ]] || die "Image already exists: $name"
-    tmp=$(mktemp "$ISO_ROOT/.upload.XXXXXX"); trap 'rm -f "$tmp"' EXIT; cat > "$tmp"; [[ -s $tmp ]] || die "Upload body was empty"; chmod 0640 "$tmp"; mv "$tmp" "$ISO_ROOT/$name"; trap - EXIT; printf '%s\n' "$name";;
+    tmp=$(mktemp "$ISO_ROOT/.upload.XXXXXX"); trap 'rm -f "$tmp"' EXIT; cat > "$tmp"; [[ -s $tmp ]] || die "Upload body was empty"; chmod 0644 "$tmp"; mv "$tmp" "$ISO_ROOT/$name"; trap - EXIT; printf '%s\n' "$name";;
   download)
     name=${2:?filename required}; valid_image_name "$name"; [[ -f "$ISO_ROOT/$name" ]] || die "Image not found: $name"; cat -- "$ISO_ROOT/$name";;
   delete)
     name=${2:?filename required}; valid_image_name "$name"
     # refuse deletion while referenced by any VM
-    shopt -s nullglob; for c in "$VM_ROOT"/*/vm.conf; do [[ $(cfg_get_file "$c" ISO '') == "$name" ]] && die "Image is attached to VM $(basename "$(dirname "$c")")"; done; shopt -u nullglob
+    shopt -s nullglob; for c in "$VM_ROOT"/*/vm.conf; do [[ $(cfg_get_file "$c" ISO '') == "$name" && -z $(cfg_get_file "$c" ISO_PEER '') ]] && die "Image is attached to VM $(basename "$(dirname "$c")")"; done; shopt -u nullglob
     rm -f -- "$ISO_ROOT/$name";;
   *) echo 'Usage: imagectl list | upload SOURCE [NAME] | upload-stdin NAME | download NAME | delete NAME' >&2; exit 2;;
 esac

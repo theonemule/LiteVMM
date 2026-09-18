@@ -146,9 +146,10 @@
 
   // Fetch does not expose upload-byte progress. File transfers use XHR so the
   // UI can report progress while all other API calls continue through request().
-  function uploadFile(path, file, onProgress = () => {}) {
-    const useRemote = state.remotePeerId && state.route !== 'cluster';
-    const target = useRemote ? `${API}/cluster/peers/${encodeURIComponent(state.remotePeerId)}/proxy?path=${encodeURIComponent(path)}` : API + path;
+  function uploadFile(path, file, onProgress = () => {}, peerIdOverride = null) {
+    const targetPeerId = peerIdOverride === null ? state.remotePeerId : peerIdOverride;
+    const useRemote = targetPeerId && state.route !== 'cluster';
+    const target = useRemote ? `${API}/cluster/peers/${encodeURIComponent(targetPeerId)}/proxy?path=${encodeURIComponent(path)}` : API + path;
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest(); xhr.open('PUT', target); xhr.withCredentials = true;
       xhr.setRequestHeader('Accept', 'application/json'); xhr.setRequestHeader('Content-Type', 'application/octet-stream');
@@ -167,6 +168,103 @@
     const target = useRemote ? `${API}/cluster/peers/${encodeURIComponent(targetPeerId)}/proxy?path=${encodeURIComponent(path)}` : API + path;
     window.open(target, '_blank', 'noopener');
   }
+
+  function routeParams() {
+    const hash=(location.hash||'').slice(1);
+    const query=hash.includes('?')?hash.split('?',2)[1]:'';
+    return new URLSearchParams(query||'');
+  }
+
+  function formatDate(value) {
+    if (!value) return '';
+    const date=new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+
+  function inventoryHosts() {
+    const localId=state.hostCatalog.local?.node_id||'local';
+    const localLabel=state.hostCatalog.local?.name||'Local host';
+    if (state.remotePeerId) {
+      // When managing a VM on a peer, that peer is "local" from QEMU's point
+      // of view and this browser's host is one of its peer storage targets.
+      return [
+        {peerId:state.remotePeerId,hostId:state.remotePeerId,label:hostLabelForPeer(state.remotePeerId),relativePeerId:''},
+        {peerId:'',hostId:localId,label:localLabel,relativePeerId:localId},
+      ];
+    }
+    return [
+      {peerId:'',hostId:localId,label:localLabel,relativePeerId:''},
+      ...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,hostId:peer.node_id,label:peer.label||peer.name||abbreviatedNodeId(peer.node_id),relativePeerId:peer.node_id}))
+    ];
+  }
+
+  async function collectInventory(path) {
+    const groups=await Promise.all(inventoryHosts().map(async host=>{
+      try {
+        const items=await request(path,host.peerId?{peerId:host.peerId}:{local:true});
+        return {...host,items:Array.isArray(items)?items:[],error:null};
+      } catch(error) {
+        return {...host,items:[],error};
+      }
+    }));
+    return groups;
+  }
+
+  function storageLocationOptions(peers=state.hostCatalog.peers, selected='local') {
+    const options=[{value:'local',label:`${activeHost().name} · local storage`},...(peers||[]).filter(usablePeer).map(peer=>({value:`peer:${peer.node_id}`,label:`${peer.name||peer.label||abbreviatedNodeId(peer.node_id)} · peer storage`}))];
+    return options.map(item=>`<option value="${esc(item.value)}" ${item.value===selected?'selected':''}>${esc(item.label)}</option>`).join('');
+  }
+
+  function parseImageSelection(value='') {
+    const text=String(value||'');
+    if (!text) return {name:'',peerId:''};
+    const split=text.indexOf('::');
+    return split<0?{name:text,peerId:''}:{peerId:text.slice(0,split),name:text.slice(split+2)};
+  }
+
+  function imageSelectionValue(image) {
+    const peerId=image._selectionPeerId||'';
+    return peerId ? `${peerId}::${image.name}` : image.name;
+  }
+
+  async function combinedImages() {
+    const groups=await collectInventory('/images');
+    return {
+      groups,
+      images:groups.flatMap(group=>group.items.map(image=>({...image,_hostId:group.hostId,_hostLabel:group.label,_hostPeerId:group.peerId,_selectionPeerId:group.relativePeerId||''})))
+    };
+  }
+
+  function hostLabelForPeer(peerId = '') {
+    if (!peerId) return state.hostCatalog.local?.name || 'Local host';
+    const peer = state.hostCatalog.peers.find(p => String(p.node_id).toLowerCase() === String(peerId).toLowerCase());
+    return peer?.label || peer?.name || abbreviatedNodeId(peerId);
+  }
+
+  async function collectHostInventory(path) {
+    // Storage inventory is deliberately global: one pane includes this host and
+    // every directly paired host regardless of the host currently selected.
+    const targets = [{peerId:'',label:hostLabelForPeer('')}, ...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,label:peer.label}))];
+    const results = await Promise.all(targets.map(async target => {
+      try {
+        const data = await request(path, target.peerId ? {peerId:target.peerId} : {local:true});
+        return {target, data:Array.isArray(data)?data:[], error:null};
+      } catch (error) {
+        return {target, data:[], error};
+      }
+    }));
+    return {
+      rows: results.flatMap(result=>result.data.map(item=>({...item,storage_peer_id:result.target.peerId,storage_host:result.target.label}))),
+      errors: results.filter(result=>result.error).map(result=>`${result.target.label}: ${result.error.message}`),
+    };
+  }
+
+  async function collectImages() {
+    const result = await collectHostInventory('/images');
+    result.rows = result.rows.map(image=>({...image,iso_peer:image.storage_peer_id||'',location:image.storage_host}));
+    return result;
+  }
+
 
   function toast(message, title = 'LiteVMM') {
     $('#toastTitle').textContent = title;
@@ -193,9 +291,10 @@
 
   function vmCreateCommand(o) {
     const parts = ['/usr/local/bin/vmctl', 'create', o.name || 'NAME'];
+    const image=parseImageSelection(o.iso||'');
     const opts = [
-      ['--memory', o.memory_mb], ['--cpus', o.vcpus], ['--disk', o.disk_size], ['--disk-format', o.disk_format], ['--disk-bus', o.disk_bus],
-      ['--iso', o.iso], ['--network', o.network], ['--bridge', o.network === 'bridge' ? o.bridge : ''], ['--overlay', o.network === 'overlay' ? o.overlay : ''], ['--vlan', ['bridge','overlay'].includes(o.network) ? o.vlan : ''], ['--nic-model', o.nic_model],
+      ['--memory', o.memory_mb], ['--cpus', o.vcpus], ['--disk', o.disk_size], ['--disk-format', o.disk_format], ['--disk-bus', o.disk_bus], ['--disk-location', o.disk_location],
+      ['--iso', image.name], ['--iso-peer', image.peerId], ['--network', o.network], ['--bridge', o.network === 'bridge' ? o.bridge : ''], ['--overlay', o.network === 'overlay' ? o.overlay : ''], ['--vlan', ['bridge','overlay'].includes(o.network) ? o.vlan : ''], ['--nic-model', o.nic_model],
       ['--autostart', o.autostart], ['--firmware', o.firmware], ['--machine', o.machine], ['--cpu', o.cpu], ['--vnc-display', o.vnc_display],
       ['--vnc-bind', o.vnc_bind], ['--display', o.display], ['--boot', o.boot]
     ];
@@ -520,7 +619,10 @@ ${commandLine(ci)} < user-data`;
     $$('[data-vm-migrate]').forEach(b => b.onclick = () => openMigrateVM(b.dataset.vmMigrate));
     $$('[data-vm-delete]').forEach(b => b.onclick = () => confirmAction('Delete VM', `Delete ${b.dataset.vmDelete} and its VM directory?`, async () => { await request(`/vms/${encodeURIComponent(b.dataset.vmDelete)}`, {method:'DELETE'}); await renderRoute(); }));
     $$('[data-vm-details]').forEach(b => b.onclick = () => openVMDetails(b.dataset.vmDetails));
-    $$('[data-vm-backups]').forEach(b => b.onclick = () => openVMBackups(b.dataset.vmBackups));
+    $$('[data-vm-backups]').forEach(b => b.onclick = () => {
+      const q=new URLSearchParams({vm:b.dataset.vmBackups});
+      location.hash=`#backups?${q.toString()}`;
+    });
     $$('[data-vm-replication]').forEach(b => b.onclick = () => openVMReplication(b.dataset.vmReplication));
   }
 
@@ -573,8 +675,10 @@ ${commandLine(ci)} < user-data`;
   }
 
   async function openCreateVM() {
-    const [images, nets, overlays] = await Promise.all([request('/images'), request('/networks'), request('/overlays').catch(()=>[])]);
-    const imgOpts = [`<option value="">None</option>`, ...images.map(i=>`<option value="${esc(i.name)}">${esc(i.name)}</option>`)].join('');
+    const [imageInventory, nets, overlays, storagePeers] = await Promise.all([combinedImages(), request('/networks'), request('/overlays').catch(()=>[]), request('/cluster/peers').catch(()=>[])]);
+    const images=imageInventory.images;
+    const imgOpts = [`<option value="">None</option>`, ...images.map(i=>`<option value="${esc(imageSelectionValue(i))}">${esc(i.name)} · ${esc(i._hostLabel)}</option>`)].join('');
+    const diskLocationOpts=storageLocationOptions(storagePeers,'local');
     const bridges = (nets.bridges || []).map(b=>`<option value="${esc(b)}">${esc(b)}</option>`).join('');
     const overlayOptions = (overlays || []).map(o=>`<option value="${esc(o.name)}">${esc(o.name)} · ${esc(o.bridge)}</option>`).join('');
     modal({eyebrow:'QEMU / KVM', title:'Create virtual machine', submitText:'Create VM', body:`
@@ -585,10 +689,11 @@ ${commandLine(ci)} < user-data`;
           <div class="col-6 col-md-3"><label class="form-label">Memory MB</label><select name="memory_mb" class="form-select">${selectOptions(['256','512','1024','2048','4096','8192','16384'], '2048')}</select></div>
         </div></div>
         <div class="form-section"><div class="form-section-title">Storage and boot</div><div class="row g-3">
-          <div class="col-md-4"><label class="form-label">Initial disk</label><input name="disk_size" class="form-control" value="40G"></div>
-          <div class="col-md-4"><label class="form-label">Disk format</label><select name="disk_format" class="form-select"><option>qcow2</option><option>raw</option></select></div>
-          <div class="col-md-4"><label class="form-label">Disk bus</label><select name="disk_bus" class="form-select"><option>virtio</option><option>sata</option><option>scsi</option></select></div>
-          <div class="col-md-8"><label class="form-label">Install image</label><select name="iso" class="form-select">${imgOpts}</select></div>
+          <div class="col-md-3"><label class="form-label">Initial disk</label><input name="disk_size" class="form-control" value="40G"></div>
+          <div class="col-md-3"><label class="form-label">Disk format</label><select name="disk_format" class="form-select"><option>qcow2</option><option>raw</option></select></div>
+          <div class="col-md-3"><label class="form-label">Disk bus</label><select name="disk_bus" class="form-select"><option>virtio</option><option>sata</option><option>scsi</option></select></div>
+          <div class="col-md-3"><label class="form-label">Disk storage</label><select name="disk_location" class="form-select">${diskLocationOpts}</select></div>
+          <div class="col-md-8"><label class="form-label">Install image</label><select name="iso" class="form-select">${imgOpts}</select><div class="form-text">Local and peer-hosted media are mounted in place through the storage backplane.</div></div>
           <div class="col-md-4"><label class="form-label">Firmware</label><select name="firmware" class="form-select"><option value="bios">BIOS</option><option value="uefi">UEFI</option></select></div>
         </div></div>
         <div class="form-section"><div class="form-section-title">Networking and display</div><div class="row g-3">
@@ -615,6 +720,9 @@ ${commandLine(ci)} < user-data`;
         if (o.network !== 'bridge') delete o.bridge;
         if (o.network !== 'overlay') delete o.overlay;
         if (!['bridge','overlay'].includes(o.network)) delete o.vlan;
+        const image=parseImageSelection(o.iso||'');
+        o.iso=image.name;
+        o.iso_peer=image.peerId;
         if (o.cloud_init_enabled === 'true') {
           if (!(o.cloud_init_user_data || '').trim()) throw new Error('Cloud-init user-data is required when cloud-init is enabled.');
           if (!(o.cloud_init_hostname || '').trim()) o.cloud_init_hostname = o.name;
@@ -644,14 +752,20 @@ ${commandLine(ci)} < user-data`;
   }
 
   async function openVMDetails(name) {
-    const [vm, images, nets, consoleInfo, metrics, cloudInit] = await Promise.all([
-      request(`/vms/${encodeURIComponent(name)}`), request('/images'), request('/networks'), request(`/vms/${encodeURIComponent(name)}/console`).catch(()=>null), request(`/vms/${encodeURIComponent(name)}/metrics`).catch(()=>null), request(`/vms/${encodeURIComponent(name)}/cloud-init`).catch(()=>({enabled:false,instance_id:'',local_hostname:'',user_data:''}))
+    const [vm, imageInventory, nets, consoleInfo, metrics, cloudInit, storagePeers] = await Promise.all([
+      request(`/vms/${encodeURIComponent(name)}`), combinedImages(), request('/networks'), request(`/vms/${encodeURIComponent(name)}/console`).catch(()=>null), request(`/vms/${encodeURIComponent(name)}/metrics`).catch(()=>null), request(`/vms/${encodeURIComponent(name)}/cloud-init`).catch(()=>({enabled:false,instance_id:'',local_hostname:'',user_data:''})), request('/cluster/peers').catch(()=>[])
     ]);
+    const images=imageInventory.images;
     const c = vm.config || {};
-    const disks = indexedConfig(c, 'DISK', ['FILE','FORMAT','BUS']);
+    const disks = indexedConfig(c, 'DISK', ['FILE','FORMAT','BUS','LOCATION']);
     const nics = indexedConfig(c, 'NIC', ['MODE','MODEL','MAC','BRIDGE','VLAN']);
     const pci = indexedConfig(c, 'PCI', ['BDF']);
-    const imgOpts = [`<option value="">None</option>`, ...images.map(i=>`<option ${i.name===c.ISO?'selected':''} value="${esc(i.name)}">${esc(i.name)}</option>`)].join('');
+    const currentImageValue=c.ISO?(c.ISO_PEER?`${c.ISO_PEER}::${c.ISO}`:c.ISO):'';
+    const availableImageValues=new Set(images.map(imageSelectionValue));
+    const imageOptions=images.map(i=>{const value=imageSelectionValue(i);return `<option ${value===currentImageValue?'selected':''} value="${esc(value)}">${esc(i.name)} · ${esc(i._hostLabel)}</option>`;});
+    if(currentImageValue&&!availableImageValues.has(currentImageValue))imageOptions.push(`<option selected value="${esc(currentImageValue)}">${esc(c.ISO)} · unavailable peer ${esc(c.ISO_PEER||'')}</option>`);
+    const imgOpts = [`<option value="">None</option>`, ...imageOptions].join('');
+    const diskLocationLabel=location=>{const value=location||'local';if(value==='local')return `${activeHost().name} · local`;const peerId=value.startsWith('peer:')?value.slice(5):value;const peer=(storagePeers||[]).find(p=>p.node_id===peerId);return `${peer?.name||abbreviatedNodeId(peerId)} · peer`;};
     const bridgeOpts = (nets.bridges || []).map(b=>`<option value="${esc(b)}">${esc(b)}</option>`).join('');
     modal({eyebrow:`QEMU / KVM · ${vm.state}`, title:name, submitText:'Save settings', body:`
       <form id="vmEditForm">
@@ -668,13 +782,15 @@ ${commandLine(ci)} < user-data`;
           <div class="col-12"><div class="form-check form-switch"><input name="emulation" id="editEmulation" class="form-check-input" type="checkbox" ${String(c.ALLOW_TCG)==='true'?'checked':''}><label class="form-check-label" for="editEmulation">Allow software emulation when KVM is unavailable</label></div></div>
         </div>${vm.state === 'running' ? '<div class="alert alert-warning small mt-3 mb-0">Hardware settings can only be changed while the VM is stopped.</div>' : ''}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center"><span>Cloud-init provisioning</span><div class="form-check form-switch mb-0"><input name="cloud_init_enabled" id="editCloudInitEnabled" class="form-check-input" type="checkbox" ${cloudInit.enabled?'checked':''} ${vm.state==='running'?'disabled':''}><label class="form-check-label" for="editCloudInitEnabled">Enabled</label></div></div><div id="editCloudInitFields" class="${cloudInit.enabled?'':'d-none'}"><div class="row g-3"><div class="col-md-6"><label class="form-label">Guest hostname</label><input name="cloud_init_hostname" class="form-control mono" value="${esc(cloudInit.local_hostname||name)}" ${vm.state==='running'?'disabled':''}></div><div class="col-md-6"><label class="form-label">Instance ID</label><input class="form-control mono" value="${esc(cloudInit.instance_id||'Generated when saved')}" readonly><div class="form-text">Changing cloud-init content generates a new instance ID for the next boot.</div></div><div class="col-12"><label class="form-label">User-data</label><textarea name="cloud_init_user_data" rows="10" class="form-control mono" spellcheck="false" ${vm.state==='running'?'disabled':''}>${esc(cloudInit.user_data||'')}</textarea><div class="form-text">The seed is attached as a NoCloud <span class="mono">cidata</span> ISO. The guest image must include cloud-init.</div></div></div></div>${vm.state==='running'?'<div class="alert alert-warning small mt-3 mb-0">Stop the VM before changing cloud-init. The current seed remains attached while it is running.</div>':''}</div>
-        <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Disks <button type="button" class="btn btn-sm btn-outline-primary" id="addDiskBtn">Add disk</button></div>${resourceList(disks, d=>`<strong>disk${d.index}</strong> · ${esc(d.FILE || '')} · ${esc(d.FORMAT || '')} · ${esc(d.BUS || '')}`, 'disk')}</div>
+        <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Disks <button type="button" class="btn btn-sm btn-outline-primary" id="addDiskBtn">Add disk</button></div>${resourceList(disks, d=>`<strong>disk${d.index}</strong> · ${esc(d.FILE || '')} · ${esc(d.FORMAT || '')} · ${esc(d.BUS || '')}<div class="small text-secondary">${esc(diskLocationLabel(d.LOCATION))}</div>`, 'disk')}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Network adapters <button type="button" class="btn btn-sm btn-outline-primary" id="addNicBtn">Add NIC</button></div>${resourceList(nics, n=>`<strong>nic${n.index}</strong> · ${esc(n.MODE || '')}${n.BRIDGE ? ` / ${esc(n.BRIDGE)}`:''} · ${esc(n.MODEL || '')}${n.VLAN ? ` · VLAN ${esc(n.VLAN)}` : ''} · <span class="mono">${esc(n.MAC || '')}</span>`, 'nic')}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">PCI passthrough <button type="button" class="btn btn-sm btn-outline-primary" id="addPciBtn">Add device</button></div>${resourceList(pci, p=>`<strong>pci${p.index}</strong> · <span class="mono">${esc(p.BDF || '')}</span>`, 'pci')}</div>
         <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Console ${vm.state === 'running' && c.DISPLAY === 'vnc' ? `<button type="button" class="btn btn-sm btn-outline-primary" id="openConsoleBtn">Open noVNC</button>` : ''}</div>${consoleInfo ? `<div class="row g-2 small"><div class="col-md-6"><div class="border rounded-3 p-3"><div class="text-secondary">VNC</div><div class="mono mt-1">${esc(consoleInfo.vnc_host || consoleInfo.vnc_bind || '')}${consoleInfo.vnc_port ? ':'+esc(consoleInfo.vnc_port) : ''}</div></div></div><div class="col-md-6"><div class="border rounded-3 p-3"><div class="text-secondary">Serial / QMP</div><div class="mono mt-1 text-break">${esc(consoleInfo.serial_socket || consoleInfo.qmp_socket || '')}</div></div></div></div>` : '<div class="text-secondary small">Console information unavailable.</div>'}</div>
       </form>`, onSubmit: async (el,m) => {
-        const f = new FormData($('#vmEditForm',el)); const updates = {cpus:f.get('cpus'),memory:f.get('memory'),cpu:f.get('cpu'),machine:f.get('machine'),emulation:f.has('emulation')?'true':'false',iso:f.get('iso') || '',boot:f.get('boot'),display:f.get('display'),autostart:f.has('autostart')?'true':'false'};
+        const f = new FormData($('#vmEditForm',el)); const updates = {cpus:f.get('cpus'),memory:f.get('memory'),cpu:f.get('cpu'),machine:f.get('machine'),emulation:f.has('emulation')?'true':'false',boot:f.get('boot'),display:f.get('display'),autostart:f.has('autostart')?'true':'false'};
         for (const [field,value] of Object.entries(updates)) await request(`/vms/${encodeURIComponent(name)}`, {method:'PATCH', form:{field,value}});
+        const selectedImage=parseImageSelection(f.get('iso')||'');
+        await request(`/vms/${encodeURIComponent(name)}`,{method:'PATCH',form:{field:'iso',value:selectedImage.name,peer_id:selectedImage.peerId}});
         if (vm.state !== 'running') {
           const enabled = f.has('cloud_init_enabled');
           const userData = f.get('cloud_init_user_data') || ''; const hostname = f.get('cloud_init_hostname') || name;
@@ -695,7 +811,7 @@ ${commandLine(ci)} < user-data`;
     $$('[data-remove-nic]', $('#formModal')).forEach(b=>b.onclick=()=>confirmAction('Remove NIC', `Remove NIC ${b.dataset.removeNic} from ${name}?`, async()=>{await request(`/vms/${encodeURIComponent(name)}/nics/${b.dataset.removeNic}`,{method:'DELETE'}); bootstrap.Modal.getInstance($('#formModal'))?.hide(); await openVMDetails(name);}));
     $$('[data-edit-nic]', $('#formModal')).forEach(b=>b.onclick=()=>subModalEditNic(name, nics.find(n=>String(n.index)===b.dataset.editNic), bridgeOpts));
     $$('[data-remove-pci]', $('#formModal')).forEach(b=>b.onclick=()=>confirmAction('Remove PCI device', `Remove PCI entry ${b.dataset.removePci}?`, async()=>{await request(`/vms/${encodeURIComponent(name)}/pci/${b.dataset.removePci}`,{method:'DELETE'}); bootstrap.Modal.getInstance($('#formModal'))?.hide(); await openVMDetails(name);}));
-    $('#addDiskBtn').onclick=()=>subModalAddDisk(name);
+    $('#addDiskBtn').onclick=()=>subModalAddDisk(name,storagePeers);
     $('#addNicBtn').onclick=()=>subModalAddNic(name, bridgeOpts);
     $('#addPciBtn').onclick=()=>subModalAddPci(name);
     const consoleBtn = $('#openConsoleBtn'); if (consoleBtn) consoleBtn.onclick=()=>openConsole(name);
@@ -716,8 +832,8 @@ ${commandLine(ci)} < user-data`;
   function nicModelOptions(current) {
     return selectOptions(['virtio-net-pci','e1000e','e1000','rtl8139'], current);
   }
-  function subModalAddDisk(name){
-    modal({eyebrow:name,title:'Add virtual disk',submitText:'Add disk',size:'sm',body:`<form id="subForm"><label class="form-label">Size</label><input name="size" value="20G" class="form-control mb-3"><label class="form-label">Format</label><select name="format" class="form-select mb-3"><option>qcow2</option><option>raw</option></select><label class="form-label">Bus</label><select name="bus" class="form-select"><option>virtio</option><option>sata</option><option>scsi</option></select></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());await request(`/vms/${encodeURIComponent(name)}/disks`,{method:'POST',form:f});m.hide();await openVMDetails(name);}});
+  function subModalAddDisk(name,peers=[]){
+    modal({eyebrow:name,title:'Add virtual disk',submitText:'Add disk',size:'sm',body:`<form id="subForm"><label class="form-label">Size</label><input name="size" value="20G" class="form-control mb-3"><label class="form-label">Format</label><select name="format" class="form-select mb-3"><option>qcow2</option><option>raw</option></select><label class="form-label">Bus</label><select name="bus" class="form-select mb-3"><option>virtio</option><option>sata</option><option>scsi</option></select><label class="form-label">Storage location</label><select name="location" class="form-select">${storageLocationOptions(peers,'local')}</select><div class="form-text">Peer disks are created directly on the selected host through the existing storage backplane.</div></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());await request(`/vms/${encodeURIComponent(name)}/disks`,{method:'POST',form:f});m.hide();await openVMDetails(name);}});
   }
   function subModalAddNic(name, bridgeOpts){
     modal({eyebrow:name,title:'Add network adapter',submitText:'Add NIC',size:'sm',body:`<form id="subForm"><label class="form-label">Mode</label><select name="mode" id="nicAddMode" class="form-select mb-3"><option value="nat">NAT</option><option value="bridge">Bridge</option></select><div id="nicAddBridgeWrap"><label class="form-label">Bridge</label><select name="bridge" class="form-select mb-3"><option value="">None</option>${bridgeOpts}</select><label class="form-label">VLAN ID</label><input name="vlan" type="number" min="1" max="4094" class="form-control mb-3" placeholder="Untagged"><div class="form-text mb-3">Optional 802.1Q access VLAN. The physical bridge uplink must carry this VLAN.</div></div><label class="form-label">Model</label><select name="model" class="form-select"><option>virtio-net-pci</option><option>e1000e</option><option>e1000</option><option>rtl8139</option></select></form>`,onSubmit:async(el,m)=>{const f=Object.fromEntries(new FormData($('#subForm',el)).entries());if(f.mode!=='bridge'){delete f.bridge;delete f.vlan;}await request(`/vms/${encodeURIComponent(name)}/nics`,{method:'POST',form:f});m.hide();await openVMDetails(name);}});
@@ -928,21 +1044,84 @@ ${commandLine(ci)} < user-data`;
   }
 
   async function openISOMediaLibrary(){
-    const images=await request('/images'); state.cache.vmImages=images;
-    const rows=images.map(i=>`<tr><td><div class="resource-name">${esc(i.name)}</div></td><td>${bytes(i.bytes)}</td><td><div class="action-row"><button class="btn btn-sm btn-outline-secondary" data-iso-download="${esc(i.name)}">Download</button><button class="btn btn-sm btn-outline-danger" data-vmi-delete="${esc(i.name)}">Delete</button></div></td></tr>`);
-    modal({eyebrow:'VM storage',title:'ISO installation media',body:`<div class="alert alert-light border small">Shared, read-only installation media is stored separately from VM configurations and virtual disks.</div><form id="isoLibraryForm" class="row g-3 align-items-end mb-4"><div class="col-md-9"><label class="form-label">Upload ISO or installer image</label><input id="isoLibraryFile" type="file" class="form-control" accept=".iso,.img"></div><div class="col-md-3 d-grid"><button class="btn btn-primary" type="submit">Upload</button></div><div id="isoLibraryProgress" class="col-12 d-none"><div class="d-flex justify-content-between small mb-1"><span id="isoLibraryStatus">Preparing upload</span><span id="isoLibraryPercent">0%</span></div><div class="progress"><div id="isoLibraryBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div></div></form>${table(['Media','Size',''],rows,'No ISO installation media has been uploaded.')}`});
-    $('#isoLibraryForm').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,file=$('#isoLibraryFile',form).files[0];if(!file)return;const btn=$('button',form),progress=$('#isoLibraryProgress'),bar=$('#isoLibraryBar'),status=$('#isoLibraryStatus'),percentEl=$('#isoLibraryPercent');btn.disabled=true;btn.textContent='Uploading';progress.classList.remove('d-none');try{await uploadFile(`/images/${encodeURIComponent(file.name)}`,file,(loaded,total,known)=>{const value=known&&total?Math.round(loaded/total*100):0;bar.style.width=`${value}%`;percentEl.textContent=known?`${value}%`:'Uploading';status.textContent=known?`${file.name} - ${bytes(loaded)} of ${bytes(total)}`:`Uploading ${file.name}`;});toast(`${file.name} uploaded`);await openISOMediaLibrary();}catch(err){toast(err.message,'Upload failed');}finally{btn.disabled=false;btn.textContent='Upload';}};
-    $$('[data-iso-download]', $('#formModal')).forEach(b=>b.onclick=()=>downloadFile(`/images/${encodeURIComponent(b.dataset.isoDownload)}`));
-    $$('[data-vmi-delete]', $('#formModal')).forEach(b=>b.onclick=async()=>{if(!window.confirm(`Delete ${b.dataset.vmiDelete}?`))return;await request(`/images/${encodeURIComponent(b.dataset.vmiDelete)}`,{method:'DELETE'});toast(`${b.dataset.vmiDelete} deleted`);await openISOMediaLibrary();});
+    const inventory=await collectImages();
+    const hosts=[...new Set(inventory.rows.map(i=>i.location))].sort();
+    const errors=inventory.errors.length?`<div class="alert alert-warning small">${esc(inventory.errors.join(' / '))}</div>`:'';
+    const uploadHostOptions=[{peerId:'',label:hostLabelForPeer('')},...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,label:peer.label||peer.name||peer.node_id}))].map(host=>`<option value="${esc(host.peerId)}">${esc(host.label)}</option>`).join('');
+    modal({eyebrow:'Storage',title:'ISO media',size:'xl',body:`${errors}<div class="alert alert-light border small">One ISO inventory across this host and all directly paired hosts. Peer media stays on its storage host and is mounted by QEMU through the existing NFSv4/WSS backplane.</div><div class="row g-2 mb-3"><div class="col-md-6"><label class="form-label small">Storage host</label><select id="isoHostFilter" class="form-select form-select-sm"><option value="">All hosts</option>${hosts.map(h=>`<option>${esc(h)}</option>`).join('')}</select></div><div class="col-md-6"><label class="form-label small">Search</label><input id="isoSearchFilter" class="form-control form-control-sm" placeholder="ISO name"></div></div><div id="isoInventory"></div><hr><form id="isoUploadForm"><div class="row g-2 align-items-end"><div class="col-md-5"><label class="form-label">ISO file</label><input id="isoUploadFile" type="file" accept=".iso,.img,application/octet-stream" class="form-control" required></div><div class="col-md-4"><label class="form-label">Store on</label><select name="peer_id" class="form-select">${uploadHostOptions}</select></div><div class="col-md-3"><button class="btn btn-primary w-100">Upload</button></div></div><div id="isoUploadProgress" class="progress mt-3 d-none"><div id="isoUploadBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div></form>`});
+    const render=()=>{
+      const host=$('#isoHostFilter')?.value||'',q=($('#isoSearchFilter')?.value||'').toLowerCase();
+      const rows=inventory.rows.filter(i=>(!host||i.location===host)&&(!q||i.name.toLowerCase().includes(q))).sort((a,b)=>new Date(b.modified||0)-new Date(a.modified||0)).map(i=>`<tr><td class="mono">${esc(i.name)}</td><td>${esc(i.location)}</td><td>${esc(formatDate(i.modified)||'-')}</td><td>${bytes(i.bytes)}</td><td><div class="action-row"><button class="btn btn-sm btn-outline-secondary" data-iso-download="${esc(i.name)}" data-peer="${esc(i.iso_peer||'')}">Download</button><button class="btn btn-sm btn-outline-danger" data-iso-delete="${esc(i.name)}" data-peer="${esc(i.iso_peer||'')}">Delete</button></div></td></tr>`);
+      $('#isoInventory').innerHTML=table(['ISO','Stored on','Date','Size',''],rows,'No ISO media match the selected filters.');
+      $$('[data-iso-download]').forEach(b=>b.onclick=()=>downloadFile(`/images/${encodeURIComponent(b.dataset.isoDownload)}`,b.dataset.peer||''));
+      $$('[data-iso-delete]').forEach(b=>b.onclick=()=>confirmAction('Delete ISO',`Delete ${b.dataset.isoDelete} from ${hostLabelForPeer(b.dataset.peer||'')}?`,async()=>{await request(`/images/${encodeURIComponent(b.dataset.isoDelete)}`,{method:'DELETE',...(b.dataset.peer?{peerId:b.dataset.peer}:{local:true})});bootstrap.Modal.getInstance($('#formModal'))?.hide();await openISOMediaLibrary();}));
+    };
+    $('#isoHostFilter').onchange=render; $('#isoSearchFilter').oninput=render; render();
+    $('#isoUploadForm').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,file=$('#isoUploadFile',form).files[0];if(!file)return;const peer=String(new FormData(form).get('peer_id')||''),progress=$('#isoUploadProgress'),bar=$('#isoUploadBar');progress.classList.remove('d-none');await uploadFile(`/images/${encodeURIComponent(file.name)}`,file,(loaded,total)=>bar.style.width=`${total?Math.round(loaded/total*100):0}%`,peer);toast(`${file.name} uploaded to ${hostLabelForPeer(peer)}`);bootstrap.Modal.getInstance($('#formModal'))?.hide();await openISOMediaLibrary();};
   }
 
   async function openVMDiskStorage(){
-    const names=await request('/vms'); const vms=await Promise.all(names.map(v=>request(`/vms/${encodeURIComponent(v.name)}`)));
-    const rows=vms.flatMap(vm=>indexedConfig(vm.config||{},'DISK',['FILE','FORMAT','BUS']).map(d=>`<tr><td>${esc(vm.name)}</td><td class="mono">${esc(d.FILE)}</td><td>${esc(d.FORMAT)}</td><td>${esc(d.BUS)}</td><td class="mono small text-break">${esc(`${vm.storage?.disk_path || ''}/${d.FILE}`)}</td><td><button class="btn btn-sm btn-outline-secondary" data-vm-disk-download="${esc(vm.name)}" data-vm-disk-index="${d.index}">Download</button></td></tr>`));
-    const options=vms.map(vm=>`<option value="${esc(vm.name)}">${esc(vm.name)}</option>`).join('');
-    modal({eyebrow:'VM storage',title:'Virtual disks',size:'xl',body:`<div class="alert alert-light border small">Each VM has its own disk folder. Uploading a QCOW2, RAW, or VMDK stores it there and attaches it as a new data disk. The VM must be stopped.</div><form id="diskLibraryForm" class="row g-3 align-items-end mb-4"><div class="col-md-3"><label class="form-label">Virtual machine</label><select name="vm" class="form-select" required><option value="">Select VM</option>${options}</select></div><div class="col-md-4"><label class="form-label">Disk file</label><input id="diskLibraryFile" type="file" class="form-control" accept=".qcow2,.raw,.vmdk" required></div><div class="col-md-2"><label class="form-label">Format</label><select name="format" class="form-select"><option>qcow2</option><option>raw</option><option>vmdk</option></select></div><div class="col-md-2"><label class="form-label">Bus</label><select name="bus" class="form-select"><option>virtio</option><option>sata</option><option>scsi</option></select></div><div class="col-md-1 d-grid"><button class="btn btn-primary" type="submit">Upload</button></div><div id="diskLibraryProgress" class="col-12 d-none"><div class="d-flex justify-content-between small mb-1"><span id="diskLibraryStatus">Preparing upload</span><span id="diskLibraryPercent">0%</span></div><div class="progress"><div id="diskLibraryBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div></div></form>${table(['VM','Disk','Format','Bus','Storage location',''],rows,'No virtual disks are attached.')}`});
-    $('#diskLibraryForm').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,fd=new FormData(form),file=$('#diskLibraryFile',form).files[0],vm=fd.get('vm');if(!file||!vm)return;const btn=$('button',form),progress=$('#diskLibraryProgress'),bar=$('#diskLibraryBar'),status=$('#diskLibraryStatus'),percentEl=$('#diskLibraryPercent');btn.disabled=true;btn.textContent='Uploading';progress.classList.remove('d-none');try{const q=new URLSearchParams({format:fd.get('format'),bus:fd.get('bus')});await uploadFile(`/vms/${encodeURIComponent(vm)}/disks/import/${encodeURIComponent(file.name)}?${q}`,file,(loaded,total,known)=>{const value=known&&total?Math.round(loaded/total*100):0;bar.style.width=`${value}%`;percentEl.textContent=known?`${value}%`:'Uploading';status.textContent=known?`${file.name} - ${bytes(loaded)} of ${bytes(total)}`:`Uploading ${file.name}`;});toast(`${file.name} attached to ${vm}`);await openVMDiskStorage();}catch(err){toast(err.message,'Disk upload failed');}finally{btn.disabled=false;btn.textContent='Upload';}};
-    $$('[data-vm-disk-download]', $('#formModal')).forEach(b=>b.onclick=()=>downloadFile(`/vms/${encodeURIComponent(b.dataset.vmDiskDownload)}/disks/${encodeURIComponent(b.dataset.vmDiskIndex)}/download`));
+    const hosts=inventoryHosts();
+    const hostGroups=await Promise.all(hosts.map(async host=>{
+      const opts=host.peerId?{peerId:host.peerId}:{local:true};
+      try{
+        const names=await request('/vms',opts);
+        const vms=await Promise.all((names||[]).map(vm=>request(`/vms/${encodeURIComponent(vm.name)}`,opts)));
+        return {...host,vms,error:null};
+      }catch(error){return {...host,vms:[],error};}
+    }));
+    const [activeVmNames,storagePeers]=await Promise.all([request('/vms').catch(()=>[]),request('/cluster/peers').catch(()=>[])]);
+    const locationName=(location,vmHost)=>{
+      const value=location||'local';
+      if(value==='local')return `${vmHost} · local storage`;
+      const peerId=value.startsWith('peer:')?value.slice(5):value;
+      if(peerId===state.hostCatalog.local?.node_id)return `${state.hostCatalog.local?.name||'Local host'} · peer storage`;
+      const peer=state.hostCatalog.peers.find(p=>p.node_id===peerId)||(storagePeers||[]).find(p=>p.node_id===peerId);
+      return `${peer?.name||peer?.label||abbreviatedNodeId(peerId)} · peer storage`;
+    };
+    const disks=hostGroups.flatMap(group=>group.vms.flatMap(vm=>indexedConfig(vm.config||{},'DISK',['FILE','FORMAT','BUS','LOCATION']).map(d=>({...d,vm:vm.name,_hostId:group.hostId,_hostLabel:group.label,_hostPeerId:group.peerId,_storageLabel:locationName(d.LOCATION,group.label)}))));
+    const vmNames=[...new Set(disks.map(d=>d.vm))].sort((a,b)=>a.localeCompare(b));
+    const rows=disks.map(d=>`<tr data-disk-row data-disk-vm="${esc(d.vm)}" data-disk-host="${esc(d._hostId)}" data-disk-search="${esc(String(d.FILE||'').toLowerCase())}"><td>${esc(d.vm)}</td><td>${esc(d._hostLabel)}</td><td class="mono">${esc(d.FILE)}</td><td>${esc(d.FORMAT)}</td><td>${esc(d.BUS)}</td><td>${esc(d._storageLabel)}</td><td><button class="btn btn-sm btn-outline-secondary" data-vm-disk-download="${esc(d.vm)}" data-vm-disk-index="${d.index}" data-vm-host-peer="${esc(d._hostPeerId)}">Download</button></td></tr>`);
+    const vmOptions=(activeVmNames||[]).map(vm=>`<option value="${esc(vm.name)}">${esc(vm.name)}</option>`).join('');
+    const hostFilters=[...new Map(hostGroups.map(group=>[group.hostId,group.label])).entries()];
+    const errors=hostGroups.filter(group=>group.error).map(group=>group.label);
+    modal({eyebrow:'VM storage',title:'Virtual disks',size:'xl',body:`<div class="alert alert-light border small">This inventory includes VM disks across the current host and paired hosts. New and imported disks can live locally or directly on peer-backed storage through the existing NFSv4/WSS backplane.</div>
+      <form id="diskLibraryForm" class="row g-3 align-items-end mb-4">
+        <div class="col-md-2"><label class="form-label">Virtual machine</label><select name="vm" class="form-select" required><option value="">Select VM</option>${vmOptions}</select></div>
+        <div class="col-md-3"><label class="form-label">Disk file</label><input id="diskLibraryFile" type="file" class="form-control" accept=".qcow2,.raw,.vmdk" required></div>
+        <div class="col-md-2"><label class="form-label">Format</label><select name="format" class="form-select"><option>qcow2</option><option>raw</option><option>vmdk</option></select></div>
+        <div class="col-md-2"><label class="form-label">Bus</label><select name="bus" class="form-select"><option>virtio</option><option>sata</option><option>scsi</option></select></div>
+        <div class="col-md-2"><label class="form-label">Store on</label><select name="location" class="form-select">${storageLocationOptions(storagePeers,'local')}</select></div>
+        <div class="col-md-1 d-grid"><button class="btn btn-primary" type="submit">Upload</button></div>
+        <div id="diskLibraryProgress" class="col-12 d-none"><div class="d-flex justify-content-between small mb-1"><span id="diskLibraryStatus">Preparing upload</span><span id="diskLibraryPercent">0%</span></div><div class="progress"><div id="diskLibraryBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div></div>
+      </form>
+      <div class="row g-2 mb-3"><div class="col-md-4"><label class="form-label small mb-1">VM</label><select id="diskVmFilter" class="form-select form-select-sm"><option value="">All VMs</option>${vmNames.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join('')}</select></div><div class="col-md-4"><label class="form-label small mb-1">VM host</label><select id="diskHostFilter" class="form-select form-select-sm"><option value="">All hosts</option>${hostFilters.map(([id,label])=>`<option value="${esc(id)}">${esc(label)}</option>`).join('')}</select></div><div class="col-md-4"><label class="form-label small mb-1">Search</label><input id="diskTextFilter" class="form-control form-control-sm" placeholder="Disk filename"></div></div>
+      ${errors.length?`<div class="alert alert-warning py-2 small">Could not query VM disks on ${errors.map(esc).join(', ')}.</div>`:''}
+      ${table(['VM','VM host','Disk','Format','Bus','Storage location',''],rows,'No virtual disks are attached.')}`});
+
+    const applyFilters=()=>{
+      const vm=$('#diskVmFilter',$('#formModal'))?.value||'',host=$('#diskHostFilter',$('#formModal'))?.value||'',text=String($('#diskTextFilter',$('#formModal'))?.value||'').trim().toLowerCase();
+      $$('[data-disk-row]',$('#formModal')).forEach(row=>row.classList.toggle('d-none',!((!vm||row.dataset.diskVm===vm)&&(!host||row.dataset.diskHost===host)&&(!text||(row.dataset.diskSearch||'').includes(text)))));
+    };
+    $('#diskVmFilter',$('#formModal'))?.addEventListener('change',applyFilters);
+    $('#diskHostFilter',$('#formModal'))?.addEventListener('change',applyFilters);
+    $('#diskTextFilter',$('#formModal'))?.addEventListener('input',applyFilters);
+
+    $('#diskLibraryForm').onsubmit=async e=>{
+      e.preventDefault();
+      const form=e.currentTarget,fd=new FormData(form),file=$('#diskLibraryFile',form).files[0],vm=fd.get('vm');
+      if(!file||!vm)return;
+      const btn=$('button',form),progress=$('#diskLibraryProgress'),bar=$('#diskLibraryBar'),status=$('#diskLibraryStatus'),percentEl=$('#diskLibraryPercent');
+      btn.disabled=true;btn.textContent='Uploading';progress.classList.remove('d-none');
+      try{
+        const q=new URLSearchParams({format:fd.get('format'),bus:fd.get('bus'),location:fd.get('location')||'local'});
+        await uploadFile(`/vms/${encodeURIComponent(vm)}/disks/import/${encodeURIComponent(file.name)}?${q}`,file,(loaded,total,known)=>{const value=known&&total?Math.round(loaded/total*100):0;bar.style.width=`${value}%`;percentEl.textContent=known?`${value}%`:'Uploading';status.textContent=known?`${file.name} - ${bytes(loaded)} of ${bytes(total)}`:`Uploading ${file.name}`;});
+        toast(`${file.name} attached to ${vm}`);
+        await openVMDiskStorage();
+      }catch(err){toast(err.message,'Disk upload failed');}
+      finally{btn.disabled=false;btn.textContent='Upload';}
+    };
+    $$('[data-vm-disk-download]',$('#formModal')).forEach(button=>button.onclick=()=>downloadFile(`/vms/${encodeURIComponent(button.dataset.vmDiskDownload)}/disks/${encodeURIComponent(button.dataset.vmDiskIndex)}/download`,button.dataset.vmHostPeer||''));
   }
 
   async function openDockerImageLibrary(){
@@ -1160,68 +1339,123 @@ ${commandLine(ci)} < user-data`;
   }
 
   async function loadBackups() {
-    if (!hasCap('backup-create')) {
-      const [backups, peers, replicas, hostedVolumes] = await Promise.all([request('/backups'), request('/cluster/peers'), hasCap('storage-backplane')?request('/replications/replicas').catch(()=>[]):Promise.resolve([]), hasCap('storage-backplane')?request('/backplane/docker-volumes').catch(()=>[]):Promise.resolve([])]);
-      const rows=(backups||[]).map(b=>`<tr><td class="mono">${esc(b.vm)}</td><td class="mono">${esc(b.archive)}</td><td>${bytes(b.bytes)}</td><td>${esc(b.modified||'')}</td><td><div class="action-row"><button class="btn btn-sm btn-outline-secondary" data-backup-download="${esc(b.vm)}" data-backup-archive="${esc(b.archive)}">Download</button><button class="btn btn-sm btn-outline-danger" data-backup-delete="${esc(b.vm)}" data-backup-archive="${esc(b.archive)}">Delete</button></div></td></tr>`);
-      const replicasCard=hasCap('storage-backplane')?`<div class="mt-3">${card('Continuous replicas',`<div class="small text-secondary mb-3">Active replicas are qcow2 files written through this node's loopback-only NFSv4 peer backplane. Stopping replication on the source leaves the last synchronized disk here as a retained replica until it is explicitly purged.</div>${replicaInventoryTable(replicas)}`)}</div>`:'';
-      $('#view').innerHTML=`<div class="mb-3 alert alert-info"><strong>Backup storage profile.</strong> This node stores peer backups, retained disk replicas, Docker volumes, and image archives on the shared storage backplane. It does not run virtual machines.</div>${card('Received backups',table(['VM','Archive','Size','Modified',''],rows,'No backups have been received yet.'),`<span class="small text-secondary">${(peers||[]).length} paired host${(peers||[]).length===1?'':'s'}</span>`)}${replicasCard}${hostedPeerVolumeCard(hostedVolumes)}`;
-      $$('[data-backup-download]').forEach(b=>b.onclick=()=>downloadFile(`/backups/${encodeURIComponent(b.dataset.backupDownload)}/${encodeURIComponent(b.dataset.backupArchive)}`));
-      $$('[data-backup-delete]').forEach(b=>b.onclick=()=>confirmAction('Delete backup',`Delete ${b.dataset.backupArchive}?`,async()=>{await request(`/backups/${encodeURIComponent(b.dataset.backupDelete)}/${encodeURIComponent(b.dataset.backupArchive)}`,{method:'DELETE'});await loadBackups();}));
-      bindReplicaInventoryActions();
-      bindHostedPeerVolumeActions();
-      return;
-    }
-    const [backups, schedules, vms, peers, replicas, hostedVolumes] = await Promise.all([request('/backups'), request('/backups/schedules'), request('/vms'), request('/cluster/peers'), hasCap('storage-backplane')?request('/replications/replicas').catch(()=>[]):Promise.resolve([]), hasCap('storage-backplane')?request('/backplane/docker-volumes').catch(()=>[]):Promise.resolve([])]);
+    const canCreate=hasCap('backup-create');
+    const hasStorageBackplane=hasCap('storage-backplane');
+    const [inventory,schedules,vms,peers,replicas,hostedVolumes]=await Promise.all([
+      collectHostInventory('/backups'),
+      canCreate?request('/backups/schedules').catch(()=>[]):Promise.resolve([]),
+      canCreate?request('/vms').catch(()=>[]):Promise.resolve([]),
+      request('/cluster/peers').catch(()=>[]),
+      hasStorageBackplane?request('/replications/replicas').catch(()=>[]):Promise.resolve([]),
+      hasStorageBackplane?request('/backplane/docker-volumes').catch(()=>[]):Promise.resolve([])
+    ]);
     state.cache.backupPeers=(peers||[]).filter(usablePeer);
-    const vmOptions = vms.map(vm=>`<option value="${esc(vm.name)}">${esc(vm.name)} (${esc(vm.state)})</option>`).join('');
-    const rows = backups.map(b=>`<tr><td class="mono">${esc(b.vm)}</td><td class="mono">${esc(b.archive)}</td><td>${bytes(b.bytes)}</td><td><div class="action-row"><a class="btn btn-sm btn-outline-secondary" href="${API}/backups/${encodeURIComponent(b.vm)}/${encodeURIComponent(b.archive)}">Download</a><button class="btn btn-sm btn-outline-danger" data-backup-delete="${esc(b.vm)}" data-backup-archive="${esc(b.archive)}">Delete</button></div></td></tr>`);
-    const scheduleRows = schedules.map(s=>`<tr><td class="mono">${esc(s.vm)}</td><td class="mono">${esc(s.cron)}</td><td>${esc(s.label)}</td><td><button class="btn btn-sm btn-outline-danger" data-backup-unschedule="${esc(s.vm)}">Remove</button></td></tr>`);
-    const replicasSection=hasCap('storage-backplane')?`<div class="mt-3">${card('Continuous replicas',`<div class="small text-secondary mb-3">This inventory is destination-side storage. Active entries are being mirrored through the NFSv4/WSS peer backplane; retained entries are the last synchronized copy after replication was stopped.</div>${replicaInventoryTable(replicas)}`)}</div>`:'';
-    $('#view').innerHTML=`<div class="row g-3"><div class="col-xl-8">${card('VM backups',table(['VM','Archive','Size',''],rows,'No backups found.'),'<button class="btn btn-sm btn-primary" id="createBackupBtn">Create backup</button>')}</div><div class="col-xl-4">${card('Schedules',table(['VM','Cron','Label',''],scheduleRows,'No scheduled backups.'),'<button class="btn btn-sm btn-outline-primary" id="scheduleBackupBtn">Schedule backup</button>')}</div></div>${replicasSection}${hostedPeerVolumeCard(hostedVolumes)}`;
-    $('#createBackupBtn').onclick=()=>{modal({eyebrow:'VM backup',title:'Create backup',body:`<form id="backupForm"><label class="form-label">Virtual machine</label><select name="name" class="form-select mb-3" required><option value="">Select a VM</option>${vmOptions}</select><label class="form-label">Label</label><input name="label" class="form-control mb-3" value="manual">${backupTargetFields()}<div class="form-check form-switch mt-3"><input name="live" id="liveBackup" class="form-check-input" type="checkbox"><label class="form-check-label" for="liveBackup">Live backup</label></div><div class="form-text">Uses QMP full disk copies while the VM runs. A stopped VM uses an ordinary consistent file copy.</div><button id="vmBackupNowBtn" type="button" class="btn btn-primary mt-3">Backup now</button><div id="vmBackupProgress" class="mt-3 d-none" role="status"><div class="d-flex justify-content-between small mb-1"><span id="vmBackupProgressLabel">Queued</span><span id="vmBackupProgressValue">0%</span></div><div class="progress" style="height:0.5rem"><div id="vmBackupProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div></div></form>`});const root=$('#formModal');bindBackupTarget(root);$('#vmBackupNowBtn',root).onclick=async()=>{const fd=new FormData($('#backupForm',root));const name=fd.get('name');if(!name){toast('Select a virtual machine.','Backup not started');return;}let target;try{target=backupTargetData(fd);}catch(error){toast(error.message,'Backup not started');return;}const button=$('#vmBackupNowBtn',root);button.disabled=true;button.textContent='Backup queued';try{const job=await request('/backups/start',{method:'POST',form:{name,...target}});watchBackupJob(job,root,name,async()=>{bootstrap.Modal.getInstance(root)?.hide();await loadBackups();});}catch(error){button.disabled=false;button.textContent='Backup now';$('#vmBackupProgress',root).classList.remove('d-none');$('#vmBackupProgressLabel',root).textContent=`Backup could not start: ${error.message}`;$('#vmBackupProgressBar',root).className='progress-bar bg-danger';toast(error.message,'Backup not started');}};};
-    $('#scheduleBackupBtn').onclick=()=>openBackupSchedule(vmOptions);
-    $$('[data-backup-delete]').forEach(b=>b.onclick=()=>confirmAction('Delete backup',`Delete ${b.dataset.backupArchive}?`,async()=>{await request(`/backups/${encodeURIComponent(b.dataset.backupDelete)}/${encodeURIComponent(b.dataset.backupArchive)}`,{method:'DELETE'});await loadBackups();}));
-    $$('[data-backup-unschedule]').forEach(b=>b.onclick=()=>confirmAction('Remove schedule',`Remove the ${b.dataset.backupUnschedule} schedule?`,async()=>{await request('/backups/unschedule',{method:'DELETE',form:{name:b.dataset.backupUnschedule}});await loadBackups();}));
+
+    const params=routeParams();
+    const initialVm=params.get('vm')||'';
+    const backupTime=value=>{
+      if(!value)return 0;
+      const n=Number(value);
+      if(Number.isFinite(n)&&n>0)return n>1e12?n:n*1000;
+      const parsed=new Date(value).getTime();
+      return Number.isFinite(parsed)?parsed:0;
+    };
+    const backups=inventory.rows.slice().sort((a,b)=>backupTime(b.modified)-backupTime(a.modified));
+    const vmNames=[...new Set([...backups.map(b=>b.vm),...(vms||[]).map(v=>v.name),...(initialVm?[initialVm]:[])].filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+    const hosts=[...new Set(backups.map(b=>b.storage_host).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+
+    const filters=`<div class="row g-2 mb-3">
+      <div class="col-md-4"><label class="form-label small">VM</label><select id="backupVmFilter" class="form-select form-select-sm"><option value="">All VMs</option>${vmNames.map(v=>`<option value="${esc(v)}" ${v===initialVm?'selected':''}>${esc(v)}</option>`).join('')}</select></div>
+      <div class="col-md-4"><label class="form-label small">Storage host</label><select id="backupHostFilter" class="form-select form-select-sm"><option value="">All storage hosts</option>${hosts.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')}</select></div>
+      <div class="col-md-4"><label class="form-label small">Search</label><input id="backupSearchFilter" class="form-control form-control-sm" placeholder="Backup name"></div>
+    </div>`;
+    const errors=inventory.errors.length?`<div class="alert alert-warning small">${esc(inventory.errors.join(' / '))}</div>`:'';
+    const backupActions=canCreate?'<button class="btn btn-sm btn-primary" id="createBackupBtn">Create backup</button>':'';
+    const backupCard=card('All backups',`${errors}${filters}<div id="backupInventoryTable"></div>`,backupActions);
+
+    let page=`<div class="row g-3"><div class="col-12">${backupCard}</div>`;
+    if(canCreate){
+      const scheduleRows=(schedules||[]).map(item=>{
+        const destination=item.peer_id?hostLabelForPeer(item.peer_id):(item.destination||'/var/lib/vmapi/backups');
+        return `<tr><td>${esc(item.vm)}</td><td>${esc(item.label||'scheduled')}</td><td class="mono small">${esc(item.cron)}</td><td>${esc(item.keep||'Unlimited')}</td><td>${esc(destination)}</td><td><button class="btn btn-sm btn-outline-danger" data-unschedule="${esc(item.vm)}" data-label="${esc(item.label||'scheduled')}">Remove</button></td></tr>`;
+      });
+      page+=`<div class="col-12">${card('Schedules',table(['VM','Policy','Schedule','Keep','Destination',''],scheduleRows,'No scheduled backups.'),'<button class="btn btn-sm btn-outline-primary" id="scheduleBackupBtn">Schedule backup</button>')}</div>`;
+    }
+    if(hasStorageBackplane){
+      page+=`<div class="col-12">${card('Continuous replicas',replicaInventoryTable(replicas))}</div>`;
+      page+=`<div class="col-12">${hostedPeerVolumeCard(hostedVolumes)}</div>`;
+    }
+    page+='</div>';
+    $('#view').innerHTML=page;
+
+    const renderBackupRows=()=>{
+      const vm=$('#backupVmFilter')?.value||'';
+      const host=$('#backupHostFilter')?.value||'';
+      const q=String($('#backupSearchFilter')?.value||'').trim().toLowerCase();
+      const rows=backups.filter(b=>(!vm||b.vm===vm)&&(!host||b.storage_host===host)&&(!q||String(b.archive||'').toLowerCase().includes(q))).map(b=>`<tr>
+        <td><strong>${esc(b.vm)}</strong></td>
+        <td class="mono small text-break">${esc(b.archive)}</td>
+        <td>${esc(b.storage_host)}</td>
+        <td>${esc(formatDate(b.modified)||'-')}</td>
+        <td>${bytes(b.bytes)}</td>
+        <td><div class="action-row"><button class="btn btn-sm btn-outline-secondary" data-backup-download="${esc(b.archive)}" data-vm="${esc(b.vm)}" data-peer="${esc(b.storage_peer_id||'')}">Download</button><button class="btn btn-sm btn-outline-danger" data-backup-delete="${esc(b.archive)}" data-vm="${esc(b.vm)}" data-peer="${esc(b.storage_peer_id||'')}">Delete</button></div></td>
+      </tr>`);
+      $('#backupInventoryTable').innerHTML=table(['VM','Backup','Stored on','Date','Size',''],rows,'No backups match the selected filters.');
+      $$('[data-backup-download]').forEach(btn=>btn.onclick=()=>downloadFile(`/backups/${encodeURIComponent(btn.dataset.vm)}/${encodeURIComponent(btn.dataset.backupDownload)}`,btn.dataset.peer||''));
+      $$('[data-backup-delete]').forEach(btn=>btn.onclick=()=>confirmAction('Delete backup',`Delete ${btn.dataset.backupDelete} from ${hostLabelForPeer(btn.dataset.peer||'')}?`,async()=>{
+        await request(`/backups/${encodeURIComponent(btn.dataset.vm)}/${encodeURIComponent(btn.dataset.backupDelete)}`,{method:'DELETE',...(btn.dataset.peer?{peerId:btn.dataset.peer}:{local:true})});
+        toast('Backup deleted');
+        await loadBackups();
+      }));
+    };
+    ['backupVmFilter','backupHostFilter','backupSearchFilter'].forEach(id=>$('#'+id)?.addEventListener(id==='backupSearchFilter'?'input':'change',renderBackupRows));
+    renderBackupRows();
+
+    if(canCreate){
+      const vmOptions=(vms||[]).map(vm=>`<option value="${esc(vm.name)}" ${vm.name===initialVm?'selected':''}>${esc(vm.name)} (${esc(vm.state)})</option>`).join('');
+      $('#createBackupBtn')?.addEventListener('click',()=>openBackupCreate(vmOptions));
+      $('#scheduleBackupBtn')?.addEventListener('click',()=>openBackupSchedule(vmOptions));
+      $$('[data-unschedule]').forEach(button=>button.onclick=()=>confirmAction('Remove schedule',`Remove the ${button.dataset.label} backup schedule for ${button.dataset.unschedule}?`,async()=>{
+        await request('/backups/unschedule',{method:'DELETE',form:{name:button.dataset.unschedule,label:button.dataset.label}});
+        await loadBackups();
+      }));
+    }
     bindReplicaInventoryActions();
     bindHostedPeerVolumeActions();
   }
 
-  async function openVMBackups(name) {
-    const [backups, schedules, vm, peers] = await Promise.all([request('/backups'), request('/backups/schedules'), request(`/vms/${encodeURIComponent(name)}`), request('/cluster/peers')]);
-    state.cache.backupPeers=(peers||[]).filter(usablePeer);
-    // A peer-targeted backup deliberately leaves no source copy after the
-    // peer storage accepts it. Query each paired host so those archives remain
-    // visible from the VM that created them.
-    const peerBackups = state.remotePeerId ? [] : await Promise.all(state.cache.backupPeers.map(async peer => {
-      try { return {peer, backups:await request('/backups',{peerId:peer.node_id})}; }
-      catch(error) { return {peer, error}; }
-    }));
-    const rows = backups.filter(backup => backup.vm === name).map(backup => `<tr><td class="mono">${esc(backup.archive)}</td><td>${bytes(backup.bytes)}</td><td><div class="action-row"><a class="btn btn-sm btn-outline-secondary" href="${API}/backups/${encodeURIComponent(name)}/${encodeURIComponent(backup.archive)}">Download</a><button class="btn btn-sm btn-outline-primary" data-vm-backup-restore="${esc(backup.archive)}">Restore</button><button class="btn btn-sm btn-outline-danger" data-vm-backup-delete="${esc(backup.archive)}">Delete</button></div></td></tr>`);
-    const peerRows = peerBackups.flatMap(({peer,backups:items=[]}) => items.filter(backup=>backup.vm===name).map(backup => `<tr><td>${esc(peer.label||peer.name||peer.node_id)}</td><td class="mono">${esc(backup.archive)}</td><td>${bytes(backup.bytes)}</td><td><button type="button" class="btn btn-sm btn-outline-secondary" data-vm-peer-backup-download="${esc(backup.archive)}" data-vm-peer-id="${esc(peer.node_id)}">Download</button></td></tr>`));
-    const peerErrors=peerBackups.filter(item=>item.error).map(item=>esc(item.peer.label||item.peer.name||item.peer.node_id));
-    const vmSchedules = schedules.filter(item => item.vm === name);
-    const scheduleRows = vmSchedules.map(item=>`<tr><td>${esc(item.label)}</td><td class="mono">${esc(item.cron)}</td><td>${esc(item.keep || 'Unlimited')}</td><td><div>${item.peer_id?'Paired host':'Local folder'}</div><div class="small mono text-break">${esc(item.peer_id ? (state.cache.backupPeers.find(p=>p.node_id===item.peer_id)?.name||item.peer_id) : (item.destination||'/var/lib/vmapi/backups'))}</div><div class="small text-secondary">${item.live?'live copy':'stopped VM'}</div></td><td><button class="btn btn-sm btn-outline-danger" data-vm-backup-unschedule="${esc(item.label)}">Remove</button></td></tr>`);
-    modal({eyebrow:'VM backup',title:name,body:`<div class="form-section"><div class="form-section-title">Backup now</div><form id="vmBackupNowForm"><div class="row g-3"><div class="col-md-6"><label class="form-label">Backup name</label><input name="label" class="form-control" value="manual"></div><div class="col-md-6"><label class="form-label">Keep copies</label><input name="keep" type="number" min="1" max="9999" class="form-control" value="3"></div></div>${backupTargetFields()}<div class="form-check form-switch mt-3"><input name="live" id="vmLiveBackup" class="form-check-input" type="checkbox" ${vm.state==='running'?'checked':''}><label class="form-check-label" for="vmLiveBackup">Live backup</label></div><div class="form-text mt-1">Live backup uses QMP full disk copies for running VMs with virtio qcow2 disks.</div><button id="vmBackupNowBtn" type="button" class="btn btn-primary mt-3">Backup now</button><div id="vmBackupProgress" class="mt-3 d-none" role="status"><div class="d-flex justify-content-between small mb-1"><span id="vmBackupProgressLabel">Queued</span><span id="vmBackupProgressValue">0%</span></div><div class="progress" style="height:0.5rem"><div id="vmBackupProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div><div class="form-text mt-1">Progress reflects backup phases; disk-copy byte progress is not exposed by QMP.</div></div></form></div><div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center">Scheduled backup plan <button id="vmBackupScheduleBtn" type="button" class="btn btn-sm btn-outline-primary">Configure plan</button></div>${table(['Tier','Schedule','Keep','Destination',''],scheduleRows,'No scheduled backup plan for this VM.')}</div><div class="form-section"><div class="form-section-title">Local backups</div>${table(['Archive','Size',''],rows,'No local backups for this VM.')}</div><div class="form-section"><div class="form-section-title">Backups on paired hosts</div>${table(['Host','Archive','Size',''],peerRows,'No paired-host backups found.')}${peerErrors.length?`<div class="form-text text-warning mt-2">Could not query: ${peerErrors.join(', ')}.</div>`:''}</div>`});
-    bindBackupTarget($('#formModal'));
-    $('#vmBackupNowBtn', $('#formModal')).onclick=async()=>{const root=$('#formModal');const button=$('#vmBackupNowBtn',root);const form=$('#vmBackupNowForm',root);let data;try{data=backupTargetData(new FormData(form));}catch(error){toast(error.message,'Backup not started');return;}button.disabled=true;button.textContent='Backup queued';try{const job=await request('/backups/start',{method:'POST',form:{name,...data}});watchBackupJob(job,root,name,()=>openVMBackups(name));}catch(error){$('#vmBackupProgress',root).classList.remove('d-none');$('#vmBackupProgressLabel',root).textContent=`Backup could not start: ${error.message}`;$('#vmBackupProgressBar',root).className='progress-bar bg-danger';button.disabled=false;button.textContent='Backup now';toast(error.message,'Backup not started');}};
-    $$('[data-vm-peer-backup-download]', $('#formModal')).forEach(button=>button.onclick=()=>downloadFile(`/backups/${encodeURIComponent(name)}/${encodeURIComponent(button.dataset.vmPeerBackupDownload)}`,button.dataset.vmPeerId));
-    $$('[data-vm-backup-delete]', $('#formModal')).forEach(button=>button.onclick=()=>confirmAction('Delete backup',`Delete ${button.dataset.vmBackupDelete}?`,async()=>{await request(`/backups/${encodeURIComponent(name)}/${encodeURIComponent(button.dataset.vmBackupDelete)}`,{method:'DELETE'});await openVMBackups(name);}));
-    $$('[data-vm-backup-restore]', $('#formModal')).forEach(button=>button.onclick=()=>confirmAction('Restore backup',`Restore ${button.dataset.vmBackupRestore}? The VM must not already exist.`,async()=>{await request('/backups/restore',{method:'POST',form:{name,archive:button.dataset.vmBackupRestore}});toast(`${name}: restore completed`);await openVMBackups(name);},false));
-    $$('[data-vm-backup-unschedule]', $('#formModal')).forEach(button=>button.onclick=()=>confirmAction('Remove schedule',`Remove the ${button.dataset.vmBackupUnschedule} policy?`,async()=>{await request('/backups/unschedule',{method:'DELETE',form:{name,label:button.dataset.vmBackupUnschedule}});await openVMBackups(name);}));
-    $('#vmBackupScheduleBtn', $('#formModal')).onclick=()=>openVMBackupSchedule(name);
+  function openBackupCreate(vmOptions='') {
+    modal({eyebrow:'VM backup',title:'Create backup',body:`<form id="backupForm"><label class="form-label">Virtual machine</label><select name="name" class="form-select mb-3" required><option value="">Select a VM</option>${vmOptions}</select><label class="form-label">Label</label><input name="label" class="form-control mb-3" value="manual">${backupTargetFields()}<div class="form-check form-switch mt-3"><input name="live" id="liveBackup" class="form-check-input" type="checkbox"><label class="form-check-label" for="liveBackup">Live backup</label></div><div class="form-text">Uses QMP full disk copies while the VM runs. A stopped VM uses an ordinary consistent file copy.</div><button id="vmBackupNowBtn" type="button" class="btn btn-primary mt-3">Backup now</button><div id="vmBackupProgress" class="mt-3 d-none" role="status"><div class="d-flex justify-content-between small mb-1"><span id="vmBackupProgressLabel">Queued</span><span id="vmBackupProgressValue">0%</span></div><div class="progress" style="height:0.5rem"><div id="vmBackupProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div></div></form>`});
+    const root=$('#formModal');
+    bindBackupTarget(root);
+    $('#vmBackupNowBtn',root).onclick=async()=>{
+      const fd=new FormData($('#backupForm',root));
+      const name=fd.get('name');
+      if(!name){toast('Select a virtual machine.','Backup not started');return;}
+      let target;
+      try{target=backupTargetData(fd);}catch(error){toast(error.message,'Backup not started');return;}
+      const button=$('#vmBackupNowBtn',root);
+      button.disabled=true;button.textContent='Backup queued';
+      try{
+        const job=await request('/backups/start',{method:'POST',form:{name,...target}});
+        watchBackupJob(job,root,name,async()=>{bootstrap.Modal.getInstance(root)?.hide();await loadBackups();});
+      }catch(error){
+        button.disabled=false;button.textContent='Backup now';
+        $('#vmBackupProgress',root).classList.remove('d-none');
+        $('#vmBackupProgressLabel',root).textContent=`Backup could not start: ${error.message}`;
+        $('#vmBackupProgressBar',root).className='progress-bar bg-danger';
+        toast(error.message,'Backup not started');
+      }
+    };
   }
 
-  function openVMBackupSchedule(name) {
-    modal({eyebrow:'VM backup',title:`Backup plan: ${name}`,submitText:'Save backup plan',size:'lg',body:`<form id="scheduleForm"><div class="form-section"><div class="form-section-title">Retention tiers</div><div class="row g-3"><div class="col-md-4"><div class="form-check form-switch mb-2"><input name="daily" id="dailyTier" class="form-check-input" type="checkbox" checked><label class="form-check-label" for="dailyTier">Daily backups</label></div><label class="form-label">Keep daily copies</label><input name="daily_keep" type="number" min="1" max="9999" value="7" class="form-control"></div><div class="col-md-4"><div class="form-check form-switch mb-2"><input name="weekly" id="weeklyTier" class="form-check-input" type="checkbox" checked><label class="form-check-label" for="weeklyTier">Weekly backups</label></div><label class="form-label">Keep weekly copies</label><input name="weekly_keep" type="number" min="1" max="9999" value="4" class="form-control"></div><div class="col-md-4"><div class="form-check form-switch mb-2"><input name="monthly" id="monthlyTier" class="form-check-input" type="checkbox" checked><label class="form-check-label" for="monthlyTier">Monthly backups</label></div><label class="form-label">Keep monthly copies</label><input name="monthly_keep" type="number" min="1" max="9999" value="12" class="form-control"></div></div></div><div class="form-section"><div class="form-section-title">Schedule</div><div class="row g-3"><div class="col-md-4"><label class="form-label">Time</label><input name="time" type="time" class="form-control" value="02:00"></div><div class="col-md-4"><label class="form-label">Weekly day</label><select name="weekday" class="form-select"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select></div><div class="col-md-4"><label class="form-label">Monthly day</label><input name="monthday" type="number" min="1" max="28" value="1" class="form-control"></div></div></div><div class="form-section"><div class="form-section-title">Destination</div>${backupTargetFields()}<div class="form-check form-switch mt-3"><input name="live" id="scheduleLiveBackup" class="form-check-input" type="checkbox"><label class="form-check-label" for="scheduleLiveBackup">Live backup</label></div></div></form>`,onSubmit:async(el,m)=>{const form=$('#scheduleForm',el);const fd=new FormData(form);const target=backupTargetData(fd);const [hour,minute]=(fd.get('time')||'02:00').split(':');const base={name,destination:target.destination,peer_id:target.peer_id,live:target.live};const tiers=[['daily','daily_keep',`${Number(minute)} ${Number(hour)} * * *`],['weekly','weekly_keep',`${Number(minute)} ${Number(hour)} * * ${fd.get('weekday')}`],['monthly','monthly_keep',`${Number(minute)} ${Number(hour)} ${fd.get('monthday')} * *`]];for(const [label,keepField,cron] of tiers){if(fd.has(label))await request('/backups/schedule',{method:'POST',form:{...base,label,keep:fd.get(keepField),cron}});}m.hide();toast(`${name}: backup plan saved`);await openVMBackups(name);}});
-    bindBackupTarget($('#formModal'));
-  }
 
   function backupTargetFields() {
     const peers=state.cache.backupPeers||[];
     return `<div class="row g-3 mt-1"><div class="col-md-4"><label class="form-label">Store backup</label><select name="target" class="form-select"><option value="local">Local or mounted folder</option><option value="peer" ${peers.length?'':'disabled'}>Authenticated paired host</option></select></div><div class="col-md-8" data-backup-local><label class="form-label">Storage folder</label><input name="destination" class="form-control mono" value="/var/lib/vmapi/backups"></div><div class="col-md-8 d-none" data-backup-peer><label class="form-label">Destination peer</label><select name="peer_id" class="form-select"><option value="">Select a paired host</option>${peers.map(p=>`<option value="${esc(p.node_id)}">${esc(p.label||p.name||p.node_id)}</option>`).join('')}</select></div></div><div class="form-text mt-2" data-backup-target-note>Local folders can be mounted network shares.</div>`;
   }
   function bindBackupTarget(root) {
-    const target=$('select[name="target"]',root); const sync=()=>{const peer=target.value==='peer';$('[data-backup-peer]',root)?.classList.toggle('d-none',!peer);$('[data-backup-local]',root)?.classList.toggle('d-none',peer);$('[data-backup-target-note]',root).textContent=peer?'The archive is streamed over the signed peer API and retained on the destination host only.':'Local folders can be mounted network shares.';};target.onchange=sync;sync();
+    const target=$('select[name="target"]',root); const sync=()=>{const peer=target.value==='peer';$('[data-backup-peer]',root)?.classList.toggle('d-none',!peer);$('[data-backup-local]',root)?.classList.toggle('d-none',peer);$('[data-backup-target-note]',root).textContent=peer?'The archive is written directly to the paired host through the shared NFSv4/WSS storage backplane and retained there only.':'Local folders can be mounted network shares.';};target.onchange=sync;sync();
   }
   function backupTargetData(formData) {
     const data=Object.fromEntries(formData.entries());
@@ -1229,9 +1463,21 @@ ${commandLine(ci)} < user-data`;
     return {label:data.label,keep:data.keep,live:formData.has('live')?'true':'false',frequency:data.frequency,cron:data.cron,time:data.time,weekday:data.weekday,monthday:data.monthday,destination:data.target==='local'?data.destination:'',peer_id:data.target==='peer'?data.peer_id:''};
   }
 
-  function openBackupSchedule(vmOptions) {
-    modal({eyebrow:'VM backup',title:'Schedule backup',submitText:'Schedule',size:'sm',body:`<form id="scheduleForm"><label class="form-label">Virtual machine</label><select name="name" class="form-select mb-3" required><option value="">Select a VM</option>${vmOptions}</select><div class="row g-3"><div class="col-7"><label class="form-label">Frequency</label><select name="frequency" class="form-select"><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="custom">Custom cron</option></select></div><div class="col-5"><label class="form-label">Time</label><input name="time" type="time" class="form-control" value="02:00"></div><div class="col-12" id="scheduleWeekday"><label class="form-label">Day of week</label><select name="weekday" class="form-select"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select></div><div class="col-12 d-none" id="scheduleMonthday"><label class="form-label">Day of month</label><input name="monthday" type="number" min="1" max="28" value="1" class="form-control"></div><div class="col-12 d-none" id="scheduleCustom"><label class="form-label">Cron expression</label><input name="cron" class="form-control mono" placeholder="0 2 * * *"></div></div><label class="form-label mt-3">Label</label><input name="label" class="form-control" value="scheduled"></form>`,onSubmit:async(el,m)=>{const form=$('#scheduleForm',el);const fd=new FormData(form);const o=Object.fromEntries(fd.entries());if(!o.name)throw new Error('Select a virtual machine.');if(o.frequency!=='custom'){const [hour,minute]=o.time.split(':');o.cron=o.frequency==='daily'?`${Number(minute)} ${Number(hour)} * * *`:o.frequency==='weekly'?`${Number(minute)} ${Number(hour)} * * ${o.weekday}`:`${Number(minute)} ${Number(hour)} ${o.monthday} * *`;}await request('/backups/schedule',{method:'POST',form:o});m.hide();toast(`${o.name}: backup scheduled`);await loadBackups();}});
-    const form=$('#scheduleForm', $('#formModal')); const frequency=$('select[name="frequency"]',form); const sync=()=>{const custom=frequency.value==='custom';$('#scheduleWeekday',form).classList.toggle('d-none',frequency.value!=='weekly');$('#scheduleMonthday',form).classList.toggle('d-none',frequency.value!=='monthly');$('#scheduleCustom',form).classList.toggle('d-none',!custom);$('input[name="time"]',form).disabled=custom;}; frequency.onchange=sync; sync();
+  function openBackupSchedule(vmOptions='') {
+    modal({eyebrow:'VM backup',title:'Schedule backup',submitText:'Schedule',size:'lg',body:`<form id="scheduleForm"><label class="form-label">Virtual machine</label><select name="name" class="form-select mb-3" required><option value="">Select a VM</option>${vmOptions}</select><div class="row g-3"><div class="col-md-4"><label class="form-label">Frequency</label><select name="frequency" class="form-select"><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="custom">Custom cron</option></select></div><div class="col-md-4"><label class="form-label">Time</label><input name="time" type="time" class="form-control" value="02:00"></div><div class="col-md-4" id="scheduleWeekday"><label class="form-label">Day of week</label><select name="weekday" class="form-select"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select></div><div class="col-md-4 d-none" id="scheduleMonthday"><label class="form-label">Day of month</label><input name="monthday" type="number" min="1" max="28" value="1" class="form-control"></div><div class="col-12 d-none" id="scheduleCustom"><label class="form-label">Cron expression</label><input name="cron" class="form-control mono" placeholder="0 2 * * *"></div></div><div class="row g-3 mt-1"><div class="col-md-6"><label class="form-label">Label</label><input name="label" class="form-control" value="scheduled"></div><div class="col-md-6"><label class="form-label">Keep copies</label><input name="keep" type="number" min="1" max="9999" class="form-control" value="3"></div></div>${backupTargetFields()}<div class="form-check form-switch mt-3"><input name="live" id="scheduledLiveBackup" class="form-check-input" type="checkbox"><label class="form-check-label" for="scheduledLiveBackup">Live backup</label></div></form>`,onSubmit:async(el,m)=>{
+      const form=$('#scheduleForm',el),fd=new FormData(form),o=Object.fromEntries(fd.entries());
+      if(!o.name)throw new Error('Select a virtual machine.');
+      if(o.frequency!=='custom'){
+        const [hour,minute]=(o.time||'02:00').split(':');
+        o.cron=o.frequency==='daily'?`${Number(minute)} ${Number(hour)} * * *`:o.frequency==='weekly'?`${Number(minute)} ${Number(hour)} * * ${o.weekday}`:`${Number(minute)} ${Number(hour)} ${o.monthday} * *`;
+      }
+      const target=backupTargetData(fd);
+      await request('/backups/schedule',{method:'POST',form:{name:o.name,cron:o.cron,label:o.label,keep:o.keep,live:target.live,destination:target.destination,peer_id:target.peer_id}});
+      m.hide();toast(`${o.name}: backup scheduled`);await loadBackups();
+    }});
+    const root=$('#formModal'),form=$('#scheduleForm',root),frequency=$('select[name="frequency"]',form);
+    const sync=()=>{const custom=frequency.value==='custom';$('#scheduleWeekday',form).classList.toggle('d-none',frequency.value!=='weekly');$('#scheduleMonthday',form).classList.toggle('d-none',frequency.value!=='monthly');$('#scheduleCustom',form).classList.toggle('d-none',!custom);$('input[name="time"]',form).disabled=custom;};
+    frequency.onchange=sync;sync();bindBackupTarget(root);
   }
 
   async function loadAdmin() {

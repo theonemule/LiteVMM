@@ -25,8 +25,8 @@ Commands:
   reboot NAME [--force]           Immediate virtual reset
   restart NAME [--timeout SEC] [--force]   Graceful shutdown then start
   delete NAME
-  disk-add NAME --size SIZE [--file FILE] [--format qcow2|raw] [--bus virtio|sata|scsi]
-  disk-import-stdin NAME FILE [--format qcow2|raw|vmdk] [--bus virtio|sata|scsi]
+  disk-add NAME --size SIZE [--file FILE] [--format qcow2|raw] [--bus virtio|sata|scsi] [--location local|peer:NODE_ID]
+  disk-import-stdin NAME FILE [--format qcow2|raw|vmdk] [--bus virtio|sata|scsi] [--location local|peer:NODE_ID]
   disk-download NAME INDEX
   disk-remove NAME INDEX [--delete-file]
   disk-resize NAME INDEX SIZE
@@ -48,7 +48,9 @@ Create options:
   --disk SIZE       e.g. 40G; omit for no initial disk
   --disk-format F   qcow2|raw
   --disk-bus B      virtio|sata|scsi
+  --disk-location L local or peer:NODE_ID
   --iso FILE        filename from shared image store
+  --iso-peer ID     paired host that stores the ISO
   --network M       nat|bridge|overlay|none
   --bridge BR       required when network=bridge
   --overlay NAME    required when network=overlay (a named VMAPI L2 overlay)
@@ -69,6 +71,12 @@ TXT
 valid_nic_model() { [[ $1 == virtio-net-pci || $1 == e1000 || $1 == e1000e || $1 == rtl8139 ]] || die "Unsupported NIC model: $1"; }
 valid_disk_format() { [[ $1 == qcow2 || $1 == raw || $1 == vmdk ]] || die "Unsupported disk format: $1"; }
 valid_disk_bus() { [[ $1 == virtio || $1 == sata || $1 == scsi ]] || die "Unsupported disk bus: $1"; }
+valid_storage_location() {
+  local location=${1:-local}
+  [[ $location == local ]] && return 0
+  [[ $location == peer:* ]] || die "Storage location must be local or peer:NODE_ID"
+  valid_peer_node_id "${location#peer:}"
+}
 valid_mac() { [[ $1 =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || die "Invalid MAC address: $1"; }
 valid_bridge() { [[ $1 =~ ^[A-Za-z0-9_.:-]{1,31}$ ]] || die "Invalid bridge name: $1"; }
 valid_vlan() { [[ ${1:-} =~ ^[0-9]{1,4}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 4094 )) || die "Invalid VLAN ID: ${1:-}; expected 1-4094"; }
@@ -97,14 +105,14 @@ cmd_create() {
   mkdir -p "$VM_ROOT" "$DISK_ROOT" "$ISO_ROOT"
   [[ ! -e "$VM_ROOT/$name" && ! -e "$DISK_ROOT/$name" ]] || die "VM already exists: $name"
 
-  local memory=$DEFAULT_MEMORY_MB cpus=$DEFAULT_VCPUS disk='' disk_format=$DEFAULT_DISK_FORMAT disk_bus=$DEFAULT_DISK_BUS
-  local iso='' network=nat bridge='' overlay='' vlan='' nic_model=$DEFAULT_NIC_MODEL autostart=false firmware=bios
+  local memory=$DEFAULT_MEMORY_MB cpus=$DEFAULT_VCPUS disk='' disk_format=$DEFAULT_DISK_FORMAT disk_bus=$DEFAULT_DISK_BUS disk_location=local
+  local iso='' iso_peer='' network=nat bridge='' overlay='' vlan='' nic_model=$DEFAULT_NIC_MODEL autostart=false firmware=bios
   local machine=$DEFAULT_MACHINE cpu=$DEFAULT_CPU allow_tcg=false vnc_display='' vnc_bind=$DEFAULT_VNC_BIND display=vnc boot=c
   while (($#)); do
     case "$1" in
       --memory) memory=${2:?}; shift 2;; --cpus) cpus=${2:?}; shift 2;; --disk) disk=${2:?}; shift 2;;
-      --disk-format) disk_format=${2:?}; shift 2;; --disk-bus) disk_bus=${2:?}; shift 2;;
-      --iso) iso=${2:?}; shift 2;; --network) network=${2:?}; shift 2;; --bridge) bridge=${2:?}; shift 2;; --overlay) overlay=${2:?}; shift 2;;
+      --disk-format) disk_format=${2:?}; shift 2;; --disk-bus) disk_bus=${2:?}; shift 2;; --disk-location) disk_location=${2:?}; shift 2;;
+      --iso) iso=${2:?}; shift 2;; --iso-peer) iso_peer=${2:?}; shift 2;; --network) network=${2:?}; shift 2;; --bridge) bridge=${2:?}; shift 2;; --overlay) overlay=${2:?}; shift 2;;
       --nic-model) nic_model=${2:?}; shift 2;; --vlan) vlan=${2:?}; shift 2;; --autostart) autostart=${2:?}; shift 2;;
       --firmware) firmware=${2:?}; shift 2;; --machine) machine=${2:?}; shift 2;; --cpu) cpu=${2:?}; shift 2;; --emulation) allow_tcg=${2:?}; shift 2;;
       --vnc-display) vnc_display=${2:?}; shift 2;; --vnc-bind) vnc_bind=${2:?}; shift 2;;
@@ -113,7 +121,7 @@ cmd_create() {
     esac
   done
   validate_positive_int "$memory"; validate_positive_int "$cpus"; validate_bool "$autostart"; validate_bool "$allow_tcg"
-  [[ -z "$disk" ]] || validate_size "$disk"; valid_disk_format "$disk_format"; valid_disk_bus "$disk_bus"; valid_nic_model "$nic_model"
+  [[ -z "$disk" ]] || validate_size "$disk"; valid_disk_format "$disk_format"; valid_disk_bus "$disk_bus"; valid_storage_location "$disk_location"; valid_nic_model "$nic_model"
   [[ $network == nat || $network == bridge || $network == overlay || $network == none ]] || die "network must be nat, bridge, overlay, or none"
   [[ $network != bridge ]] || { [[ -n "$bridge" ]] || die "--bridge is required for bridged networking"; valid_bridge "$bridge"; }
   [[ $network != overlay ]] || { [[ -n "$overlay" ]] || die "--overlay is required for overlay networking"; bridge=$(overlay_bridge "$overlay"); }
@@ -121,14 +129,16 @@ cmd_create() {
   [[ $firmware == bios || $firmware == uefi ]] || die "firmware must be bios or uefi"
   [[ $display == vnc || $display == none ]] || die "display must be vnc or none"
   [[ $boot =~ ^[acdn]{1,4}$ ]] || die "Invalid QEMU boot order: $boot"
-  [[ -z "$iso" ]] || resolve_image "$iso" >/dev/null
+  [[ -z "$iso_peer" ]] || valid_peer_node_id "$iso_peer"
+  [[ -z "$iso" ]] || resolve_image "$iso" "$iso_peer" >/dev/null
   if [[ $display == vnc ]]; then
     [[ -n "$vnc_display" ]] || vnc_display=$(next_vnc_display)
     validate_int "$vnc_display"; (( vnc_display >= 0 && vnc_display < 100 )) || die "VNC display out of range"
   fi
 
-  local dir="$VM_ROOT/$name" diskdir="$DISK_ROOT/$name" conf="$VM_ROOT/$name/vm.conf"
+  local dir="$VM_ROOT/$name" diskdir conf="$VM_ROOT/$name/vm.conf"
   mkdir -m 0750 -p "$dir/runtime"
+  diskdir=$(disk_location_dir "$name" "$disk_location")
   mkdir -m 0750 -p "$diskdir"
   local uuid; uuid=$(cat /proc/sys/kernel/random/uuid)
   cat > "$conf" <<CFG
@@ -146,6 +156,7 @@ VNC_BIND=$vnc_bind
 VNC_DISPLAY=$vnc_display
 BOOT_ORDER=$boot
 ISO=$iso
+ISO_PEER=$iso_peer
 CLOUD_INIT=false
 CFG
   chmod 0640 "$conf"
@@ -163,6 +174,7 @@ CFG
 DISK_0_FILE=disk0.$disk_format
 DISK_0_FORMAT=$disk_format
 DISK_0_BUS=$disk_bus
+DISK_0_LOCATION=$disk_location
 CFG
   fi
 
@@ -180,6 +192,15 @@ CFG
   printf '%s\n' "$name"
 }
 
+cmd_iso_set() {
+  local name=${1:?} value=${2-} peer=${3-}
+  require_vm "$name"; require_stopped "$name"
+  [[ -z $peer ]] || valid_peer_node_id "$peer"
+  [[ -z $value ]] || resolve_image "$value" "$peer" >/dev/null
+  cfg_set "$name" ISO "$value"
+  cfg_set "$name" ISO_PEER "$peer"
+}
+
 cmd_set() {
   local name=${1:?} field=${2:?} value=${3-}
   require_vm "$name"; require_stopped "$name"
@@ -192,7 +213,7 @@ cmd_set() {
     cpu) [[ $value =~ ^[A-Za-z0-9._,+-]+$ ]] || die "Invalid CPU value"; key=CPU;;
     emulation|allow_tcg) validate_bool "$value"; key=ALLOW_TCG;;
     firmware) [[ $value == bios || $value == uefi ]] || die "firmware must be bios or uefi"; key=FIRMWARE;;
-    iso) [[ -z $value ]] || resolve_image "$value" >/dev/null; key=ISO;;
+    iso) [[ -z $value ]] || resolve_image "$value" "$(cfg_get_file "$(vm_conf "$name")" ISO_PEER '')" >/dev/null; key=ISO;;
     boot|boot_order) [[ $value =~ ^[acdn]{1,4}$ ]] || die "Invalid boot order"; key=BOOT_ORDER;;
     display) [[ $value == vnc || $value == none ]] || die "display must be vnc or none"; key=DISPLAY;;
     vnc_bind) key=VNC_BIND;;
@@ -261,39 +282,40 @@ cmd_cloud_init_disable() {
 
 cmd_disk_add() {
   local name=${1:?}; shift; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"
-  local size='' file='' format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS
+  local size='' file='' format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS location=local
   while (($#)); do case "$1" in
-    --size) size=${2:?}; shift 2;; --file) file=${2:?}; shift 2;; --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
-  [[ -n $size ]] || die "--size is required"; validate_size "$size"; valid_disk_format "$format"; valid_disk_bus "$bus"
+    --size) size=${2:?}; shift 2;; --file) file=${2:?}; shift 2;; --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; --location) location=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  [[ -n $size ]] || die "--size is required"; validate_size "$size"; valid_disk_format "$format"; valid_disk_bus "$bus"; valid_storage_location "$location"
   local conf; conf=$(vm_conf "$name"); local idx; idx=$(next_index "$conf" DISK)
   [[ -n $file ]] || file="disk${idx}.${format}"; validate_filename "$file"
-  [[ ! -e "$(disk_file "$name" "$file")" && ! -e "$(vm_dir "$name")/$file" ]] || die "Disk file already exists: $file"
-  install -d -m 0750 "$(disk_dir "$name")"
-  need_cmd "$QEMU_IMG"; "$QEMU_IMG" create -f "$format" "$(disk_file "$name" "$file")" "$size" >/dev/null
-  cfg_set_file "$conf" "DISK_${idx}_FILE" "$file"; cfg_set_file "$conf" "DISK_${idx}_FORMAT" "$format"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$bus"
+  local target; target=$(disk_location_file "$name" "$file" "$location")
+  [[ ! -e $target && ! -e "$(vm_dir "$name")/$file" ]] || die "Disk file already exists: $file"
+  if [[ $location == local ]]; then install -d -m 0750 "$(dirname "$target")"; else [[ -d $(dirname "$target") ]] || die "Peer disk storage is unavailable"; fi
+  need_cmd "$QEMU_IMG"; "$QEMU_IMG" create -f "$format" "$target" "$size" >/dev/null
+  cfg_set_file "$conf" "DISK_${idx}_FILE" "$file"; cfg_set_file "$conf" "DISK_${idx}_FORMAT" "$format"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$bus"; cfg_set_file "$conf" "DISK_${idx}_LOCATION" "$location"
   printf '%s\n' "$idx"
 }
 cmd_disk_import_stdin() {
   local name=${1:?} file=${2:?}; shift 2; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"
-  local format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS
+  local format=$DEFAULT_DISK_FORMAT bus=$DEFAULT_DISK_BUS location=local
   while (($#)); do case "$1" in
-    --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
-  validate_filename "$file"; valid_disk_format "$format"; valid_disk_bus "$bus"
-  local target; target=$(disk_file "$name" "$file")
+    --format) format=${2:?}; shift 2;; --bus) bus=${2:?}; shift 2;; --location) location=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
+  validate_filename "$file"; valid_disk_format "$format"; valid_disk_bus "$bus"; valid_storage_location "$location"
+  local target dir; target=$(disk_location_file "$name" "$file" "$location"); dir=$(dirname "$target")
   [[ ! -e $target && ! -e "$(vm_dir "$name")/$file" ]] || die "Disk file already exists: $file"
-  install -d -m 0750 "$(disk_dir "$name")"
-  local tmp; tmp=$(mktemp "$(disk_dir "$name")/.upload.XXXXXX"); trap 'rm -f -- "$tmp"' RETURN
+  if [[ $location == local ]]; then install -d -m 0750 "$dir"; else [[ -d $dir ]] || die "Peer disk storage is unavailable"; fi
+  local tmp; tmp=$(mktemp "$dir/.upload.XXXXXX"); trap 'rm -f -- "$tmp"' RETURN
   cat > "$tmp"; [[ -s $tmp ]] || die 'Upload body was empty'
   chmod 0640 "$tmp"; mv "$tmp" "$target"; trap - RETURN
   local conf idx; conf=$(vm_conf "$name"); idx=$(next_index "$conf" DISK)
-  cfg_set_file "$conf" "DISK_${idx}_FILE" "$file"; cfg_set_file "$conf" "DISK_${idx}_FORMAT" "$format"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$bus"
+  cfg_set_file "$conf" "DISK_${idx}_FILE" "$file"; cfg_set_file "$conf" "DISK_${idx}_FORMAT" "$format"; cfg_set_file "$conf" "DISK_${idx}_BUS" "$bus"; cfg_set_file "$conf" "DISK_${idx}_LOCATION" "$location"
   printf '%s\n' "$idx"
 }
 cmd_disk_download() {
   local name=${1:?} idx=${2:?}; require_vm "$name"; validate_int "$idx"
   local file; file=$(cfg_get_file "$(vm_conf "$name")" "DISK_${idx}_FILE" '')
   [[ -n $file ]] || die "Disk index not found: $idx"
-  local path; path=$(vm_disk_path "$name" "$file")
+  local path; path=$(vm_disk_path_index "$name" "$idx")
   [[ -f $path ]] || die "Disk file missing: $path"
   cat -- "$path"
 }
@@ -302,16 +324,18 @@ cmd_disk_remove() {
   local delete=false; [[ ${1:-} == --delete-file ]] && delete=true
   local conf; conf=$(vm_conf "$name"); local file; file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
   [[ -n $file ]] || die "Disk index not found: $idx"
+  local path; path=$(vm_disk_path_index "$name" "$idx")
   cfg_delete_prefix_file "$conf" "DISK_${idx}_"
-  $delete && rm -f -- "$(vm_disk_path "$name" "$file")"
+  $delete && rm -f -- "$path"
 }
 
 
 cmd_disk_resize() {
   local name=${1:?} idx=${2:?} size=${3:?}; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"; validate_int "$idx"; validate_size "$size"
   local conf file; conf=$(vm_conf "$name"); file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
-  [[ -n $file && -f "$(vm_disk_path "$name" "$file")" ]] || die "Disk index not found: $idx"
-  need_cmd "$QEMU_IMG"; "$QEMU_IMG" resize "$(vm_disk_path "$name" "$file")" "$size" >/dev/null
+  local path; path=$(vm_disk_path_index "$name" "$idx")
+  [[ -n $file && -f "$path" ]] || die "Disk index not found: $idx"
+  need_cmd "$QEMU_IMG"; "$QEMU_IMG" resize "$path" "$size" >/dev/null
 }
 cmd_disk_set() {
   local name=${1:?} idx=${2:?} field=${3:?} value=${4:?}; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"; validate_int "$idx"
@@ -405,7 +429,7 @@ build_qemu_args() {
   local sata_slot=0 scsi_slot=0
   while read -r idx; do
     file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" ''); format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2); bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" virtio)
-    diskpath=$(vm_disk_path "$name" "$file")
+    diskpath=$(vm_disk_path_index "$name" "$idx")
     [[ -f "$diskpath" ]] || die "Disk file missing: $diskpath"
     case "$bus" in
       virtio) QEMU_ARGS+=(-drive "file=$diskpath,format=$format,if=none,id=drive$idx,cache=none,aio=threads" -device "virtio-blk-pci,drive=drive$idx,id=disk$idx");;
@@ -415,8 +439,8 @@ build_qemu_args() {
     esac
   done < <(indexes_for "$conf" DISK)
 
-  local iso; iso=$(cfg_get_file "$conf" ISO '')
-  if [[ -n $iso ]]; then local ipath; ipath=$(resolve_image "$iso"); QEMU_ARGS+=(-drive "file=$ipath,media=cdrom,readonly=on"); fi
+  local iso iso_peer; iso=$(cfg_get_file "$conf" ISO ''); iso_peer=$(cfg_get_file "$conf" ISO_PEER '')
+  if [[ -n $iso ]]; then local ipath; ipath=$(resolve_image "$iso" "$iso_peer"); QEMU_ARGS+=(-drive "file=$ipath,media=cdrom,readonly=on"); fi
   local cloud_init seed; cloud_init=$(cfg_get_file "$conf" CLOUD_INIT false); validate_bool "$cloud_init"
   if [[ $cloud_init == true ]]; then
     seed="$(cloud_init_dir "$name")/seed.iso"; [[ -s $seed ]] || die "cloud-init seed ISO is missing: $seed"
@@ -551,8 +575,13 @@ cmd_reboot() {
 }
 cmd_delete() {
   local name=${1:?}; require_vm "$name"; require_stopped "$name"; require_no_replication "$name"
-  local d; d=$(vm_dir "$name")
+  local d conf idx path; d=$(vm_dir "$name"); conf=$(vm_conf "$name")
   [[ "$d" == "$VM_ROOT/"* && "$d" != "$VM_ROOT/" ]] || die "Refusing unsafe delete path"
+  while IFS= read -r idx; do
+    [[ -n $idx ]] || continue
+    path=$(vm_disk_path_index "$name" "$idx")
+    rm -f -- "$path"
+  done < <(indexes_for "$conf" DISK)
   local disks; disks=$(disk_dir "$name")
   [[ "$disks" == "$DISK_ROOT/"* && "$disks" != "$DISK_ROOT/" ]] || die "Refusing unsafe disk delete path"
   rm -rf --one-file-system -- "$d"
@@ -575,7 +604,7 @@ main() {
   case "$cmd" in
     help|-h|--help) usage;; list) cmd_list "$@";; show) cmd_show "$@";; status) cmd_status "$@";; create) cmd_create "$@";; set) cmd_set "$@";;
     start) cmd_start "$@";; stop) cmd_stop "$@";; shutdown) cmd_shutdown "$@";; reboot) cmd_reboot "$@";; restart) cmd_restart "$@";; delete) cmd_delete "$@";;
-    disk-add) cmd_disk_add "$@";; disk-import-stdin) cmd_disk_import_stdin "$@";; disk-download) cmd_disk_download "$@";; disk-remove) cmd_disk_remove "$@";; disk-resize) cmd_disk_resize "$@";; disk-set) cmd_disk_set "$@";; nic-add) cmd_nic_add "$@";; nic-remove) cmd_nic_remove "$@";; nic-set) cmd_nic_set "$@";;
+    disk-add) cmd_disk_add "$@";; disk-import-stdin) cmd_disk_import_stdin "$@";; disk-download) cmd_disk_download "$@";; disk-remove) cmd_disk_remove "$@";; disk-resize) cmd_disk_resize "$@";; disk-set) cmd_disk_set "$@";; iso-set) cmd_iso_set "$@";; nic-add) cmd_nic_add "$@";; nic-remove) cmd_nic_remove "$@";; nic-set) cmd_nic_set "$@";;
     pci-add) cmd_pci_add "$@";; pci-remove) cmd_pci_remove "$@";; cloud-init-set) cmd_cloud_init_set "$@";; cloud-init-show) cmd_cloud_init_show "$@";; cloud-init-disable) cmd_cloud_init_disable "$@";; console-info) cmd_console_info "$@";; command) cmd_command "$@";;
     *) usage >&2; die "Unknown command: $cmd";;
   esac

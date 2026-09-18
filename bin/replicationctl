@@ -107,7 +107,7 @@ start_replication(){
   conf=$(vm_conf "$vm")
   trap 'stop_replication "$vm" true >/dev/null 2>&1 || true' ERR
   while IFS= read -r idx; do
-    source=$(vm_disk_path "$vm" "$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')")
+    source=$(vm_disk_path_index "$vm" "$idx")
     [[ -f $source ]] || die "Disk file missing: $source"
     bytes=$("$QEMU_IMG" info --output=json "$source" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
     validate_positive_int "$bytes"

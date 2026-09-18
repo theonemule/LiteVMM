@@ -59,6 +59,11 @@ vmapi_has_capability() {
 # they can be placed on storage with different performance or retention needs.
 VM_ROOT=${VM_ROOT:-/var/lib/vmapi/vms}
 DISK_ROOT=${DISK_ROOT:-/var/lib/vmapi/disks}
+BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
+BACKPLANE_MOUNT_ROOT=${VMAPI_BACKPLANE_MOUNT_ROOT:-/var/lib/vmapi/peer-storage}
+NODE_ID_FILE=${VMAPI_NODE_ID_FILE:-/etc/vmapi/node-id}
+BACKPLANECTL=${BACKPLANECTL:-${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}}
+PEERCTL=${PEERCTL:-${VMAPI_PEERCTL:-/usr/local/bin/peerctl}}
 # IMAGE_ROOT was the original public setting.  Keep it as a fallback so an
 # upgraded installation that has not yet changed its config continues to find
 # its existing installation media.
@@ -100,8 +105,57 @@ vm_dir() { validate_vm_name "$1"; printf '%s/%s\n' "$VM_ROOT" "$1"; }
 vm_conf() { printf '%s/vm.conf\n' "$(vm_dir "$1")"; }
 disk_dir() { validate_vm_name "$1"; printf '%s/%s\n' "$DISK_ROOT" "$1"; }
 disk_file() { validate_vm_name "$1"; validate_filename "$2"; printf '%s/%s\n' "$(disk_dir "$1")" "$2"; }
+valid_peer_node_id() { [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die "Invalid peer node id: ${1:-}"; }
+vmapi_node_id() {
+  local id=''
+  if [[ -r $NODE_ID_FILE ]]; then
+    id=$(cat "$NODE_ID_FILE" 2>/dev/null || true)
+  elif command -v sudo >/dev/null 2>&1 && sudo -n "$PEERCTL" node-id >/dev/null 2>&1; then
+    id=$(sudo -n "$PEERCTL" node-id)
+  elif [[ -x $PEERCTL ]]; then
+    id=$("$PEERCTL" node-id 2>/dev/null || true)
+  fi
+  valid_peer_node_id "$id"
+  printf '%s\n' "${id,,}"
+}
+peer_storage_dir() {
+  local peer=${1:?peer required} kind=${2:?storage class required} name=${3:-} out
+  valid_peer_node_id "$peer"; peer=${peer,,}
+  if command -v sudo >/dev/null 2>&1 && sudo -n "$BACKPLANECTL" path "$peer" "$kind" ${name:+"$name"} >/dev/null 2>&1; then
+    out=$(sudo -n "$BACKPLANECTL" path "$peer" "$kind" ${name:+"$name"})
+  else
+    out=$("$BACKPLANECTL" path "$peer" "$kind" ${name:+"$name"})
+  fi
+  [[ $out == /* ]] || die "Peer storage path is unavailable for $peer"
+  printf '%s\n' "$out"
+}
+peer_shared_path() {
+  local peer=${1:?peer required} kind=${2:?shared storage class required} name=${3:-} out
+  valid_peer_node_id "$peer"; peer=${peer,,}
+  if command -v sudo >/dev/null 2>&1 && sudo -n "$BACKPLANECTL" shared-path "$peer" "$kind" ${name:+"$name"} >/dev/null 2>&1; then
+    out=$(sudo -n "$BACKPLANECTL" shared-path "$peer" "$kind" ${name:+"$name"})
+  else
+    out=$("$BACKPLANECTL" shared-path "$peer" "$kind" ${name:+"$name"})
+  fi
+  [[ $out == /* ]] || die "Peer shared storage path is unavailable for $peer"
+  printf '%s\n' "$out"
+}
+disk_location_dir() {
+  local name=$1 location=${2:-local} peer
+  validate_vm_name "$name"
+  case "$location" in
+    ''|local) disk_dir "$name";;
+    peer:*) peer=${location#peer:}; valid_peer_node_id "$peer"; peer_storage_dir "$peer" vm-disks "$name";;
+    *) die "Invalid disk storage location: $location";;
+  esac
+}
+disk_location_file() {
+  local name=$1 file=$2 location=${3:-local}
+  validate_filename "$file"
+  printf '%s/%s\n' "$(disk_location_dir "$name" "$location")" "$file"
+}
 # Existing installations stored disks beside vm.conf.  Read those paths as a
-# compatibility fallback; all newly-created disks use disk_dir().
+# compatibility fallback; all newly-created local disks use disk_dir().
 vm_disk_path() {
   local name=$1 file=$2 primary legacy
   primary=$(disk_file "$name" "$file")
@@ -109,6 +163,18 @@ vm_disk_path() {
   [[ -f $primary ]] && { printf '%s\n' "$primary"; return; }
   [[ -f $legacy ]] && { printf '%s\n' "$legacy"; return; }
   printf '%s\n' "$primary"
+}
+vm_disk_path_index() {
+  local name=$1 idx=$2 conf file location
+  require_vm "$name"; validate_int "$idx"; conf=$(vm_conf "$name")
+  file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
+  [[ -n $file ]] || die "Disk index not found: $idx"
+  location=$(cfg_get_file "$conf" "DISK_${idx}_LOCATION" local)
+  if [[ $location == local || -z $location ]]; then
+    vm_disk_path "$name" "$file"
+  else
+    disk_location_file "$name" "$file" "$location"
+  fi
 }
 require_vm() { [[ -f "$(vm_conf "$1")" ]] || die "VM does not exist: $1"; }
 
@@ -186,11 +252,16 @@ next_vnc_display() {
 }
 
 resolve_image() {
-  local name=${1:-}
+  local name=${1:-} peer=${2:-} path
   [[ -n "$name" ]] || { printf '\n'; return; }
   validate_filename "$name"
-  local path="$ISO_ROOT/$name"
-  [[ -f "$path" ]] || die "Image not found: $name"
+  if [[ -n $peer ]]; then
+    valid_peer_node_id "$peer"
+    path=$(peer_shared_path "$peer" isos "$name")
+  else
+    path="$ISO_ROOT/$name"
+  fi
+  [[ -f "$path" ]] || die "Image not found: $name${peer:+ on peer $peer}"
   printf '%s\n' "$path"
 }
 

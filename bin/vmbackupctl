@@ -101,7 +101,7 @@ stage_vm_disks() {
   while IFS= read -r idx; do
     file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
     [[ -n $file ]] || die "Disk index has no file name: $idx"
-    source=$(vm_disk_path "$name" "$file")
+    source=$(vm_disk_path_index "$name" "$idx")
     [[ -f $source ]] || die "Disk file missing: $source"
     cp --reflink=auto "$source" "$stage/$name/disks/$file" 2>/dev/null || cp "$source" "$stage/$name/disks/$file"
   done < <(indexes_for "$conf" DISK)
@@ -248,6 +248,12 @@ cmd_import_file() {
   fi
   mv "$stage/$name" "$VM_ROOT/$name"
   mv "$VM_ROOT/$name/disks" "$DISK_ROOT/$name"
+  # Restores are materialized onto this host's local disk store. A backup may
+  # have originated from peer-backed disks, so normalize restored locations.
+  conf="$VM_ROOT/$name/vm.conf"
+  while IFS= read -r idx; do
+    cfg_set_file "$conf" "DISK_${idx}_LOCATION" local
+  done < <(indexes_for "$conf" DISK)
   chown -R vmapi:vmapi "$VM_ROOT/$name" 2>/dev/null || true
   chown -R vmapi:vmapi "$DISK_ROOT/$name" 2>/dev/null || true
   chmod 0750 "$VM_ROOT/$name" "$VM_ROOT/$name/runtime" "$DISK_ROOT/$name" 2>/dev/null || true

@@ -600,7 +600,9 @@ case "${P[0]-}" in
           [[ -n $(param disk_size) ]] && args+=(--disk "$(param disk_size)")
           [[ -n $(param disk_format) ]] && args+=(--disk-format "$(param disk_format)")
           [[ -n $(param disk_bus) ]] && args+=(--disk-bus "$(param disk_bus)")
+          [[ -n $(param disk_location) ]] && args+=(--disk-location "$(param disk_location)")
           [[ -n $(param iso) ]] && args+=(--iso "$(param iso)")
+          [[ -n $(param iso_peer) ]] && args+=(--iso-peer "$(param iso_peer)")
           [[ -n $requested_network ]] && args+=(--network "$requested_network")
           [[ -n $(param bridge) ]] && args+=(--bridge "$(param bridge)")
           [[ -n $(param overlay) ]] && args+=(--overlay "$(param overlay)")
@@ -636,7 +638,7 @@ case "${P[0]-}" in
           DELETE) run_cmd vm_delete_cmd "$name" >/dev/null; reply '200 OK' '{"deleted":true}';;
           PATCH|POST)
             field=$(param field); value=$(param value); [[ -n $field ]] || error_reply '400 Bad Request' 'field is required'
-            run_cmd "$VMCTL" set "$name" "$field" "$value" >/dev/null; body=$(json_config "$name"); reply '200 OK' "$body";;
+            if [[ $field == iso ]]; then run_cmd "$VMCTL" iso-set "$name" "$value" "$(param peer_id)" >/dev/null; else run_cmd "$VMCTL" set "$name" "$field" "$value" >/dev/null; fi; body=$(json_config "$name"); reply '200 OK' "$body";;
           *) error_reply '405 Method Not Allowed' 'Unsupported method';;
         esac;;
       cloud-init)
@@ -697,6 +699,7 @@ case "${P[0]-}" in
           args=(disk-import-stdin "$name" "${P[4]}")
           [[ -n $(param format) ]] && args+=(--format "$(param format)")
           [[ -n $(param bus) ]] && args+=(--bus "$(param bus)")
+          [[ -n $(param location) ]] && args+=(--location "$(param location)")
           idx=$(run_cmd "$VMCTL" "${args[@]}")
           reply '201 Created' "{\"index\":$idx}"
         fi
@@ -714,6 +717,7 @@ case "${P[0]-}" in
           [[ -n $(param file) ]] && args+=(--file "$(param file)")
           [[ -n $(param format) ]] && args+=(--format "$(param format)")
           [[ -n $(param bus) ]] && args+=(--bus "$(param bus)")
+          [[ -n $(param location) ]] && args+=(--location "$(param location)")
           idx=$(run_cmd "$VMCTL" "${args[@]}"); reply '201 Created' "{\"index\":$idx}" 
         else
           case "$method" in
@@ -1021,7 +1025,7 @@ case "${P[0]-}" in
     if [[ -z ${P[1]-} ]]; then
       [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
       first=true; printf 'Status: 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\r\n['
-      while IFS=$'\t' read -r n s; do [[ -n $n ]] || continue; $first || printf ','; first=false; printf '{"name":"%s","bytes":%s}' "$(json_escape "$n")" "$s"; done < <("$IMAGECTL" list)
+      while IFS=$'\t' read -r n s m; do [[ -n $n ]] || continue; $first || printf ','; first=false; printf '{"name":"%s","bytes":%s,"modified":"%s"}' "$(json_escape "$n")" "$s" "$(json_escape "$m")"; done < <("$IMAGECTL" list)
       printf ']\n'; exit 0
     fi
     case "$method" in
