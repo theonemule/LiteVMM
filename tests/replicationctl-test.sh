@@ -29,8 +29,8 @@ env "${common[@]}" bash "$ROOT/bin/replicationctl" replica-purge "$id" true >/de
 
 # The mock mirrors real qemu-img >= 8.0 output: the protocol child node, whose
 # "virtual-size" is the host file length (196616), is printed before the
-# image's own fields. Images made by the mock "create" report the size they
-# were created with; anything else reports 1048576.
+# image's own fields. Replication reads source geometry from qemu-img, but QEMU
+# itself now creates the destination mirror image on the backplane.
 cat > "$T/qemu-img" <<'QEMU'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -41,8 +41,8 @@ case ${1:-} in
     if [[ -f $file ]] && grep -q '^SIZE=' "$file"; then size=$(sed -n 's/^SIZE=//p' "$file"); fi
     printf '{\n    "children": [\n        {\n            "name": "file",\n            "info": {\n                "children": [\n                ],\n                "virtual-size": 196616,\n                "filename": "%s",\n                "format": "file",\n                "actual-size": 200704\n            }\n        }\n    ],\n    "virtual-size": %s,\n    "filename": "%s",\n    "format": "qcow2",\n    "actual-size": 200704\n}\n' "$file" "$size" "$file";;
   create)
-    [[ $2 == -f && $3 == qcow2 ]]
-    printf 'create %s %s\n' "$4" "$5" >> "${QEMU_IMG_LOG:?}"; printf 'SIZE=%s\n' "$5" > "$4";;
+    echo "replication must not pre-create mirror targets with qemu-img" >&2
+    exit 19;;
   *) echo "unexpected qemu-img $*" >&2; exit 9;;
 esac
 QEMU
@@ -52,10 +52,6 @@ export VMAPI_LIB="$ROOT/lib/common.sh"
 export QEMU_IMG="$T/qemu-img"
 source <(sed '/^case ${1:-help} in/,$d' "$ROOT/bin/replicationctl")
 [[ $(image_virtual_size "$T/locked.qcow2") == 1048576 ]]
-touch "$T/replica-permissions.qcow2"
-chmod 0644 "$T/replica-permissions.qcow2"
-prepare_replica_file_access "$T/replica-permissions.qcow2"
-[[ $(stat -c %a "$T/replica-permissions.qcow2") == 660 ]]
 
 # --- start/resume lifecycle, run as separate processes like the real CLI ----
 PEER=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -83,35 +79,44 @@ indexes_for(){ printf '0\n'; }
 status_replication(){ printf '{"vm":"%s","configured":true}\n' "$1"; }
 qmp(){
   case $2 in
-    *query-block-jobs*) printf '%s\n' '{"return": []}';;
-    *drive-mirror*) printf '%s\n' "$2" >> "$T/qmp.log"; printf '%s\n' "$MIRROR_REPLY";;
-    *block-job-cancel*) printf '%s\n' "$2" >> "$T/qmp.log"; printf '%s\n' '{"return": {}}';;
+    *query-block-jobs*)
+      if [[ -f $T/job-active ]]; then printf '%s\n' '{"return": [{"device":"repl-0","type":"mirror","offset":1,"len":1048576,"ready":false}]}'
+      else printf '%s\n' '{"return": []}'; fi;;
+    *drive-mirror*)
+      printf '%s\n' "$2" >> "$T/qmp.log"
+      if [[ $MIRROR_REPLY == *'"error"'* ]]; then printf '%s\n' "$MIRROR_REPLY"
+      else printf 'qemu-created\n' > "$REMOTE/disk0.qcow2"; : > "$T/job-active"; printf '%s\n' "$MIRROR_REPLY"; fi;;
+    *block-job-cancel*) rm -f "$T/job-active"; printf '%s\n' "$2" >> "$T/qmp.log"; printf '%s\n' '{"return": {}}';;
     *) printf '%s\n' '{"return": {}}';;
   esac
 }
 "$@"
 HARNESS
-export ROOT T QEMU_IMG_LOG="$T/qemu-img.log" VMAPI_BACKPLANECTL="$T/backplanectl" VMAPI_PEERCTL="$T/peerctl" VMAPI_REPLICATION_JOB_ROOT="$JOBS"
+export ROOT T REMOTE QEMU_IMG_LOG="$T/qemu-img.log" VMAPI_BACKPLANECTL="$T/backplanectl" VMAPI_PEERCTL="$T/peerctl" VMAPI_REPLICATION_JOB_ROOT="$JOBS"
 : > "$QEMU_IMG_LOG"
 ok_reply='{"return": {}}'
 size_reply='{"timestamp": {"seconds": 1, "microseconds": 2}, "event": "BLOCK_JOB_COMPLETED", "data": {"device": "repl-0", "len": 0, "offset": 0, "speed": 0, "type": "mirror", "error": "Source and target image have different sizes"}}'
 
-# The replica must be created at the source's virtual size, not its file length.
-# A mirror rejected by QEMU must roll back the whole job (die() never fires ERR).
+# A rejected mirror must roll back the whole job. The target is deliberately
+# not pre-created: QEMU receives absolute-paths and owns image creation/size.
+printf 'stale-target\n' > "$REMOTE/disk0.qcow2"
 rc=0; MIRROR_REPLY=$size_reply bash "$T/harness.sh" start_replication demo "$PEER" 0 >/dev/null 2>"$T/start.err" || rc=$?
 [[ $rc -ne 0 ]]
 grep -Fq 'QMP rejected replication request' "$T/start.err"
-grep -qx "create $REMOTE/disk0.qcow2 1048576" "$QEMU_IMG_LOG"
+[[ ! -s $QEMU_IMG_LOG ]]
+grep -Fq '"mode":"absolute-paths"' "$T/qmp.log"
 [[ ! -e $JOBS/demo ]]
 grep -Fq '"execute":"block-job-cancel","arguments":{"device":"repl-0"}' "$T/qmp.log"
 grep -qx 'ACTIVE=false' "$REMOTE/disk0.meta"
 grep -qx 'BYTES=1048576' "$REMOTE/disk0.meta"
 
 # A successful start must keep its job once the process exits.
-: > "$T/qmp.log"
+: > "$T/qmp.log"; rm -f "$T/job-active"
 MIRROR_REPLY=$ok_reply bash "$T/harness.sh" start_replication demo "$PEER" 0 >/dev/null
 grep -qx 'DISK_0_BYTES=1048576' "$JOBS/demo/state.conf"
 grep -Fq '"job-id":"repl-0"' "$T/qmp.log"
+grep -Fq '"mode":"absolute-paths"' "$T/qmp.log"
+grep -qx 'qemu-created' "$REMOTE/disk0.qcow2"
 grep -qx 'ACTIVE=true' "$REMOTE/disk0.meta"
 # Stop must load the job state so it can cancel the mirror and retire the replica.
 MIRROR_REPLY=$ok_reply bash "$T/harness.sh" stop_replication demo true >/dev/null
@@ -126,15 +131,17 @@ printf 'PEER=%s\nSPEED=0\nOWNER=%s\nDISK_0_JOB=repl-0\nDISK_0_TARGET=%s\nDISK_0_
   "$PEER" "$OWNER" "$REMOTE/disk0.qcow2" "$REMOTE/disk0.meta" > "$JOBS/demo/state.conf"
 printf 'SIZE=196616\n' > "$REMOTE/disk0.qcow2"
 sed -i 's/^BYTES=.*/BYTES=196616/' "$REMOTE/disk0.meta"
-: > "$T/qmp.log"; : > "$QEMU_IMG_LOG"
+: > "$T/qmp.log"; : > "$QEMU_IMG_LOG"; rm -f "$T/job-active"
 MIRROR_REPLY=$ok_reply bash "$T/harness.sh" resume_replication demo
 grep -qx 'DISK_0_BYTES=1048576' "$JOBS/demo/state.conf"
 grep -qx 'BYTES=1048576' "$REMOTE/disk0.meta"
 grep -qx 'ACTIVE=true' "$REMOTE/disk0.meta"
-grep -qx 'SIZE=1048576' "$REMOTE/disk0.qcow2"
+grep -qx 'qemu-created' "$REMOTE/disk0.qcow2"
+[[ ! -s $QEMU_IMG_LOG ]]
+grep -Fq '"mode":"absolute-paths"' "$T/qmp.log"
 grep -Fq '"job-id":"repl-0"' "$T/qmp.log"
 
 grep -Fq 'drive-mirror' bin/replicationctl
-grep -Fq '"mode":"existing"' bin/replicationctl
+grep -Fq 'absolute-paths' bin/replicationctl
 grep -Fq 'nfs4-wss-backplane' bin/replicationctl
 echo 'replication backplane retention lifecycle: PASS'

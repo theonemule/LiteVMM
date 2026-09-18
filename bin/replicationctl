@@ -85,40 +85,32 @@ image_virtual_size(){
   printf '%s\n' "$bytes"
 }
 
-prepare_replica_file_access(){
-  local file=$1
-  # replicationctl is privileged but the running QEMU process belongs to
-  # vmapi. drive-mirror opens an existing destination for write, so a qcow2
-  # created by root with the default 0644 mode is unusable by QEMU.
-  chmod 0660 "$file"
-  if [[ $EUID -eq 0 ]] && id vmapi >/dev/null 2>&1; then
-    chown vmapi:vmapi "$file"
-  fi
-}
-
-ensure_replica_file(){
-  local file=$1 bytes=$2
-  need_cmd "$QEMU_IMG"
-  if [[ -f $file ]]; then
-    local current
-    current=$(image_virtual_size "$file")
-    if [[ $current != "$bytes" ]]; then
-      rm -f -- "$file"
-      "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null
-    fi
-  else
-    "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null
-  fi
-  prepare_replica_file_access "$file"
+prepare_new_replica_target(){
+  local file=$1 dir
+  dir=$(dirname -- "$file")
+  [[ -d $dir ]] || die "Replica directory is unavailable: $dir"
+  # Let QEMU create the mirror image itself. Pre-creating qcow2 with qemu-img
+  # and then using mode=existing makes QEMU enforce an exact size match before
+  # the copy starts; that has proven fragile across qcow2/QEMU versions. The
+  # backplane directory is already owned by vmapi and writable by the running
+  # QEMU process, so removing any stale target lets drive-mirror derive the
+  # destination geometry directly from the live source block node.
+  rm -f -- "$file"
 }
 
 start_mirror_job(){
-  local vm=$1 idx=$2 target=$3 job=$4 speed=$5 conf qid escaped payload out
+  local vm=$1 idx=$2 target=$3 job=$4 speed=$5 mode=${6:-existing} conf qid escaped payload out
   conf=$(vm_conf "$vm"); qid=$(disk_qemu_id "$conf" "$idx"); escaped=$(json_escape "$target")
-  payload='{"execute":"drive-mirror","arguments":{"device":"'"$qid"'","job-id":"'"$job"'","target":"'"$escaped"'","format":"qcow2","sync":"full","mode":"existing"'
+  [[ $mode == existing || $mode == absolute-paths ]] || die "Invalid mirror image mode: $mode"
+  payload='{"execute":"drive-mirror","arguments":{"device":"'"$qid"'","job-id":"'"$job"'","target":"'"$escaped"'","format":"qcow2","sync":"full","mode":"'"$mode"'"'
   ((speed>0)) && payload+=',"speed":'"$speed"
   payload+='}}'
   out=$(qmp "$vm" "$payload"); qmp_ok "$out"
+  # drive-mirror returns before the background copy completes. A target-open or
+  # geometry error can arrive immediately afterwards as BLOCK_JOB_COMPLETED;
+  # verify that the mirror job actually survived command acceptance.
+  sleep 0.1
+  [[ -n $(query_job_json "$vm" "$job") ]] || die "Replication mirror for $vm disk $idx stopped immediately after it was started"
 }
 
 backplane_ready(){
@@ -150,11 +142,11 @@ start_replication(){
     [[ -f $source ]] || die "Disk file missing: $source"
     bytes=$(image_virtual_size "$source")
     target="$remote/disk${idx}.qcow2"; meta="$remote/disk${idx}.meta"; job="repl-$idx"
-    ensure_replica_file "$target" "$bytes"
+    prepare_new_replica_target "$target"
     write_meta "$meta" "$owner" "$vm" "$idx" "$bytes" "disk${idx}.qcow2" true
     printf 'DISK_%s_JOB=%q\nDISK_%s_TARGET=%q\nDISK_%s_META=%q\nDISK_%s_BYTES=%q\n' \
       "$idx" "$job" "$idx" "$target" "$idx" "$meta" "$idx" "$bytes" >> "$state"
-    start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
+    start_mirror_job "$vm" "$idx" "$target" "$job" "$speed" absolute-paths
   done < <(indexes_for "$conf" DISK)
   trap - EXIT
   status_replication "$vm"
@@ -186,8 +178,10 @@ resume_replication(){
           if [[ -n $OWNER && -n $FILE_NAME ]]; then write_meta "$meta" "$OWNER" "$vm" "$idx" "$bytes" "$FILE_NAME" true; fi
         fi
       fi
-      ensure_replica_file "$target" "$bytes"
-      start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
+      # A missing mirror is resynchronised from the live source. Recreate the
+      # destination through QEMU rather than reusing/pre-sizing a qcow2 file.
+      prepare_new_replica_target "$target"
+      start_mirror_job "$vm" "$idx" "$target" "$job" "$speed" absolute-paths
     fi
     refresh_meta "$meta" true
   done < <(state_disk_indexes "$state")
