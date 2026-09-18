@@ -398,10 +398,32 @@ cmd_proxy() {
 }
 
 cmd_migrate() {
-  local name=${1:?VM name required} id=${2:?peer node id required} result archive path
+  local name=${1:?VM name required} id=${2:?peer node id required} result archive path remote_vms remote_out scratch
   validate_vm_name "$name"; valid_id "$id"; load_peer "$id"; [[ -n $PEER_URL ]] || die 'Peer has no API URL; set its endpoint first'; [[ $($VMCTL status "$name") == stopped ]] || die "VM must be stopped before migration: $name"
-  result=$("$BACKUPCTL" create "$name" --label migration); archive=$(json_field "$result" archive); path=$(json_field "$result" path); [[ -n $archive && -f $path ]] || die 'Migration archive creation failed'
-  cmd_proxy "$id" POST "/migrations/import/$archive" application/gzip < "$path" >/dev/null || die 'Peer import failed; source VM was retained'; "$VMCTL" delete "$name"
+  if [[ -x $REPLICATIONCTL ]]; then
+    local replication_status
+    replication_status=$("$REPLICATIONCTL" status "$name" 2>/dev/null || true)
+    [[ $replication_status != *'"configured":true'* ]] || die "Stop live replication before migrating VM: $name"
+  fi
+
+  if ! remote_vms=$(cmd_proxy "$id" GET /vms 2>&1); then
+    die "Could not query destination peer before migration: $remote_vms"
+  fi
+  if printf '%s' "$remote_vms" | grep -Fq "\"name\":\"$name\""; then
+    die "Destination peer already contains VM $name; remove or rename it before migration"
+  fi
+
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/vmapi-migrate.XXXXXX")
+  trap 'rm -rf -- "$scratch"' RETURN
+  result=$("$BACKUPCTL" create "$name" --label migration --destination "$scratch")
+  archive=$(json_field "$result" archive); path=$(json_field "$result" path)
+  [[ -n $archive && -f $path ]] || die 'Migration archive creation failed'
+
+  if ! remote_out=$(cmd_proxy "$id" POST "/migrations/import/$archive" application/gzip < "$path" 2>&1); then
+    die "Peer import failed; source VM was retained: $remote_out"
+  fi
+  "$VMCTL" delete "$name"
+  rm -rf -- "$scratch"; trap - RETURN
   printf '{"migrated":true,"vm":"%s","peer":"%s","archive":"%s"}\n' "$(json_escape "$name")" "$(json_escape "$id")" "$(json_escape "$archive")"
 }
 

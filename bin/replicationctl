@@ -73,6 +73,17 @@ image_virtual_size(){
   printf '%s\n' "$bytes"
 }
 
+prepare_replica_file_access(){
+  local file=$1
+  # replicationctl is privileged but the running QEMU process belongs to
+  # vmapi. drive-mirror opens an existing destination for write, so a qcow2
+  # created by root with the default 0644 mode is unusable by QEMU.
+  chmod 0660 "$file"
+  if [[ $EUID -eq 0 ]] && id vmapi >/dev/null 2>&1; then
+    chown vmapi:vmapi "$file"
+  fi
+}
+
 ensure_replica_file(){
   local file=$1 bytes=$2
   need_cmd "$QEMU_IMG"
@@ -86,6 +97,7 @@ ensure_replica_file(){
   else
     "$QEMU_IMG" create -f qcow2 "$file" "$bytes" >/dev/null
   fi
+  prepare_replica_file_access "$file"
 }
 
 start_mirror_job(){

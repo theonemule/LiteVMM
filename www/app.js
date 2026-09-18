@@ -246,7 +246,7 @@
   async function collectHostInventory(path) {
     // Storage inventory is deliberately global: one pane includes this host and
     // every directly paired host regardless of the host currently selected.
-    const targets = [{peerId:'',label:hostLabelForPeer('')}, ...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,label:peer.label}))];
+    const targets = [{peerId:'',nodeId:state.hostCatalog.local?.node_id||'',label:hostLabelForPeer('')}, ...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,nodeId:peer.node_id,label:peer.label}))];
     const results = await Promise.all(targets.map(async target => {
       try {
         const data = await request(path, target.peerId ? {peerId:target.peerId} : {local:true});
@@ -256,7 +256,7 @@
       }
     }));
     return {
-      rows: results.flatMap(result=>result.data.map(item=>({...item,storage_peer_id:result.target.peerId,storage_host:result.target.label}))),
+      rows: results.flatMap(result=>result.data.map(item=>({...item,storage_peer_id:result.target.peerId,storage_node_id:result.target.nodeId,storage_host:result.target.label}))),
       errors: results.filter(result=>result.error).map(result=>`${result.target.label}: ${result.error.message}`),
     };
   }
@@ -1400,9 +1400,26 @@ ${commandLine(ci)} < user-data`;
         <td>${esc(b.storage_host)}</td>
         <td>${esc(formatDate(b.modified)||'-')}</td>
         <td>${bytes(b.bytes)}</td>
-        <td><div class="action-row"><button class="btn btn-sm btn-outline-secondary" data-backup-download="${esc(b.archive)}" data-vm="${esc(b.vm)}" data-peer="${esc(b.storage_peer_id||'')}">Download</button><button class="btn btn-sm btn-outline-danger" data-backup-delete="${esc(b.archive)}" data-vm="${esc(b.vm)}" data-peer="${esc(b.storage_peer_id||'')}">Delete</button></div></td>
+        <td><div class="action-row"><button class="btn btn-sm btn-outline-primary" data-backup-restore="${esc(b.archive)}" data-vm="${esc(b.vm)}" data-owner="${esc(b.owner||'')}" data-storage-node="${esc(b.storage_node_id||'')}" data-storage-peer="${esc(b.storage_peer_id||'')}">Restore</button><button class="btn btn-sm btn-outline-secondary" data-backup-download="${esc(b.archive)}" data-vm="${esc(b.vm)}" data-peer="${esc(b.storage_peer_id||'')}">Download</button><button class="btn btn-sm btn-outline-danger" data-backup-delete="${esc(b.archive)}" data-vm="${esc(b.vm)}" data-peer="${esc(b.storage_peer_id||'')}">Delete</button></div></td>
       </tr>`);
       $('#backupInventoryTable').innerHTML=table(['VM','Backup','Stored on','Date','Size',''],rows,'No backups match the selected filters.');
+      $$('[data-backup-restore]').forEach(btn=>btn.onclick=()=>{
+        const vm=btn.dataset.vm,archive=btn.dataset.backupRestore,owner=btn.dataset.owner||'',storageNode=btn.dataset.storageNode||'',storagePeer=btn.dataset.storagePeer||'';
+        const localNode=state.hostCatalog.local?.node_id||'';
+        let targetPeer='',sourcePeer='';
+        if(owner){
+          targetPeer=owner===localNode?'':owner;
+          sourcePeer=storageNode && storageNode!==owner ? storageNode : '';
+        }else{
+          targetPeer=storagePeer;
+        }
+        const targetLabel=targetPeer?hostLabelForPeer(targetPeer):hostLabelForPeer('');
+        confirmAction('Restore backup',`Restore ${archive} as ${vm} on ${targetLabel}? If ${vm} already exists it must be stopped and its current disks/configuration will be replaced after a rollback copy is created.`,async()=>{
+          await request('/backups/restore',{method:'POST',form:{name:vm,archive,replace:'true',peer_id:sourcePeer},...(targetPeer?{peerId:targetPeer}:{local:true})});
+          toast(`${vm}: backup restored`);
+          await loadBackups();
+        });
+      });
       $$('[data-backup-download]').forEach(btn=>btn.onclick=()=>downloadFile(`/backups/${encodeURIComponent(btn.dataset.vm)}/${encodeURIComponent(btn.dataset.backupDownload)}`,btn.dataset.peer||''));
       $$('[data-backup-delete]').forEach(btn=>btn.onclick=()=>confirmAction('Delete backup',`Delete ${btn.dataset.backupDelete} from ${hostLabelForPeer(btn.dataset.peer||'')}?`,async()=>{
         await request(`/backups/${encodeURIComponent(btn.dataset.vm)}/${encodeURIComponent(btn.dataset.backupDelete)}`,{method:'DELETE',...(btn.dataset.peer?{peerId:btn.dataset.peer}:{local:true})});

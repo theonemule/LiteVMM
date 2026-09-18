@@ -101,6 +101,56 @@ result=$(PATH="$T/bin:$PATH" VMAPI_TEST_ROOT="$ROOT" VMAPI_TEST_TMP="$T" VMAPI_L
 result=$(PATH="$T/bin:$PATH" VMAPI_TEST_ROOT="$ROOT" VMAPI_TEST_TMP="$T" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" CURL_BIN="$T/curl" bash "$ROOT/bin/peerctl" proxy "$b_id" GET '/docker/networks?name=overlay-net')
 [[ $result == '{"ok":true}' ]]
 
+# Migration uses a transient archive, streams it to the paired API, and only
+# deletes the source VM after the peer import succeeds.
+cat > "$T/migrate-vmctl" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+case "$1" in
+  status) printf 'stopped\n';;
+  delete) printf '%s\n' "$2" >> "$VMAPI_MIGRATE_DELETE_LOG";;
+  *) exit 2;;
+esac
+MOCK
+cat > "$T/migrate-backupctl" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $1 == create ]] || exit 2
+vm=$2; shift 2; destination=''
+while (($#)); do case "$1" in --destination) destination=$2; shift 2;; *) shift;; esac; done
+[[ -n $destination ]] || exit 3
+mkdir -p "$destination/$vm"
+archive="$vm-migration-test.tar.gz"
+printf 'migration-payload' > "$destination/$vm/$archive"
+printf '%s\n' "$destination" > "$VMAPI_MIGRATE_SCRATCH_LOG"
+printf '{"vm":"%s","archive":"%s","path":"%s/%s/%s"}\n' "$vm" "$archive" "$destination" "$vm" "$archive"
+MOCK
+cat > "$T/migrate-curl" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+method=GET; target=''
+while (($#)); do
+  case "$1" in
+    --request) method=$2; shift 2;;
+    --user|--connect-timeout|--max-time|--header|--data-binary) shift 2;;
+    --fail-with-body|--show-error|--silent|--basic) shift;;
+    *) target=$1; shift;;
+  esac
+done
+case "$method:$target" in
+  GET:*/peer-api/vms) printf '[]\n';;
+  POST:*/peer-api/migrations/import/*) cat > "$VMAPI_MIGRATE_BODY"; printf '{"imported":true}\n';;
+  *) exit 22;;
+esac
+MOCK
+chmod +x "$T/migrate-vmctl" "$T/migrate-backupctl" "$T/migrate-curl"
+: > "$T/migrate-delete.log"
+PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" CURL_BIN="$T/migrate-curl" VMAPI_VMCTL="$T/migrate-vmctl" VMAPI_BACKUPCTL="$T/migrate-backupctl" VMAPI_MIGRATE_DELETE_LOG="$T/migrate-delete.log" VMAPI_MIGRATE_SCRATCH_LOG="$T/migrate-scratch.log" VMAPI_MIGRATE_BODY="$T/migrate-body" bash "$ROOT/bin/peerctl" migrate demo "$b_id" >/dev/null
+grep -qx demo "$T/migrate-delete.log"
+grep -qx 'migration-payload' "$T/migrate-body"
+scratch=$(cat "$T/migrate-scratch.log")
+[[ ! -e $scratch ]]
+
 # Revocation removes API/upgrade credentials from the shared database.
 run_b revoke "$a_id"
 [[ ! -s $T/b/passwd ]]

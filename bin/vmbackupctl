@@ -29,7 +29,7 @@ Commands:
   download VM ARCHIVE
   receive ARCHIVE             Store an archive read from stdin (paired hosts only)
   import ARCHIVE              Read a VM archive from stdin
-  restore VM ARCHIVE [--destination DIR]
+  restore VM ARCHIVE [--destination DIR] [--peer NODE_ID] [--replace]
   delete VM ARCHIVE
   schedule VM CRON [--label POLICY] [--destination DIR] [--keep COUNT] [--live] [--peer NODE_ID]
   unschedule VM [POLICY]
@@ -41,6 +41,10 @@ valid_destination() { [[ ${1:-} == /* && ${1:-} != *$'\n'* && ${1:-} != *$'\r'* 
 valid_keep() { [[ ${1:-} =~ ^[1-9][0-9]{0,3}$ ]] || die 'Retention count must be between 1 and 9999'; }
 valid_peer_id() { [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
 valid_job_id() { [[ ${1:-} =~ ^[A-Za-z0-9._-]{8,128}$ ]] || die 'Invalid backup job id'; }
+json_string_field() {
+  local json=$1 key=$2
+  printf '%s\n' "$json" | sed -nE "s/.*\"$key\":\"([^\"]*)\".*/\1/p" | head -n1
+}
 backup_progress() {
   local percent=${1:?percent required} message=${2:?message required} tmp
   [[ -n ${BACKUP_PROGRESS_FILE:-} ]] || return 0
@@ -261,11 +265,65 @@ cmd_import_file() {
   printf '{"imported":true,"vm":"%s"}\n' "$(json_escape "$name")"
 }
 cmd_restore() {
-  local name=${1:?VM name required} archive=${2:?archive required}; shift 2; local destination=$BACKUP_ROOT source stage
+  local name=${1:?VM name required} archive=${2:?archive required}; shift 2
+  local destination=$BACKUP_ROOT source peer_id='' replace=false rollback_root='' rollback_result='' rollback_archive='' rollback_path='' restore_output=''
   valid_archive "$archive"; validate_vm_name "$name"
-  while (($#)); do case "$1" in --destination) destination=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
-  if [[ $destination == "$BACKUP_ROOT" ]]; then source=$(find_archive "$name" "$archive") || die 'Backup archive not found'; else source="$(backup_dir "$name" "$destination")/$archive"; [[ -f $source ]] || die 'Backup archive not found'; fi
-  [[ ! -e "$VM_ROOT/$name" ]] || die "VM already exists: $name; delete it before restoring"
+  while (($#)); do
+    case "$1" in
+      --destination) destination=${2:?}; shift 2;;
+      --peer) peer_id=${2:?}; shift 2;;
+      --replace) replace=true; shift;;
+      *) die "Unknown option: $1";;
+    esac
+  done
+  [[ -z $peer_id ]] || valid_peer_id "$peer_id"
+
+  if [[ -n $peer_id ]]; then
+    local remote_root
+    remote_root=$(peer_storage_dir "$peer_id" backups)
+    source="$remote_root/$name/$archive"
+    [[ -f $source ]] || die "Backup archive not found on paired host: $archive"
+  elif [[ $destination == "$BACKUP_ROOT" ]]; then
+    source=$(find_archive "$name" "$archive") || die 'Backup archive not found'
+  else
+    source="$(backup_dir "$name" "$destination")/$archive"
+    [[ -f $source ]] || die 'Backup archive not found'
+  fi
+
+  if [[ -e "$VM_ROOT/$name" ]]; then
+    $replace || die "VM already exists: $name; use --replace to restore over it"
+    require_stopped_vm "$name"
+
+    rollback_root=$(mktemp -d "${TMPDIR:-/tmp}/vmapi-restore.XXXXXX")
+    if ! rollback_result=$(cmd_create "$name" --label rollback --destination "$rollback_root" 2>&1); then
+      rm -rf -- "$rollback_root"
+      die "Could not create restore rollback archive: $rollback_result"
+    fi
+    rollback_archive=$(json_string_field "$rollback_result" archive)
+    rollback_path=$(json_string_field "$rollback_result" path)
+    if [[ -z $rollback_archive || ! -f $rollback_path ]]; then
+      rm -rf -- "$rollback_root"
+      die 'Could not create restore rollback archive'
+    fi
+
+    local delete_error=''
+    if ! delete_error=$("$VMCTL" delete "$name" 2>&1); then
+      rm -rf -- "$rollback_root"
+      die "Could not replace current VM before restore: $delete_error"
+    fi
+    if ! restore_output=$(cmd_import_file "$archive" "$source" 2>&1); then
+      rm -rf -- "$VM_ROOT/$name" "$DISK_ROOT/$name" 2>/dev/null || true
+      if ! cmd_import_file "$rollback_archive" "$rollback_path" >/dev/null 2>&1; then
+        die "Restore failed and rollback also failed; rollback archive retained at $rollback_path: $restore_output"
+      fi
+      rm -rf -- "$rollback_root"
+      die "Restore failed; the original VM was rolled back: $restore_output"
+    fi
+    rm -rf -- "$rollback_root"
+    printf '%s\n' "$restore_output"
+    return
+  fi
+
   cmd_import_file "$archive" "$source"
 }
 cmd_delete() { local name=${1:?VM name required} archive=${2:?archive required} source; source=$(find_archive "$name" "$archive") || die 'Backup archive not found'; rm -f -- "$source"; }

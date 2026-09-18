@@ -40,6 +40,10 @@ export VMAPI_LIB="$ROOT/lib/common.sh"
 export QEMU_IMG="$T/qemu-img"
 source <(sed '/^case ${1:-help} in/,$d' "$ROOT/bin/replicationctl")
 [[ $(image_virtual_size "$T/locked.qcow2") == 1048576 ]]
+touch "$T/replica-permissions.qcow2"
+chmod 0644 "$T/replica-permissions.qcow2"
+prepare_replica_file_access "$T/replica-permissions.qcow2"
+[[ $(stat -c %a "$T/replica-permissions.qcow2") == 660 ]]
 grep -Fq 'drive-mirror' bin/replicationctl
 grep -Fq '"mode":"existing"' bin/replicationctl
 grep -Fq 'nfs4-wss-backplane' bin/replicationctl

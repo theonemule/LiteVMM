@@ -417,7 +417,12 @@ case "${P[0]-}" in
       jobs)
         job=${P[2]-}; [[ $method == GET && -n $job ]] || error_reply '400 Bad Request' 'job id is required'; raw_json_reply '200 OK' backup_cmd job "$job";;
       restore)
-        name=$(param name); archive=$(param archive); [[ $method == POST && -n $name && -n $archive ]] || error_reply '400 Bad Request' 'name and archive are required'; args=(restore "$name" "$archive"); [[ -n $(param destination) ]] && args+=(--destination "$(param destination)"); raw_json_reply '201 Created' backup_cmd "${args[@]}";;
+        name=$(param name); archive=$(param archive); [[ $method == POST && -n $name && -n $archive ]] || error_reply '400 Bad Request' 'name and archive are required'
+        args=(restore "$name" "$archive")
+        [[ -n $(param destination) ]] && args+=(--destination "$(param destination)")
+        [[ -n $(param peer_id) ]] && args+=(--peer "$(param peer_id)")
+        [[ $(param replace false) == true ]] && args+=(--replace)
+        raw_json_reply '201 Created' backup_cmd "${args[@]}";;
       *)
         name=${P[1]}; archive=${P[2]-}; [[ $method == GET || $method == DELETE ]] || error_reply '405 Method Not Allowed' 'Use GET or DELETE'
         [[ -n $archive ]] || error_reply '400 Bad Request' 'archive is required'

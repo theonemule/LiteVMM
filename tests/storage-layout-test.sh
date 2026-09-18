@@ -84,6 +84,19 @@ grep -qx 'demo/disks/data.vmdk' "$T/archive-members"
 [[ -f "$T/vms/demo/vm.conf" ]]
 [[ -f "$T/disks/demo/disk0.qcow2" && -f "$T/disks/demo/data.vmdk" ]]
 
+# Restoring over an existing stopped VM replaces its disk/config state while
+# first creating a private rollback copy.
+printf 'changed-disk' > "$T/disks/demo/data.vmdk"
+"$T/bin/vmbackupctl" restore demo "$(basename "$archive")" --replace >/dev/null
+grep -q 'data-disk' "$T/disks/demo/data.vmdk"
+
+# The migration receiver accepts the same archive as a streamed request and
+# materializes the VM before the source side is allowed to delete its copy.
+"$T/bin/vmctl" delete demo
+response=$(cat "$archive" | REQUEST_METHOD=POST PATH_INFO="/api/migrations/import/$(basename "$archive")" CONTENT_TYPE=application/gzip BACKUPCTL="$T/bin/vmbackupctl" bash "$ROOT/cgi/api.cgi")
+grep -q 'Status: 201 Created' <<< "$response"
+[[ -f "$T/vms/demo/vm.conf" && -f "$T/disks/demo/data.vmdk" ]]
+
 # The foreground API returns a job ID quickly, then the job state reaches a
 # completed result containing the archive metadata.
 job=$("$T/bin/vmbackupctl" start demo --label job)
@@ -121,4 +134,11 @@ peer_archive=$(sed -n 's/.*"archive":"\([^"]*\)".*/\1/p' <<< "$peer_result")
 [[ -f "$T/peer-backups/demo/$peer_archive" ]]
 [[ ! -f "$T/backups/demo/$peer_archive" ]]
 tar -tzf "$T/peer-backups/demo/$peer_archive" | grep -qx 'demo/vm.conf'
+
+# A peer-retained backup can be restored back onto its owning host directly
+# through the mounted peer storage namespace.
+"$T/bin/vmctl" delete demo
+"$T/bin/vmbackupctl" restore demo "$peer_archive" --peer "$peer_id" >/dev/null
+[[ -f "$T/vms/demo/vm.conf" && -f "$T/disks/demo/data.vmdk" ]]
+
 printf 'storage layout: PASS\n'
