@@ -66,7 +66,7 @@ sudo ./install.sh --profile docker --port 5186
 sudo ./install.sh --profile virtualization-docker --port 5186
 ```
 
-Run `sudo ./install.sh` without `--profile` to use the interactive menu. It presents those four choices in the same order, with **Backup only** as the default. Add `--certbot` if the host should manage a Let's Encrypt certificate. CSR and certificate/key import do not require Certbot.
+Run `sudo ./install.sh` without `--profile` to use the interactive menu. It presents those four choices in the same order, with **Backup only** as the default. Certbot is installed automatically on every LiteVMM host.
 
 ## 4. Connect to the console
 

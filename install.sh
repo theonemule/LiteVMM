@@ -28,11 +28,10 @@ ADMIN_USER=${VMAPI_ADMIN_USER:-${SUDO_USER:-}}
 GOST_VERSION=3.2.6
 PROFILE=${VMAPI_INSTALL_PROFILE:-}
 HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
-INSTALL_CERTBOT=${VMAPI_INSTALL_CERTBOT:-false}
 
 usage() {
   cat <<'TXT'
-Usage: sudo ./install.sh [--profile backup|virtualization|docker|virtualization-docker] [--port PORT] [--certbot]
+Usage: sudo ./install.sh [--profile backup|virtualization|docker|virtualization-docker] [--port PORT]
 
 The LiteVMM API and backup storage are always installed. Choose one workload profile:
   backup                  Backup only
@@ -47,7 +46,6 @@ parse_args() {
     case "$1" in
       --profile) PROFILE=${2:?profile required}; shift 2;;
       --port) HTTP_PORT=${2:?port required}; shift 2;;
-      --certbot) INSTALL_CERTBOT=true; shift;;
       -h|--help) usage; exit 0;;
       *) die "Unknown installer option: $1";;
     esac
@@ -62,7 +60,6 @@ choose_profile() {
   PROFILE=${PROFILE:-backup}
   [[ $PROFILE == virtualization || $PROFILE == docker || $PROFILE == virtualization-docker || $PROFILE == backup ]] || die "Invalid profile: $PROFILE"
   valid_port "$HTTP_PORT" || die "Invalid management port: $HTTP_PORT (use 1024-65535)"
-  [[ $INSTALL_CERTBOT == true || $INSTALL_CERTBOT == false ]] || die 'VMAPI_INSTALL_CERTBOT must be true or false'
 }
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_source() { [[ -e "$BASE/$1" ]] || die "Missing installer source: $1"; }
@@ -102,7 +99,7 @@ install_packages() {
         virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso docker docker-openrc docker-cli-compose nfs-utils websocat;;
         backup) apk add --no-cache iproute2 nfs-utils websockify;;
       esac
-      if [[ $INSTALL_CERTBOT == true ]]; then apk add --no-cache certbot; fi
+      apk add --no-cache certbot
       ;;
     debian)
       export DEBIAN_FRONTEND=noninteractive
@@ -114,7 +111,7 @@ install_packages() {
         virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso nfs-common nfs-kernel-server websockify;;
         backup) apt-get install -y --no-install-recommends iproute2 nfs-common nfs-kernel-server websockify;;
       esac
-      if [[ $INSTALL_CERTBOT == true ]]; then apt-get install -y --no-install-recommends certbot; fi
+      apt-get install -y --no-install-recommends certbot
       ;;
   esac
   update-ca-certificates 2>/dev/null || true

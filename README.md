@@ -275,7 +275,7 @@ Only the LiteVMM management port is published. NFS remains on `127.0.0.1:2049` i
 
 LiteVMM can manage the management endpoint certificate without adding another listener or certificate service.
 
-- **Let's Encrypt** uses Certbot with the standalone HTTP-01 challenge. Install host packages with `install.sh --certbot`. DNS must resolve to the host and TCP port 80 must be reachable during issuance and renewal.
+- **Let's Encrypt** uses Certbot with the standalone HTTP-01 challenge. Certbot is installed automatically with LiteVMM. DNS must resolve to the host and TCP port 80 must be reachable during issuance and renewal.
 - **CSR workflow** generates an RSA 2048, RSA 4096, or ECDSA P-256 private key plus a PKCS#10 CSR. The private key remains on the LiteVMM host. A pending CSR does not replace an active HTTPS certificate.
 - **Signed CSR import** accepts the PEM certificate or full chain returned by an external CA and verifies that it matches both the retained CSR and private key before activating it.
 - **Direct import** accepts an existing PEM certificate/full chain plus PEM private key and verifies that the public/private keys match before changing the endpoint.
@@ -354,7 +354,7 @@ sudo ./install.sh --profile docker --port 5186
 sudo ./install.sh --profile virtualization-docker --port 5186
 ```
 
-Omit `--profile` to use the interactive installer. The menu presents the same four choices in that order. Add `--certbot` when the host should manage a Let's Encrypt certificate itself.
+Omit `--profile` to use the interactive installer. The menu presents the same four choices in that order. Certbot is installed automatically on every LiteVMM host.
 
 On Debian and Ubuntu, LiteVMM binds the management listener to loopback by default. Until HTTPS is configured, keep the SSH session open with local forwarding from the workstation:
 

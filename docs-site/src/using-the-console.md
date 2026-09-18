@@ -4,7 +4,7 @@ title: Using the LiteVMM console
 ---
 # Using the LiteVMM console
 
-The **System information** page is the detailed host inventory. It shows operating-system and kernel identity, CPU/RAM, primary IP and gateway, every interface and route, mounted filesystems and block devices, service state, installed component versions, and the raw JSON inventory for troubleshooting.
+Open **Overview → Host diagnostics → System information** for the detailed host inventory. It shows operating-system and kernel identity, CPU/RAM, primary IP and gateway, every interface and route, mounted filesystems and block devices, service state, installed component versions, and the raw JSON inventory for troubleshooting.
 
 This is the administrator's guide to the LiteVMM web console. It describes what you see after signing in, what each action changes, and when not to use an action. It does not require API knowledge. Use the dedicated pages for [virtual machines](/virtual-machines/), [containers and Compose](/containers-and-compose/), [images and storage](/images-and-storage/), [networks](/networking/), and [cluster pairing](/cluster/). For every field and submit button inside those dialogs, use the [console modal reference](/modal-reference/).
 
@@ -113,3 +113,5 @@ After pairing, use **Endpoint** to set the peer's public HTTPS base address—no
 3. Use Overview → **Logs** and select the relevant service: Docker for containers, CGI for console actions, GOST for overlays, and system for QEMU/host failures.
 4. Stop before editing VM disks, NICs, or passthrough settings.
 5. Do not retry a destructive action until you know whether it completed; inspect the resource first.
+
+Open **Overview → Host diagnostics → Certificate management** to issue a Let's Encrypt certificate, generate a CSR, import a signed CSR certificate, or import an existing certificate/private-key pair.
