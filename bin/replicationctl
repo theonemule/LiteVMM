@@ -13,6 +13,10 @@ BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
 JOB_ROOT=${VMAPI_REPLICATION_JOB_ROOT:-/var/lib/vmapi/replication-jobs}
 DAEMON_INTERVAL=${VMAPI_REPLICATION_DAEMON_INTERVAL:-10}
 STALE_SECONDS=${VMAPI_REPLICATION_STALE_SECONDS:-45}
+# Catch-up after a pause copies changed blocks while the guest runs, then
+# freezes it only for a final pass once the remaining delta is this small.
+CATCHUP_FINAL_BYTES=${VMAPI_REPLICATION_CATCHUP_FINAL_BYTES:-67108864}
+CATCHUP_PASSES=${VMAPI_REPLICATION_CATCHUP_PASSES:-5}
 
 valid_peer_id(){ [[ ${1:-} =~ ^[a-fA-F0-9]{32}$ ]] || die "Invalid peer node id: ${1:-}"; }
 valid_replica_id(){ [[ ${1:-} =~ ^[a-f0-9]{24}$ ]] || die "Invalid replica id: ${1:-}"; }
@@ -31,6 +35,123 @@ replication_paused(){
   [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 0
   rm -f -- "$file"; return 1
 }
+# Serialise replication changes to one VM between CLI commands, backups,
+# hibernation and the daemon. The lock is released when the process exits.
+REPL_LOCK_FD=''
+lock_replication(){
+  local vm=$1 wait=${2:-300} dir; dir=$(job_dir "$vm")
+  [[ -z $REPL_LOCK_FD && -d $dir ]] || return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  exec {REPL_LOCK_FD}>"$dir/.lock"
+  if (( wait == 0 )); then flock -n "$REPL_LOCK_FD" || return 1
+  else flock -w "$wait" "$REPL_LOCK_FD" || die "Replication for $vm is busy"; fi
+}
+
+# Change tracking. A disk's bitmap exists only while its mirror is stopped and
+# its replica was exact when tracking began (a READY mirror cancelled with the
+# guest frozen). Its bits are then precisely the blocks the replica is missing,
+# so a paused replica catches up with those blocks instead of a full resync.
+# Persistent bitmaps (qcow2) survive QEMU restarts, including hibernation.
+repl_bitmap(){ printf 'vmapi-repl-%s\n' "$1"; }
+# Stop the VM's mirrors, leaving each in-sync replica exact and tracking later
+# guest writes in that disk's bitmap. The guest is frozen from the cancels to
+# the bitmap creation so no write can fall between the two. A mirror still in
+# its initial copy leaves an incomplete replica: it gets no bitmap, and that
+# disk is resynchronised in full when replication resumes.
+quiesce_mirrors(){
+  local vm=$1 state=$2 conf idx job info qid bitmap persistent deadline active=false
+  local -a synced=() unsynced=()
+  [[ $(vm_state "$vm") == running ]] || return 0
+  conf=$(vm_conf "$vm"); load_state "$state"
+  while IFS= read -r idx; do
+    eval "job=\${DISK_${idx}_JOB:-}"; [[ -z $job || -z $(mirror_job_info "$vm" "$job") ]] || active=true
+  done < <(state_disk_indexes "$state")
+  $active || return 0
+  trap 'vm_thaw' EXIT
+  vm_freeze "$vm"
+  while IFS= read -r idx; do
+    eval "job=\${DISK_${idx}_JOB:-}"; [[ -n $job ]] || continue
+    info=$(mirror_job_info "$vm" "$job"); [[ -n $info ]] || continue
+    if [[ $info == *'"ready": true'* ]]; then synced+=("$idx"); else unsynced+=("$idx"); fi
+    deadline=$((SECONDS + 60))
+    # Re-issue the cancel while waiting: a daemon pass that read the job list
+    # just before the pause marker appeared may have restarted the mirror.
+    while [[ -n $(mirror_job_info "$vm" "$job") ]]; do
+      ((SECONDS < deadline)) || die "Replication job $job for $vm did not stop"
+      qmp_call "$vm" "{\"execute\":\"block-job-cancel\",\"arguments\":{\"device\":\"$job\"}}" >/dev/null || true
+      sleep 0.01
+    done
+  done < <(state_disk_indexes "$state")
+  for idx in ${synced[@]+"${synced[@]}"}; do
+    qid=$(disk_qemu_id "$conf" "$idx"); bitmap=$(repl_bitmap "$idx")
+    [[ -z $(bitmap_info "$vm" "$bitmap") ]] || continue
+    persistent=false; [[ $(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2) == qcow2 ]] && persistent=true
+    qmp_do "$vm" "{\"execute\":\"block-dirty-bitmap-add\",\"arguments\":{\"node\":\"$qid\",\"name\":\"$bitmap\",\"persistent\":$persistent}}" 'change tracking' >/dev/null
+  done
+  for idx in ${unsynced[@]+"${unsynced[@]}"}; do remove_bitmap "$vm" "$(disk_qemu_id "$conf" "$idx")" "$(repl_bitmap "$idx")"; done
+  vm_thaw; trap - EXIT
+}
+
+# Copy the blocks set in BITMAP from disk QID to the replica node. on-success
+# leaves the bitmap holding exactly the writes made while the copy ran.
+copy_changed_blocks(){
+  local vm=$1 qid=$2 node=$3 bitmap=$4 speed=$5 payload
+  payload="{\"execute\":\"blockdev-backup\",\"arguments\":{\"device\":\"$qid\",\"target\":\"$node\",\"sync\":\"bitmap\",\"bitmap\":\"$bitmap\",\"bitmap-mode\":\"on-success\",\"job-id\":\"vmapi-catchup\",\"auto-dismiss\":false"
+  ((speed > 0)) && payload+=",\"speed\":$speed"
+  qmp_do "$vm" "$payload}}" 'catch-up copy' >/dev/null
+  qmp_wait_job "$vm" vmapi-catchup
+}
+
+# Bring disk IDX's replica up to date from its bitmap, then hand over to a
+# mirror that forwards only new writes (sync=none). Passes run while the guest
+# keeps working; it is frozen only for the last pass, once the delta is small.
+catch_up_disk(){
+  local vm=$1 idx=$2 target=$3 job=$4 speed=$5 conf qid bitmap node count pass payload
+  conf=$(vm_conf "$vm"); qid=$(disk_qemu_id "$conf" "$idx"); bitmap=$(repl_bitmap "$idx"); node="vmapi-replica-$idx"
+  trap "vm_thaw; qmp_call $(printf '%q' "$vm") '{\"execute\":\"blockdev-del\",\"arguments\":{\"node-name\":\"$node\"}}' >/dev/null 2>&1 || true" EXIT
+  # Clear leftovers of an interrupted catch-up before reusing their names.
+  qmp_call "$vm" '{"execute":"job-dismiss","arguments":{"id":"vmapi-catchup"}}' >/dev/null 2>&1 || true
+  qmp_call "$vm" "{\"execute\":\"blockdev-del\",\"arguments\":{\"node-name\":\"$node\"}}" >/dev/null 2>&1 || true
+  qmp_do "$vm" "{\"execute\":\"blockdev-add\",\"arguments\":{\"driver\":\"qcow2\",\"node-name\":\"$node\",\"file\":{\"driver\":\"file\",\"filename\":\"$(json_escape "$target")\"}}}" 'replica open' >/dev/null
+  for ((pass = 1; pass <= CATCHUP_PASSES; pass++)); do
+    count=$(json_int_field "$(bitmap_info "$vm" "$bitmap")" count)
+    [[ -n $count ]] || die "Change tracking for $vm disk $idx disappeared"
+    (( count > CATCHUP_FINAL_BYTES )) || break
+    copy_changed_blocks "$vm" "$qid" "$node" "$bitmap" "$speed"
+  done
+  vm_freeze "$vm"
+  copy_changed_blocks "$vm" "$qid" "$node" "$bitmap" 0
+  qmp_do "$vm" "{\"execute\":\"blockdev-del\",\"arguments\":{\"node-name\":\"$node\"}}" 'replica close' >/dev/null
+  qmp_do "$vm" "{\"execute\":\"block-dirty-bitmap-remove\",\"arguments\":{\"node\":\"$qid\",\"name\":\"$bitmap\"}}" 'change tracking removal' >/dev/null
+  payload="{\"execute\":\"drive-mirror\",\"arguments\":{\"device\":\"$qid\",\"job-id\":\"$job\",\"target\":\"$(json_escape "$target")\",\"format\":\"qcow2\",\"sync\":\"none\",\"mode\":\"existing\""
+  ((speed > 0)) && payload+=",\"speed\":$speed"
+  qmp_do "$vm" "$payload}}" 'mirror restart' >/dev/null
+  vm_thaw
+  trap - EXIT
+  sleep 0.2
+  [[ -n $(mirror_job_info "$vm" "$job") ]] || die "Mirror for $vm disk $idx stopped right after restarting"
+}
+
+bitmap_info(){
+  local out; out=$(qmp_call "$1" '{"execute":"query-block"}' 2>/dev/null) || return 0
+  json_flat_object "$out" name "$2"
+}
+bitmap_usable(){ local info; info=$(bitmap_info "$1" "$2"); [[ -n $info && $info != *'"inconsistent": true'* && $info != *'"busy": true'* ]]; }
+remove_bitmap(){ [[ -z $(bitmap_info "$1" "$3") ]] || qmp_call "$1" "{\"execute\":\"block-dirty-bitmap-remove\",\"arguments\":{\"node\":\"$2\",\"name\":\"$3\"}}" >/dev/null 2>&1 || true; }
+# Drop tracking for every disk of VM, running or not.
+remove_all_bitmaps(){
+  local vm=$1 conf idx bitmap path
+  conf=$(vm_conf "$vm")
+  while IFS= read -r idx; do
+    bitmap=$(repl_bitmap "$idx")
+    if [[ $(vm_state "$vm") == running ]]; then remove_bitmap "$vm" "$(disk_qemu_id "$conf" "$idx")" "$bitmap"
+    elif [[ $(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2) == qcow2 ]]; then
+      path=$(vm_disk_path_index "$vm" "$idx" 2>/dev/null) || continue
+      "$QEMU_IMG" bitmap --remove "$path" "$bitmap" >/dev/null 2>&1 || true
+    fi
+  done < <(indexes_for "$conf" DISK)
+}
+
 replica_id(){ printf '%s' "$1/$2/$3" | sha256sum | cut -c1-24; }
 
 qmp(){
@@ -47,6 +168,7 @@ query_job_json(){
   compact=$(printf '%s' "$out" | tr -d ' \t\r\n')
   printf '%s' "$compact" | grep -o '{[^{}]*"device":"'"$job"'"[^{}]*}' | head -n1 || true
 }
+mirror_job_info(){ json_flat_object "$(qmp_do "$1" '{"execute":"query-block-jobs"}' 'job query')" device "$2"; }
 cancel_job(){ local vm=$1 job=$2; qmp "$vm" '{"execute":"block-job-cancel","arguments":{"device":"'"$job"'"}}' >/dev/null 2>&1 || true; }
 
 meta_get(){ local f=$1 k=$2; sed -n "s/^$k=//p" "$f" | head -n1; }
@@ -89,26 +211,17 @@ prepare_new_replica_target(){
   local file=$1 dir
   dir=$(dirname -- "$file")
   [[ -d $dir ]] || die "Replica directory is unavailable: $dir"
-  # Let QEMU create the mirror image itself. Pre-creating qcow2 with qemu-img
-  # and then using mode=existing makes QEMU enforce an exact size match before
-  # the copy starts; that has proven fragile across qcow2/QEMU versions. The
-  # backplane directory is already owned by vmapi and writable by the running
-  # QEMU process, so removing any stale target lets drive-mirror derive the
-  # destination geometry directly from the live source block node.
   rm -f -- "$file"
 }
 
 start_mirror_job(){
-  local vm=$1 idx=$2 target=$3 job=$4 speed=$5 mode=${6:-existing} conf qid escaped payload out
+  local vm=$1 idx=$2 target=$3 job=$4 speed=$5 sync=${6:-full} mode conf qid escaped payload out
   conf=$(vm_conf "$vm"); qid=$(disk_qemu_id "$conf" "$idx"); escaped=$(json_escape "$target")
-  [[ $mode == existing || $mode == absolute-paths ]] || die "Invalid mirror image mode: $mode"
-  payload='{"execute":"drive-mirror","arguments":{"device":"'"$qid"'","job-id":"'"$job"'","target":"'"$escaped"'","format":"qcow2","sync":"full","mode":"'"$mode"'"'
+  mode=existing; [[ $sync == full ]] && mode=absolute-paths
+  payload='{"execute":"drive-mirror","arguments":{"device":"'"$qid"'","job-id":"'"$job"'","target":"'"$escaped"'","format":"qcow2","sync":"'"$sync"'","mode":"'"$mode"'"'
   ((speed>0)) && payload+=',"speed":'"$speed"
   payload+='}}'
   out=$(qmp "$vm" "$payload"); qmp_ok "$out"
-  # drive-mirror returns before the background copy completes. A target-open or
-  # geometry error can arrive immediately afterwards as BLOCK_JOB_COMPLETED;
-  # verify that the mirror job actually survived command acceptance.
   sleep 0.1
   [[ -n $(query_job_json "$vm" "$job") ]] || die "Replication mirror for $vm disk $idx stopped immediately after it was started"
 }
@@ -137,6 +250,7 @@ start_replication(){
   install -d -m 0700 "$dir"; state="$dir/state.conf"
   printf 'PEER=%q\nSPEED=%q\nOWNER=%q\n' "${peer,,}" "$speed" "$owner" > "$state"
   conf=$(vm_conf "$vm")
+  remove_all_bitmaps "$vm"
   while IFS= read -r idx; do
     source=$(vm_disk_path_index "$vm" "$idx")
     [[ -f $source ]] || die "Disk file missing: $source"
@@ -146,20 +260,21 @@ start_replication(){
     write_meta "$meta" "$owner" "$vm" "$idx" "$bytes" "disk${idx}.qcow2" true
     printf 'DISK_%s_JOB=%q\nDISK_%s_TARGET=%q\nDISK_%s_META=%q\nDISK_%s_BYTES=%q\n' \
       "$idx" "$job" "$idx" "$target" "$idx" "$meta" "$idx" "$bytes" >> "$state"
-    start_mirror_job "$vm" "$idx" "$target" "$job" "$speed" absolute-paths
+    start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
   done < <(indexes_for "$conf" DISK)
   trap - EXIT
   status_replication "$vm"
 }
 
 resume_replication(){
-  local vm=${1:?VM required} dir state peer speed idx job target meta bytes obj current
+  local vm=${1:?VM required} dir state peer speed idx job target meta bytes obj current conf qid bitmap
   validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"; [[ -r $state ]] || return 0
   require_vm "$vm"; [[ $(vm_state "$vm") == running ]] || return 0
   ! replication_paused "$vm" || return 0
   PEER=''; SPEED=0; OWNER=''; source "$state"; peer=$PEER; speed=${SPEED:-0}
   valid_peer_id "$peer"; validate_int "$speed"
   "$BACKPLANECTL" connect "$peer" >/dev/null
+  conf=$(vm_conf "$vm")
   while IFS= read -r idx; do
     eval "job=\${DISK_${idx}_JOB:-}"; eval "target=\${DISK_${idx}_TARGET:-}"; eval "meta=\${DISK_${idx}_META:-}"; eval "bytes=\${DISK_${idx}_BYTES:-}"
     [[ -n $job && -n $target && -n $meta && -n $bytes ]] || die "Replication state is incomplete for $vm disk $idx"
@@ -178,10 +293,19 @@ resume_replication(){
           if [[ -n $OWNER && -n $FILE_NAME ]]; then write_meta "$meta" "$OWNER" "$vm" "$idx" "$bytes" "$FILE_NAME" true; fi
         fi
       fi
-      # A missing mirror is resynchronised from the live source. Recreate the
-      # destination through QEMU rather than reusing/pre-sizing a qcow2 file.
-      prepare_new_replica_target "$target"
-      start_mirror_job "$vm" "$idx" "$target" "$job" "$speed" absolute-paths
+      qid=$(disk_qemu_id "$conf" "$idx"); bitmap=$(repl_bitmap "$idx")
+      # Tracked changes since a pause: send only those. Anything else, or a
+      # catch-up that fails part way, falls back to a full resynchronisation.
+      if bitmap_usable "$vm" "$bitmap" && [[ -f $target && $(image_virtual_size "$target" 2>/dev/null) == "$bytes" ]] \
+         && ( catch_up_disk "$vm" "$idx" "$target" "$job" "$speed" ); then
+        :
+      else
+        [[ -z $(bitmap_info "$vm" "$bitmap") ]] || err "Replica of $vm disk $idx could not catch up from tracked changes; resynchronising it in full"
+        remove_bitmap "$vm" "$qid" "$bitmap"
+        [[ -z $(query_job_json "$vm" "$job") ]] || { cancel_job "$vm" "$job"; sleep 1; }
+        prepare_new_replica_target "$target"
+        start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
+      fi
     fi
     refresh_meta "$meta" true
   done < <(state_disk_indexes "$state")
@@ -213,23 +337,13 @@ status_replication(){
 # mirror job owns, so a holder pauses replication around its own job. Resuming
 # restarts each mirror with sync=full, which resends the disk to the peer.
 pause_replication(){
-  local vm=${1:?VM required} holder=${2:?holder PID required} dir state idx job deadline tmp
+  local vm=${1:?VM required} holder=${2:?holder PID required} dir state tmp
   validate_vm_name "$vm"; validate_positive_int "$holder"; dir=$(job_dir "$vm"); state="$dir/state.conf"
   [[ -r $state ]] || { printf '{"vm":"%s","configured":false,"paused":false}\n' "$vm"; return 0; }
   kill -0 "$holder" 2>/dev/null || die "Pause holder is not running: $holder"
   tmp="$dir/.paused.$$"; printf 'PID=%s\nSINCE=%s\n' "$holder" "$(date +%s)" > "$tmp"; mv -f -- "$tmp" "$(pause_file "$vm")"
-  load_state "$state"
-  if [[ $(vm_state "$vm") == running ]]; then
-    while IFS= read -r idx; do
-      eval "job=\${DISK_${idx}_JOB:-}"; [[ -n $job ]] || continue
-      deadline=$((SECONDS + 60))
-      # Re-issue the cancel while waiting: a daemon pass that read the job list
-      # just before the marker appeared may have restarted the mirror.
-      while [[ -n $(query_job_json "$vm" "$job") ]]; do
-        ((SECONDS < deadline)) || { rm -f -- "$(pause_file "$vm")"; die "Replication job $job for $vm did not stop"; }
-        cancel_job "$vm" "$job"; sleep 0.5
-      done
-    done < <(state_disk_indexes "$state")
+  if ! ( quiesce_mirrors "$vm" "$state" ); then
+    rm -f -- "$(pause_file "$vm")"; die "Could not pause replication for $vm"
   fi
   printf '{"vm":"%s","configured":true,"paused":true,"holder":%s}\n' "$vm" "$holder"
 }
@@ -254,6 +368,7 @@ stop_replication(){
     [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"
     [[ -z $meta ]] || refresh_meta "$meta" false
   done < <(state_disk_indexes "$state")
+  remove_all_bitmaps "$vm"
   rm -rf -- "$dir"
   $quiet || printf '{"stopped":true,"vm":"%s","replica_retained":true}\n' "$vm"
 }
@@ -275,7 +390,7 @@ resume_all(){
     [[ -d $d ]] || continue
     vm=$(basename "$d")
     [[ -f $(vm_conf "$vm") && $(vm_state "$vm") == running ]] || continue
-    resume_replication "$vm" || echo "Could not resume replication for $vm" >&2
+    ( lock_replication "$vm" 0 || exit 0; resume_replication "$vm" ) || echo "Could not resume replication for $vm" >&2
   done
 }
 
@@ -344,13 +459,15 @@ revoke_peer(){
 }
 
 daemon_cleanup(){
-  local d vm state idx job meta
+  local d vm state idx meta
   for d in "$JOB_ROOT"/*; do
     [[ -d $d ]] || continue; vm=$(basename "$d"); state="$d/state.conf"; [[ -r $state ]] || continue
+    # Leave replicas exact and changes tracked, so the service restart (an
+    # upgrade, for example) catches up instead of resynchronising in full.
+    ( quiesce_mirrors "$vm" "$state" ) || err "Could not quiesce replication for $vm"
     load_state "$state"
     while IFS= read -r idx; do
-      eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
-      [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"
+      eval "meta=\${DISK_${idx}_META:-}"
       [[ -z $meta ]] || refresh_meta "$meta" false
     done < <(state_disk_indexes "$state")
   done
@@ -363,12 +480,12 @@ daemon(){
 
 case ${1:-help} in
   start) shift; start_replication "$@";;
-  resume) shift; resume_replication "$@"; status_replication "$1";;
+  resume) shift; lock_replication "${1:?VM required}"; resume_replication "$@"; status_replication "$1";;
   resume-all) resume_all;;
   status) shift; status_replication "$@";;
-  stop) shift; stop_replication "$@";;
-  pause) shift; pause_replication "$@";;
-  unpause) shift; unpause_replication "$@";;
+  stop) shift; lock_replication "${1:?VM required}"; stop_replication "$@";;
+  pause) shift; lock_replication "${1:?VM required}"; pause_replication "$@";;
+  unpause) shift; lock_replication "${1:?VM required}"; unpause_replication "$@";;
   list) list_replications;;
   replica-show) shift; replica_show "$@";;
   replica-list) replica_list;;

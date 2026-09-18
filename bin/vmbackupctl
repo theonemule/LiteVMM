@@ -86,13 +86,14 @@ json_int_field() { printf '%s' "$1" | sed -n 's/.*"'"$2"'": *\([0-9][0-9]*\).*/\
 
 # Continuous replication keeps a drive-mirror job on every disk, and QEMU will
 # not start a backup job on a node another block job owns ("Node 'drive0' is
-# busy: block device is in use by block job: mirror"). Hold replication off for
-# the disk copy only; replicationctl resumes it with a full resync afterwards.
+# busy: block device is in use by block job: mirror"). replicationctl briefly
+# stops the mirror, enables dirty-bitmap tracking, and catches the replica up
+# incrementally afterwards. Guest writes remain tracked for the whole backup.
 pause_replication_for_backup() {
   local name=$1
   [[ -x $REPLICATIONCTL ]] || return 0
   [[ $("$REPLICATIONCTL" status "$name" 2>/dev/null || true) == *'"configured":true'* ]] || return 0
-  backup_progress 25 'Pausing continuous replication for the disk copy'
+  backup_progress 25 'Switching continuous replication to change tracking'
   "$REPLICATIONCTL" pause "$name" "$$" >/dev/null || die "Could not pause continuous replication for $name"
   PAUSED_REPLICATION=$name
 }
@@ -100,6 +101,7 @@ resume_paused_replication() {
   local name=$PAUSED_REPLICATION
   [[ -n $name ]] || return 0
   PAUSED_REPLICATION=''
+  backup_progress 72 'Catching continuous replication up from tracked changes'
   "$REPLICATIONCTL" unpause "$name" >/dev/null 2>&1 || err "Continuous replication for $name did not resume; the replication service will retry it"
 }
 

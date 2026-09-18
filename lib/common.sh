@@ -302,6 +302,61 @@ qemu_img_top_int() {
   json_top_level | sed -n 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1
 }
 
+# --- QMP ---------------------------------------------------------------------
+QMP_TIMEOUT=${VMAPI_QMP_TIMEOUT:-30}
+qmp_call() {
+  local name=$1 payload=$2 socket id line reply='' in out
+  socket="$(vm_dir "$name")/runtime/qmp.sock"
+  [[ -S $socket ]] || { err "QMP socket is unavailable for $name"; return 1; }
+  command -v socat >/dev/null 2>&1 || { err 'socat is required for QMP'; return 1; }
+  [[ $payload == '{"execute"'* ]] || { err 'Invalid QMP command'; return 1; }
+  id="vmapi-$$-$RANDOM"
+  coproc QMP_IO { exec socat - "UNIX-CONNECT:$socket" 2>/dev/null; }
+  in=${QMP_IO[0]:-}; out=${QMP_IO[1]:-}
+  if [[ -n $in && -n $out ]]; then
+    printf '%s\n%s\n' '{"execute":"qmp_capabilities"}' "{\"id\":\"$id\",${payload#\{}" >&"$out" 2>/dev/null || true
+    while IFS= read -r -t "$QMP_TIMEOUT" line <&"$in"; do
+      if [[ $line == *"\"id\": \"$id\""* || $line == *"\"id\":\"$id\""* ]]; then reply=$line; break; fi
+    done
+  fi
+  kill "$QMP_IO_PID" 2>/dev/null || true; wait "$QMP_IO_PID" 2>/dev/null || true
+  [[ -n $reply ]] || { err "QMP did not answer for $name: $payload"; return 1; }
+  printf '%s\n' "$reply"
+}
+qmp_do() {
+  local out
+  out=$(qmp_call "$1" "$2") || die "QMP ${3:-command} failed for $1"
+  [[ $out == *'"return"'* ]] || die "QMP ${3:-command} failed for $1: $out"
+  printf '%s\n' "$out"
+}
+json_flat_object() { printf '%s' "$1" | grep -o '{[^{}]*"'"$2"'": *"'"$3"'"[^{}]*}' | head -n1 || true; }
+json_str_field() { printf '%s' "$1" | sed -n 's/.*"'"$2"'": *"\(\([^"\\]\|\\.\)*\)".*/\1/p' | head -n1; }
+json_int_field() { printf '%s' "$1" | sed -n 's/.*"'"$2"'": *\([0-9][0-9]*\).*/\1/p' | head -n1; }
+qmp_wait_job() {
+  local vm=$1 job=$2 timeout=${3:-86400} start=$SECONDS info error
+  while :; do
+    info=$(json_flat_object "$(qmp_do "$vm" '{"execute":"query-jobs"}' 'job query')" id "$job")
+    [[ -n $info ]] || die "QMP job $job for $vm disappeared before it completed"
+    [[ $(json_str_field "$info" status) != concluded ]] || break
+    (( SECONDS - start < timeout )) || die "QMP job $job for $vm did not finish within ${timeout}s"
+    sleep 0.1
+  done
+  error=$(json_str_field "$info" error)
+  qmp_call "$vm" "{\"execute\":\"job-dismiss\",\"arguments\":{\"id\":\"$job\"}}" >/dev/null || true
+  [[ -z $error ]] || die "QMP job $job for $vm failed: $error"
+}
+FROZEN_VM=''
+vm_freeze() {
+  [[ $(qmp_do "$1" '{"execute":"query-status"}' 'status query') == *'"running": true'* ]] || return 0
+  qmp_do "$1" '{"execute":"stop"}' 'vCPU stop' >/dev/null
+  FROZEN_VM=$1
+}
+vm_thaw() {
+  local vm=$FROZEN_VM; [[ -n $vm ]] || return 0
+  FROZEN_VM=''
+  qmp_call "$vm" '{"execute":"cont"}' >/dev/null 2>&1 || err "Could not resume the vCPUs of $vm; resume it with the QMP 'cont' command"
+}
+
 probe_ovmf_code() {
   local p
   [[ -n ${OVMF_CODE:-} && -r ${OVMF_CODE:-} ]] && { printf '%s\n' "$OVMF_CODE"; return; }
