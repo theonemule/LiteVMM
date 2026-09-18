@@ -95,7 +95,7 @@ install_packages() {
     alpine)
       enable_alpine_community
       apk update
-      apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth lighttpd-mod_openssl apache2-utils openssh-client
+      apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client
       case $PROFILE in
         virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso nfs-utils websocat;;
         docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websockify websocat;;
