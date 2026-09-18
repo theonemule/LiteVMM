@@ -43,7 +43,7 @@ render_web(){
 }
 CFG
       fi
-      [[ ${VMAPI_REGISTRY_SKIP_RELOAD:-false} == true ]] || { lighttpd -tt -f "$LIGHTTPD_ROOT/lighttpd.conf" >/dev/null; if command -v rc-service >/dev/null 2>&1; then rc-service lighttpd restart >/dev/null; elif [[ -r /run/lighttpd.pid ]]; then kill -USR1 "$(cat /run/lighttpd.pid)"; fi; };;
+      [[ ${VMAPI_REGISTRY_SKIP_RELOAD:-false} == true ]] || { lighttpd -tt -f "$LIGHTTPD_ROOT/lighttpd.conf" >/dev/null; if [[ -x ${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload} ]]; then VMAPI_LIGHTTPD_CONF="$LIGHTTPD_ROOT/lighttpd.conf" "${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}"; elif command -v rc-service >/dev/null 2>&1; then rc-service lighttpd restart >/dev/null; elif [[ -r /run/lighttpd.pid ]]; then kill -USR1 "$(cat /run/lighttpd.pid)"; fi; };;
     nginx)
       : > "$NGINX_CONF"
       if [[ $ENABLED == true ]]; then cat > "$NGINX_CONF" <<CFG

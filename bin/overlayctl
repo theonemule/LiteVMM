@@ -12,6 +12,7 @@ WEB_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
 PASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
 SERVICE=${VMAPI_RC_SERVICE:-rc-service}
 SYS_CLASS_NET=${VMAPI_SYS_CLASS_NET:-/sys/class/net}
+WEB_RELOAD=${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 valid_name() { [[ ${1:-} =~ ^[a-z][a-z0-9-]{0,10}$ ]] || die 'Overlay name must be 1-11 lowercase letters, digits or hyphens, starting with a letter'; }
@@ -126,6 +127,16 @@ YAML
   chmod 0600 "$tmp"; mv -f -- "$tmp" "$RUN/$NAME.yaml"
 )
 
+# Overlay create/delete runs inside an API request served by this same
+# Lighttpd. A restart here would drop that request's connection, so the change
+# would succeed while the browser reported "Failed to fetch". vmapi-web-reload
+# applies routes gracefully after the request has been answered. Test harnesses
+# that substitute a fake service manager keep the direct restart contract.
+web_reload() {
+  if [[ -n ${VMAPI_RC_SERVICE:-} ]]; then "$SERVICE" lighttpd restart >&2; return; fi
+  VMAPI_LIGHTTPD_CONF="$WEB_ROOT/lighttpd.conf" "$WEB_RELOAD"
+}
+
 # Install the candidate before validation: lighttpd -tt must see the NEW routes.
 # A pure spoke never invokes Lighttpd unless removing its own previous hub routes.
 render_web() (
@@ -163,7 +174,7 @@ LIGHTY
     if [[ -s $backup ]]; then cp -p -- "$backup" "$out"; else rm -f -- "$out"; fi
     die 'Lighttpd rejected new overlay routes; restored previous routes'
   fi
-  "$SERVICE" lighttpd restart >&2 || die 'Lighttpd restart failed'
+  web_reload || die 'Lighttpd reload failed'
   # No route remains on a former hub, and the separate old password file is retired.
   ((hubs > 0)) || rm -f -- "$out"
   rm -f -- "$WEB_ROOT/gost.passwd" "$WEB_ROOT/conf.d/vmapi-overlay.conf"

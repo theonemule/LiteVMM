@@ -14,6 +14,10 @@ grep -Fq 'HTTP_PORT=${VMAPI_HTTP_PORT:-5186}' "$ROOT/install.sh"
 grep -Fq 'FROM alpine:3.24' "$ROOT/Dockerfile"
 grep -Fq 'VMAPI_PROFILE=backup' "$ROOT/docker/backup/vmapi.conf"
 grep -Fq 'lighttpd -tt -f /etc/lighttpd/lighttpd.conf' "$ROOT/install.sh"
+# Lighttpd changes made from inside an API request must be applied gracefully
+# after that request is answered (see tests/web-reload-test.sh).
+grep -Fq 'for tool in vmapi-web-reload ' "$ROOT/install.sh"
+grep -Fq 'web_reload || die' "$ROOT/bin/overlayctl"
 grep -Fq 'vmapi-network.service' "$ROOT/install.sh"
 grep -Fq 'report_nested_hyperv_requirement' "$ROOT/install.sh"
 grep -Fq '/usr/local/bin/netctl restore' "$ROOT/openrc/vmapi-network"

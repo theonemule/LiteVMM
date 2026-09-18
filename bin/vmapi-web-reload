@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Purpose: apply a changed Lighttpd configuration without cutting the HTTP
+# request that caused the change.
+#
+# overlayctl, certctl and registryctl rewrite Lighttpd routes while they are
+# running *inside* an API request (browser -> lighttpd -> fcgiwrap -> api.cgi
+# -> sudo tool).  Restarting Lighttpd at that point closes the very connection
+# the browser is waiting on, so the change succeeds but the browser reports
+# "Failed to fetch".  This helper therefore:
+#
+#   1. validates the configuration first and leaves the running server alone
+#      if it is invalid;
+#   2. when called from a web request, detaches and waits for that request's
+#      CGI process to exit, so its response is fully handed to Lighttpd;
+#   3. applies the change with a graceful restart (SIGUSR1), which finishes
+#      in-flight responses instead of dropping them.
+#
+# From an SSH/CLI shell there is no request to protect and the reload happens
+# immediately.  Usage: vmapi-web-reload [--now]
+set -Eeuo pipefail
+
+CONF=${VMAPI_LIGHTTPD_CONF:-${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}/lighttpd.conf}
+WAIT_MAX=${VMAPI_WEB_RELOAD_WAIT_MAX:-300}
+# Brief pause after the request exits so Lighttpd has written the response and
+# the console's immediate follow-up refresh is usually already served.
+SETTLE=${VMAPI_WEB_RELOAD_SETTLE:-1}
+
+# Success is reported to syslog only: callers such as the peer API return a
+# tool's combined stdout/stderr as JSON, so stray stderr text would corrupt it.
+log() { command -v logger >/dev/null 2>&1 && logger -t vmapi-web-reload -- "$*" 2>/dev/null || true; }
+die() { log "ERROR: $*"; printf 'vmapi-web-reload: %s\n' "$*" >&2; exit 1; }
+
+proc_ppid() { awk '/^PPid:/{print $2; exit}' "/proc/$1/status" 2>/dev/null; }
+proc_comm() { cat "/proc/$1/comm" 2>/dev/null; }
+
+# Print the PID of the CGI process serving the current request: the nearest
+# ancestor whose parent is fcgiwrap.  sudo, overlayctl, subshells and the
+# peer-api.cgi exec wrapper are all walked through.  Fails outside a request.
+request_pid() {
+  local pid=$$ parent
+  while [[ $pid =~ ^[0-9]+$ ]] && ((pid > 1)); do
+    parent=$(proc_ppid "$pid") || return 1
+    [[ $parent =~ ^[0-9]+$ ]] || return 1
+    if [[ $(proc_comm "$parent") == fcgiwrap ]]; then printf '%s\n' "$pid"; return 0; fi
+    pid=$parent
+  done
+  return 1
+}
+
+# The master Lighttpd process for $CONF: the configured pid-file first, then a
+# lighttpd process started with exactly this config (containers often run
+# without a pid-file).  Never guesses at unrelated Lighttpd instances.
+lighttpd_pid() {
+  local file pid p arg
+  file=$(lighttpd -p -f "$CONF" 2>/dev/null | sed -nE 's/^[[:space:]]*server\.pid-file[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' | head -n 1) || true
+  if [[ -n $file && -r $file ]]; then
+    read -r pid < "$file" || true
+    if [[ $pid =~ ^[0-9]+$ && $(proc_comm "$pid") == lighttpd ]]; then printf '%s\n' "$pid"; return 0; fi
+  fi
+  for p in /proc/[0-9]*; do
+    pid=${p##*/}
+    [[ $(proc_comm "$pid") == lighttpd ]] || continue
+    [[ $(proc_comm "$(proc_ppid "$pid")") != lighttpd ]] || continue   # skip workers
+    while IFS= read -r -d '' arg; do
+      [[ $arg == "$CONF" ]] && { printf '%s\n' "$pid"; return 0; }
+    done < "$p/cmdline" 2>/dev/null
+  done
+  return 1
+}
+
+reload_now() {
+  local pid
+  lighttpd -tt -f "$CONF" >/dev/null 2>&1 || die "Lighttpd rejected $CONF; the running server was left unchanged"
+  if pid=$(lighttpd_pid); then
+    kill -USR1 "$pid" || die "Could not signal Lighttpd (pid $pid)"
+    log "graceful reload of Lighttpd (pid $pid) for $CONF"
+    return 0
+  fi
+  # Not running, or no way to identify it: fall back to the service manager.
+  if command -v rc-service >/dev/null 2>&1; then
+    log 'Lighttpd master not found; restarting through OpenRC'
+    rc-service lighttpd restart >/dev/null
+  elif command -v systemctl >/dev/null 2>&1; then
+    log 'Lighttpd master not found; restarting through systemd'
+    systemctl reload-or-restart lighttpd
+  else
+    die 'Lighttpd is not running and no service manager is available'
+  fi
+}
+
+# Detached worker: wait for the originating request, then reload.
+if [[ ${1:-} == --after ]]; then
+  req=${2:?request pid required}
+  [[ $req =~ ^[0-9]+$ ]] || die "Invalid request pid: $req"
+  # Drop every inherited descriptor (fd 255 is Bash reading this script).
+  # Holding the caller's pipes would stall the API response, and holding
+  # overlayctl's fd-8 flock would block the next overlay change.
+  for fd in /proc/$$/fd/*; do
+    fd=${fd##*/}
+    [[ $fd =~ ^[0-9]+$ ]] && ((fd > 2 && fd != 255)) && eval "exec ${fd}>&-" 2>/dev/null || true
+  done
+  for ((i = 0; i < WAIT_MAX * 10; i++)); do
+    kill -0 "$req" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$req" 2>/dev/null && log "request $req still running after ${WAIT_MAX}s; reloading anyway"
+  sleep "$SETTLE"
+  reload_now
+  exit 0
+fi
+
+case ${1:-} in
+  ''|--now) ;;
+  -h|--help) echo 'Usage: vmapi-web-reload [--now]'; exit 0;;
+  *) die "Unknown option: $1";;
+esac
+
+# Validate synchronously so the caller still sees a bad configuration.
+lighttpd -tt -f "$CONF" >/dev/null 2>&1 || die "Lighttpd rejected $CONF; the running server was left unchanged"
+
+if [[ ${1:-} != --now ]] && req=$(request_pid); then
+  setsid -f "$(readlink -f "$0")" --after "$req" </dev/null >/dev/null 2>&1
+  log "Lighttpd reload scheduled after request $req completes"
+  exit 0
+fi
+reload_now

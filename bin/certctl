@@ -116,7 +116,12 @@ CFG
     rm -f "$conf" "$pem"
   fi
   lighttpd -tt -f "$LIGHTTPD_MAIN_CONF" >/dev/null
-  command -v rc-service >/dev/null 2>&1 && rc-service lighttpd restart >/dev/null
+  # Certificate changes are made from the console, i.e. inside a request served
+  # by this Lighttpd; reload gracefully after that request has been answered.
+  command -v rc-service >/dev/null 2>&1 || return 0
+  local reload=${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}
+  if [[ -x $reload ]]; then VMAPI_LIGHTTPD_CONF="$LIGHTTPD_MAIN_CONF" "$reload"
+  else rc-service lighttpd restart >/dev/null; fi
 }
 
 apply_web_tls(){

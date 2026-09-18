@@ -119,7 +119,21 @@
     const peerId = opts.peerId || state.remotePeerId;
     const useRemote = peerId && !opts.local && state.route !== 'cluster';
     const target = useRemote ? `${API}/cluster/peers/${encodeURIComponent(peerId)}/proxy?path=${encodeURIComponent(path)}` : API + path;
-    const res = await fetch(target, init);
+    // fetch() rejects only when no HTTP response arrived at all. Lighttpd
+    // briefly refuses connections while it gracefully applies a route or TLS
+    // change, so reads are retried. Writes are never replayed: the server may
+    // already have applied them.
+    const idempotent = init.method === 'GET' || init.method === 'HEAD';
+    let res;
+    for (let attempt = 0; ; attempt++) {
+      try { res = await fetch(target, init); break; }
+      catch (err) {
+        if (err.name === 'AbortError' || opts.signal?.aborted) throw err;
+        if (!idempotent) throw new Error(`${init.method} ${path}: the connection closed before the server replied. The change may still have been applied; refresh to check its state.`);
+        if (attempt >= 3) throw new Error(`${init.method} ${path}: the server could not be reached (${err.message}).`);
+        await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+      }
+    }
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
