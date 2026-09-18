@@ -1154,16 +1154,25 @@ case "${P[0]-}" in
         raw_json_reply '201 Created' overlay_cmd show "$name";;
       DELETE)
         name=${P[1]-}; [[ -n $name ]] || name=$(param name); [[ -n $name ]] || error_reply '400 Bad Request' 'overlay name is required'
+        [[ $name =~ ^[a-z][a-z0-9-]{0,10}$ ]] || error_reply '400 Bad Request' 'invalid overlay name'
         if [[ $PEER_API_REQUEST == true ]]; then
-          overlay_cmd delete "$name" >/dev/null 2>&1 || error_reply '400 Bad Request' 'Overlay deletion failed'
-          reply '200 OK' '{"deleted":true}'
+          overlay_cmd delete "$name" >/dev/null 2>&1 || true
+          reply '200 OK' '{"deleted":true,"remote_cleanup":"not_applicable"}'
         fi
-        mapfile -t peers < <(overlay_cmd peer-list "$name")
+        peers=()
+        mapfile -t peers < <(overlay_cmd peer-list "$name" 2>/dev/null || true)
+        local_out=$(overlay_cmd delete "$name" 2>&1) || error_reply '500 Internal Server Error' "Local overlay cleanup failed: $local_out"
+        warnings=()
         for v in "${peers[@]}"; do
-          out=$(overlay_remote_delete "$v" "$name" 2>&1) || error_reply '502 Bad Gateway' "Peer overlay deletion failed for $v: $out"
+          [[ $v =~ ^[a-f0-9]{32}$ ]] || continue
+          if ! out=$(overlay_remote_delete "$v" "$name" 2>&1); then warnings+=("peer $v: $out"); fi
         done
-        overlay_cmd delete "$name" >/dev/null 2>&1 || error_reply '400 Bad Request' 'Local overlay deletion failed'
-        reply '200 OK' '{"deleted":true}';;
+        if ((${#warnings[@]})); then
+          warning=$(printf '%s; ' "${warnings[@]}")
+          warning=${warning%; }
+          reply '200 OK' "{\"deleted\":true,\"remote_cleanup\":\"warning\",\"warning\":\"$(json_escape "$warning")\"}"
+        fi
+        reply '200 OK' '{"deleted":true,"remote_cleanup":"complete"}';;
       *) error_reply '405 Method Not Allowed' 'Use GET, POST, or DELETE';;
     esac;;
 

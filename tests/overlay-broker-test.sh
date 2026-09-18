@@ -33,6 +33,10 @@ case "\$1" in
     id=\$2 method=\$3 path=\$4
     body=\$(cat)
     printf '%s|%s|%s|%s\n' "\$id" "\$method" "\$path" "\$body" >> '$T/state/proxy.log'
+    if [[ "\$method" == DELETE && "\${FAIL_REMOTE_DELETE:-false}" == true ]]; then
+      printf '{"error":"remote overlay missing"}\n' >&2
+      exit 22
+    fi
     printf '{"remote":true}\n'
     ;;
   *) exit 2;;
@@ -65,6 +69,7 @@ cgi(){
     PATH_INFO="$path" \
     CONTENT_TYPE='application/x-www-form-urlencoded' \
     CONTENT_LENGTH=${#body} \
+    FAIL_REMOTE_DELETE=${FAIL_REMOTE_DELETE:-false} \
     bash "$ROOT/cgi/api.cgi"
 }
 
@@ -89,6 +94,7 @@ out=$(printf '%s' "$remote_body" | \
   PATH_INFO=/overlays \
   CONTENT_TYPE='application/x-www-form-urlencoded' \
   CONTENT_LENGTH=${#remote_body} \
+    FAIL_REMOTE_DELETE=${FAIL_REMOTE_DELETE:-false} \
   bash "$ROOT/cgi/api.cgi")
 printf '%s\n' "$out" | grep -Fq 'Status: 201 Created'
 grep -Fq "create mesh2 --bridge brmesh2 --role spoke --peer $caller --mtu 1400" "$T/state/overlay.log"
@@ -98,6 +104,21 @@ grep -Fq "create mesh2 --bridge brmesh2 --role spoke --peer $caller --mtu 1400" 
 out=$(cgi DELETE /api/overlays/mesh1 '')
 printf '%s\n' "$out" | grep -Fq 'Status: 200 OK'
 grep -Fq "$peer|DELETE|/overlays/mesh1|" "$T/state/proxy.log"
+grep -Fq 'delete mesh1' "$T/state/overlay.log"
+
+
+: > "$T/state/proxy.log"
+: > "$T/state/overlay.log"
+out=$(FAIL_REMOTE_DELETE=true cgi DELETE /api/overlays/mesh1 '')
+printf '%s\n' "$out" | grep -Fq 'Status: 200 OK'
+printf '%s\n' "$out" | grep -Fq '"remote_cleanup":"warning"'
+grep -Fq 'delete mesh1' "$T/state/overlay.log"
+grep -Fq "$peer|DELETE|/overlays/mesh1|" "$T/state/proxy.log"
+
+# Repeated cleanup remains successful even when the local definition is already gone.
+: > "$T/state/overlay.log"
+out=$(FAIL_REMOTE_DELETE=true cgi DELETE /api/overlays/mesh1 '')
+printf '%s\n' "$out" | grep -Fq 'Status: 200 OK'
 grep -Fq 'delete mesh1' "$T/state/overlay.log"
 
 echo 'overlay broker lifecycle: PASS'

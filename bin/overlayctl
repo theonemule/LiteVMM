@@ -11,6 +11,7 @@ GOST=${VMAPI_GOST:-$(command -v gost 2>/dev/null || printf '%s' /usr/bin/gost)}
 WEB_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
 PASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
 SERVICE=${VMAPI_RC_SERVICE:-rc-service}
+SYS_CLASS_NET=${VMAPI_SYS_CLASS_NET:-/sys/class/net}
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 valid_name() { [[ ${1:-} =~ ^[a-z][a-z0-9-]{0,10}$ ]] || die 'Overlay name must be 1-11 lowercase letters, digits or hyphens, starting with a letter'; }
@@ -33,7 +34,7 @@ access() {
 load() {
   valid_name "$1"; NAME=$1
   [[ -r $(conf "$NAME") ]] || die "Overlay not found: $NAME"
-  BRIDGE='' ROLE='' PEER='' PEERS_LIST='' MTU=1400 STAGED=false TAP_BRIDGE_LEARNING=off
+  BRIDGE='' ROLE='' PEER='' PEERS_LIST='' MTU=1400 STAGED=false TAP_BRIDGE_LEARNING=off OWN_BRIDGE=legacy
   # Only this privileged controller writes these shell-escaped files.
   # shellcheck source=/dev/null
   source "$(conf "$NAME")"
@@ -44,6 +45,7 @@ load() {
   [[ $MTU =~ ^[0-9]{4}$ && $MTU -ge 1200 && $MTU -le 1499 ]] || die 'MTU must be 1200-1499'
   [[ $STAGED == true || $STAGED == false ]] || die 'Invalid staged flag'
   [[ $TAP_BRIDGE_LEARNING == off ]] || die 'TAP bridge learning must remain disabled for GOST overlays'
+  [[ $OWN_BRIDGE == true || $OWN_BRIDGE == false || $OWN_BRIDGE == legacy ]] || die 'Invalid bridge ownership flag'
   ((${#MEMBERS[@]} > 0 && ${#MEMBERS[@]} <= 16)) || die 'Select 1-16 paired peers'
   [[ $ROLE == hub || ${#MEMBERS[@]} == 1 ]] || die 'A spoke needs exactly one hub'
   [[ $STAGED == false || ${#MEMBERS[@]} == 1 ]] || die 'Staged address validation requires one peer'
@@ -66,7 +68,7 @@ peer() {
 }
 write_config() {
   local tmp; tmp=$(mktemp "$ROOT/.config.XXXXXX")
-  printf 'SCHEMA=3\nBRIDGE=%q\nROLE=%q\nPEERS_LIST=%q\nMTU=%q\nSTAGED=%q\nTAP_BRIDGE_LEARNING=%q\n' "$BRIDGE" "$ROLE" "${MEMBERS[*]}" "$MTU" "$STAGED" "$TAP_BRIDGE_LEARNING" > "$tmp"
+  printf 'SCHEMA=4\nBRIDGE=%q\nROLE=%q\nPEERS_LIST=%q\nMTU=%q\nSTAGED=%q\nTAP_BRIDGE_LEARNING=%q\nOWN_BRIDGE=%q\n' "$BRIDGE" "$ROLE" "${MEMBERS[*]}" "$MTU" "$STAGED" "$TAP_BRIDGE_LEARNING" "$OWN_BRIDGE" > "$tmp"
   if getent group vmapi >/dev/null; then chown root:vmapi "$tmp"; fi
   chmod 0640 "$tmp"; mv -f -- "$tmp" "$(conf "$NAME")"
 }
@@ -285,6 +287,7 @@ create() {
   local name=$NAME new_bridge=$BRIDGE file other id
   declare -A seen=()
   for id in "${MEMBERS[@]}"; do peer "$id"; [[ -z ${seen[$id]+x} ]] || die 'Duplicate peer'; seen[$id]=1; done
+  if ip link show "$BRIDGE" >/dev/null 2>&1; then OWN_BRIDGE=false; else OWN_BRIDGE=true; fi
   # Reserve each local bridge and computed port for exactly one overlay.
   for file in "$ROOT"/*.conf; do
     [[ -f $file ]] || continue; other=$(basename "$file" .conf)
@@ -303,10 +306,34 @@ create() {
   show "$name"
 }
 set_stage() { load "$1"; STAGED=$2; [[ $STAGED == false || ${#MEMBERS[@]} == 1 ]] || die 'Staging requires one peer'; write_config; restart_service; wait_ready "$1" || die 'TAP startup failed'; show "$1"; }
+bridge_member_count() {
+  local bridge=$1
+  [[ -d $SYS_CLASS_NET/$bridge/brif ]] || { echo 0; return; }
+  find "$SYS_CLASS_NET/$bridge/brif" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l
+}
+cleanup_bridge() {
+  local bridge=$1 owned=$2 count
+  [[ -n $bridge ]] || return 0
+  ip link show "$bridge" >/dev/null 2>&1 || return 0
+  count=$(bridge_member_count "$bridge")
+  ((count == 0)) || return 0
+  [[ $owned == true || $owned == legacy ]] || return 0
+  "$NETCTL" bridge-delete "$bridge" >/dev/null 2>&1 || true
+}
 delete() {
-  local name=$1; load "$name"; stop_one "$name"
-  rm -f -- "$(conf "$name")" "$RUN/$name.yaml"
-  render_web; restart_service
+  local name=${1:?overlay name required} bridge='' owned=legacy
+  valid_name "$name"
+  if [[ -r $(conf "$name") ]]; then
+    load "$name"
+    bridge=$BRIDGE
+    owned=$OWN_BRIDGE
+  fi
+  stop_one "$name" || true
+  rm -f -- "$(conf "$name")" "$RUN/$name.yaml" "$RUN/$name.pid"
+  render_web || true
+  restart_service || true
+  cleanup_bridge "$bridge" "$owned"
+  printf '{"deleted":true,"name":"%s","bridge":"%s"}\n' "$name" "$bridge"
 }
 reset() {
   "$SERVICE" vmapi-overlay stop >&2 || true
