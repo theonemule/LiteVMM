@@ -10,19 +10,48 @@ VMAPI_PROFILE=${VMAPI_PROFILE:-virtualization}
 VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
 VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
 VMAPI_BACKPLANE_SERVER=${VMAPI_BACKPLANE_SERVER:-false}
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
 
-valid_vmapi_profile() { [[ ${1:-} == virtualization || ${1:-} == docker || ${1:-} == virtualization-docker || ${1:-} == backup ]]; }
+valid_vmapi_profile() { [[ $1 == virtualization || $1 == docker || $1 == virtualization-docker || $1 == backup ]]; }
+
+vmapi_qemu_available() {
+  [[ $VMAPI_PROFILE != backup ]] || return 1
+  [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || -x $QEMU_BIN ]]
+}
+
+vmapi_docker_available() {
+  [[ $VMAPI_PROFILE != backup ]] || return 1
+  [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker || -x $DOCKER_BIN ]]
+}
+
+vmapi_effective_profile() {
+  if [[ $VMAPI_PROFILE == backup ]]; then
+    printf 'backup\n'
+    return 0
+  fi
+  local has_qemu=false has_docker=false
+  vmapi_qemu_available && has_qemu=true
+  vmapi_docker_available && has_docker=true
+  if [[ $has_qemu == true && $has_docker == true ]]; then
+    printf 'virtualization-docker\n'
+  elif [[ $has_docker == true ]]; then
+    printf 'docker\n'
+  elif [[ $has_qemu == true ]]; then
+    printf 'virtualization\n'
+  else
+    printf '%s\n' "$VMAPI_PROFILE"
+  fi
+}
+
 vmapi_has_capability() {
-  local cap=${1:-}
+  local cap=$1
   case "$cap" in
-    api|system|metrics|cluster|admin) return 0;;
-    backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ]];;
-    backup-create|qemu-kvm|vm-network|vm-console|storage|cloud-init|replication-source) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker ]];;
-    backplane-client) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
-    storage-backplane) [[ ${VMAPI_BACKPLANE_SERVER:-false} == true ]];;
-    peer-volume-client) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
-    docker|compose|container-terminal) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
-    files|host-terminal) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
+    api|system|metrics|cluster|admin|backup|backup-storage) return 0;;
+    qemu-kvm|backup-create|vm-network|vm-console|storage|cloud-init|replication-source) vmapi_qemu_available;;
+    docker|compose|container-terminal|registry|peer-volume-client) vmapi_docker_available;;
+    backplane-client) vmapi_qemu_available || vmapi_docker_available;;
+    storage-backplane) [[ $VMAPI_BACKPLANE_SERVER == true ]];;
+    files|host-terminal) vmapi_qemu_available || vmapi_docker_available;;
     *) return 1;;
   esac
 }

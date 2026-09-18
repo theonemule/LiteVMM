@@ -56,18 +56,18 @@ reply() { header "$1"; printf '%s\n' "$2"; exit 0; }
 error_reply() { local code=$1 msg=$2; reply "$code" "{\"error\":\"$(json_escape "$msg")\"}"; }
 require_capability() {
   local cap=$1
-  vmapi_has_capability "$cap" || error_reply '404 Not Found' "Capability is not installed for the $VMAPI_PROFILE profile: $cap"
+  vmapi_has_capability "$cap" || error_reply '404 Not Found' "Capability is not installed or available on this host: $cap"
 }
 capabilities_json() {
-  local caps=(api system metrics cluster admin) cap first=true
-  case "$VMAPI_PROFILE" in
-    virtualization) caps+=(qemu-kvm backup backup-create backup-storage vm-network vm-console storage cloud-init replication-source backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
-    docker) caps+=(docker compose container-terminal registry peer-volume-client backup backup-storage backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
-    virtualization-docker) caps+=(qemu-kvm backup backup-create backup-storage vm-network vm-console storage cloud-init replication-source docker compose container-terminal registry peer-volume-client backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
-    backup) caps+=(backup backup-storage); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
-  esac
+  local all=(api system metrics cluster admin backup backup-storage qemu-kvm backup-create vm-network vm-console storage cloud-init replication-source docker compose container-terminal registry peer-volume-client backplane-client storage-backplane files host-terminal)
+  local cap first=true
   printf '['
-  for cap in "${caps[@]}"; do $first || printf ','; first=false; printf '"%s"' "$cap"; done
+  for cap in "${all[@]}"; do
+    vmapi_has_capability "$cap" || continue
+    $first || printf ','
+    first=false
+    printf '"%s"' "$cap"
+  done
   printf ']'
 }
 registry_cmd() {
@@ -324,7 +324,8 @@ read_params
 
 if [[ -z $route ]]; then
   caps=$(capabilities_json)
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":12,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
+  effective_profile=$(vmapi_effective_profile)
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":12,\"profile\":\"$(json_escape "$effective_profile")\",\"configured_profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
 fi
 
 case "${P[0]-}" in

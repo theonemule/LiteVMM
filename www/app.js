@@ -54,7 +54,7 @@
   function updateCapabilityUI() {
     $$('[data-capability]').forEach(el=>el.classList.toggle('d-none',!hasCap(el.dataset.capability)));
     const profile=(state.activeService||state.service)?.profile||'unknown';
-    const subtitle=$('#brandSubtitle'); if(subtitle) subtitle.textContent=profile==='virtualization'?'Virtualization platform':profile==='docker'?'Docker platform':profile==='backup'?'Backup storage':'Minimal infrastructure';
+    const subtitle=$('#brandSubtitle'); if(subtitle) subtitle.textContent=profile==='virtualization-docker'?'VM + Docker platform':profile==='virtualization'?'Virtualization platform':profile==='docker'?'Docker platform':profile==='backup'?'Backup storage':'Minimal infrastructure';
   }
   const abbreviatedNodeId = id => `${String(id || '').slice(0,12)}…`;
   const hostRouteHash = (route, peerId = '') => {

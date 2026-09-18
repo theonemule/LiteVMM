@@ -2,7 +2,15 @@
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-api(){ local profile=$1 path=$2 server=${3:-false}; cat > "$T/vmapi.conf" <<CFG
+api(){
+  local profile=$1 path=$2 server=${3:-false}
+  local qemu="$T/no-qemu" docker="$T/no-docker"
+  case "$profile" in
+    virtualization) qemu="$T/qemu-system-x86_64";;
+    docker) docker="$T/docker";;
+    virtualization-docker) qemu="$T/qemu-system-x86_64"; docker="$T/docker";;
+  esac
+  cat > "$T/vmapi.conf" <<CFG
 VMAPI_PROFILE=$profile
 VMAPI_HTTP_PORT=5186
 VMAPI_TLS_ENABLED=false
@@ -10,10 +18,23 @@ VMAPI_BACKPLANE_SERVER=$server
 VM_ROOT=$T/vms
 DISK_ROOT=$T/disks
 ISO_ROOT=$T/isos
+QEMU_BIN=$qemu
+DOCKER_BIN=$docker
 CFG
   REQUEST_METHOD=GET PATH_INFO="$path" VMAPI_CONFIG="$T/vmapi.conf" VMAPI_LIB="$ROOT/lib/common.sh" bash "$ROOT/cgi/api.cgi"
 }
+
 json_body(){ tr -d '\r' | awk 'blank{print} /^$/{blank=1}'; }
+
+cat > "$T/qemu-system-x86_64" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$T/docker" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$T/qemu-system-x86_64" "$T/docker"
 
 backup=$(api backup /api/ | json_body)
 python3 - "$backup" <<'PY'
