@@ -82,6 +82,23 @@ peer_volume_cmd() {
 cert_cmd() {
   if command -v sudo >/dev/null 2>&1; then sudo -n "$CERTCTL" "$@"; else "$CERTCTL" "$@"; fi
 }
+cert_import_signed_cmd() {
+  local pem=$1 tmp out rc
+  tmp=$(mktemp); chmod 0600 "$tmp"; printf '%s\n' "$pem" > "$tmp"
+  set +e; out=$(cert_cmd import-signed "$tmp" 2>&1); rc=$?; set -e
+  rm -f -- "$tmp"
+  ((rc==0)) || { printf '%s' "$out" >&2; return "$rc"; }
+  printf '%s' "$out"
+}
+cert_import_pair_cmd() {
+  local cert_pem=$1 key_pem=$2 domain=${3-} ctmp ktmp out rc
+  ctmp=$(mktemp); ktmp=$(mktemp); chmod 0600 "$ctmp" "$ktmp"
+  printf '%s\n' "$cert_pem" > "$ctmp"; printf '%s\n' "$key_pem" > "$ktmp"
+  set +e; out=$(cert_cmd import-pair "$ctmp" "$ktmp" "$domain" 2>&1); rc=$?; set -e
+  rm -f -- "$ctmp" "$ktmp"
+  ((rc==0)) || { printf '%s' "$out" >&2; return "$rc"; }
+  printf '%s' "$out"
+}
 cgi_require_vm() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] && [[ -f "$VM_ROOT/$1/vm.conf" ]] || error_reply '404 Not Found' 'VM not found'; }
 
 url_decode() {
@@ -307,7 +324,7 @@ read_params
 
 if [[ -z $route ]]; then
   caps=$(capabilities_json)
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":10,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":11,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
 fi
 
 case "${P[0]-}" in
@@ -505,13 +522,37 @@ case "${P[0]-}" in
         case "${P[2]-}" in
           '')
             case "$method" in
+              GET) raw_json_reply '200 OK' cert_cmd status;;
               POST) domain=$(param domain); email=$(param email); [[ -n $domain && -n $email ]] || error_reply '400 Bad Request' 'domain and email are required'; raw_json_reply '200 OK' cert_cmd issue "$domain" "$email";;
               DELETE) raw_json_reply '200 OK' cert_cmd disable;;
-              *) error_reply '405 Method Not Allowed' 'Use POST or DELETE';;
+              *) error_reply '405 Method Not Allowed' 'Use GET, POST, or DELETE';;
             esac;;
+          letsencrypt)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            domain=$(param domain); email=$(param email); [[ -n $domain && -n $email ]] || error_reply '400 Bad Request' 'domain and email are required'
+            raw_json_reply '200 OK' cert_cmd issue "$domain" "$email";;
           renew)
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
             raw_json_reply '200 OK' cert_cmd renew;;
+          csr)
+            case "$method" in
+              GET) text_reply '200 OK' cert_cmd csr-show;;
+              POST)
+                domain=$(param domain); [[ -n $domain ]] || error_reply '400 Bad Request' 'domain is required'
+                raw_json_reply '201 Created' cert_cmd csr-generate "$domain" "$(param sans)" "$(param organization)" "$(param organizational_unit)" "$(param country)" "$(param state)" "$(param locality)" "$(param key_type rsa2048)";;
+              *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
+            esac;;
+          signed)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            certificate=$(param certificate); [[ -n $certificate ]] || error_reply '400 Bad Request' 'certificate is required'
+            out=$(cert_import_signed_cmd "$certificate" 2>&1) || error_reply '400 Bad Request' "$out"
+            reply '200 OK' "$out";;
+          import)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            certificate=$(param certificate); private_key=$(param private_key)
+            [[ -n $certificate && -n $private_key ]] || error_reply '400 Bad Request' 'certificate and private_key are required'
+            out=$(cert_import_pair_cmd "$certificate" "$private_key" "$(param domain)" 2>&1) || error_reply '400 Bad Request' "$out"
+            reply '200 OK' "$out";;
           *) error_reply '404 Not Found' 'Unknown certificate endpoint';;
         esac;;
       *) error_reply '404 Not Found' 'Unknown admin endpoint';;

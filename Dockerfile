@@ -3,7 +3,7 @@ FROM alpine:3.24
 RUN apk add --no-cache \
     bash coreutils findutils gawk grep sed shadow util-linux \
     curl openssl ca-certificates sudo tar gzip iproute2 \
-    lighttpd lighttpd-mod_auth apache2-utils fcgiwrap spawn-fcgi \
+    lighttpd lighttpd-mod_auth lighttpd-mod_openssl apache2-utils fcgiwrap spawn-fcgi certbot \
     nfs-utils websockify
 
 RUN addgroup -S vmapi && adduser -S -D -H -h /var/lib/vmapi -s /sbin/nologin -G vmapi vmapi

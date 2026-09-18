@@ -1,4 +1,4 @@
-# LiteVMM 0.10
+# LiteVMM 0.11
 
 LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, combined virtualization + Docker, or backup-storage profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses the Linux NFSv4 client/server stack carried through the existing LiteVMM WebSocket endpoint.
 
@@ -270,6 +270,33 @@ docker run -d --privileged --name litevmm-backup   -p 5186:5186   -e VMAPI_HTTP_
 ```
 
 Only the LiteVMM management port is published. NFS remains on `127.0.0.1:2049` inside the container and is reachable by peers only through `/backplane/storage`.
+
+### HTTPS certificate management
+
+LiteVMM can manage the management endpoint certificate without adding another listener or certificate service.
+
+- **Let's Encrypt** uses Certbot with the standalone HTTP-01 challenge. Install host packages with `install.sh --certbot`. DNS must resolve to the host and TCP port 80 must be reachable during issuance and renewal.
+- **CSR workflow** generates an RSA 2048, RSA 4096, or ECDSA P-256 private key plus a PKCS#10 CSR. The private key remains on the LiteVMM host. A pending CSR does not replace an active HTTPS certificate.
+- **Signed CSR import** accepts the PEM certificate or full chain returned by an external CA and verifies that it matches both the retained CSR and private key before activating it.
+- **Direct import** accepts an existing PEM certificate/full chain plus PEM private key and verifies that the public/private keys match before changing the endpoint.
+
+Managed key material is stored under `/etc/vmapi/tls` on normal host installations with private keys mode `0600`. The backup container uses `/var/lib/vmapi/tls` so imported keys and CSRs persist with the backup data volume. Nginx is reloaded after validation. Lighttpd receives a generated OpenSSL include and is restarted only after its configuration validates.
+
+The administration UI shows the active certificate subject, issuer, SANs, validity dates, SHA-256 fingerprint, management mode, and pending CSR state.
+
+Certificate API routes:
+
+```text
+GET     /api/admin
+GET     /api/admin/certificates
+POST    /api/admin/certificates/letsencrypt   form: domain=...&email=...
+POST    /api/admin/certificates/renew
+POST    /api/admin/certificates/csr           form: domain=...&sans=...&organization=...&organizational_unit=...&country=...&state=...&locality=...&key_type=...
+GET     /api/admin/certificates/csr
+POST    /api/admin/certificates/signed        form: certificate=<PEM>
+POST    /api/admin/certificates/import        form: certificate=<PEM>&private_key=<PEM>&domain=...
+DELETE  /api/admin/certificates
+```
 
 ### Deploy to Alpine hosts from Windows
 

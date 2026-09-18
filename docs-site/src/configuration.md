@@ -11,9 +11,14 @@ title: Configuration reference
 | `VMAPI_PROFILE` | `virtualization` | Installed workload surface: `virtualization`, `docker`, `virtualization-docker`, or `backup`. `virtualization` always includes VM backups; `virtualization-docker` adds Docker/Compose to that stack. The CGI rejects endpoints outside the selected profile. |
 | `VMAPI_HTTP_PORT` | `5186` | LiteVMM management HTTP/HTTPS port. |
 | `VMAPI_TLS_ENABLED` | `false` | Whether the management listener uses the configured TLS certificate. Managed by `certctl`. |
-| `VMAPI_TLS_DOMAIN` | empty | Certbot-managed DNS name. |
-| `VMAPI_TLS_CERT_FILE` | empty | Full-chain PEM used by the web server. |
-| `VMAPI_TLS_KEY_FILE` | empty | Private key used by the web server. |
+| `VMAPI_TLS_MODE` | `none` | Active certificate source such as `certbot`, `imported-csr`, or `imported`. Managed by `certctl`. |
+| `VMAPI_TLS_DOMAIN` | empty | Active certificate DNS name. |
+| `VMAPI_TLS_CERT_FILE` | empty | Active PEM certificate/full-chain path. |
+| `VMAPI_TLS_KEY_FILE` | empty | Active PEM private-key path. |
+| `VMAPI_TLS_CSR_FILE` | empty | Pending CSR path. |
+| `VMAPI_TLS_CSR_KEY_FILE` | empty | Private key retained for the pending CSR. |
+| `VMAPI_TLS_CSR_DOMAIN` | empty | Primary DNS name for the pending CSR. |
+| `VMAPI_TLS_ROOT` | `/etc/vmapi/tls` | Managed certificate, private-key, and CSR directory. |
 | `VM_ROOT` | `/var/lib/vmapi/vms` | Parent directory for VM configuration, NVRAM, and transient runtime files. |
 | `DISK_ROOT` | `/var/lib/vmapi/disks` | Parent directory for per-VM virtual-disk folders. |
 | `ISO_ROOT` | `/var/lib/vmapi/isos` | Shared, read-only ISO and installer-image library. |

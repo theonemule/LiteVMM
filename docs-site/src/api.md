@@ -22,7 +22,7 @@ All browser API paths begin with `/api` and require the same HTTP Basic authenti
 | Peer Docker volumes | `GET, POST /docker/peer-volumes`; `GET, DELETE /docker/peer-volumes/{name}`. |
 | Replication | Source management under `/replications`; retained destination replica inventory under `/replications/replicas`. Replica files are written through the shared storage backplane. |
 | Cluster | Identity, peer list/revocation, endpoint update, pairing, and signed proxy routes under `/cluster`; VM migration is virtualization-only. |
-| Admin | `GET /admin` reports TLS/Certbot state; certificate issue/renew/disable operations are under `/admin/certificates`. |
+| Admin | `GET /admin` reports active TLS metadata and pending CSR state. Certificate operations under `/admin/certificates` support Let's Encrypt, CSR generation/download, signed-CSR import, direct certificate/private-key import, renewal, and HTTPS disable. |
 | Overlays | List/create/show/delete and orphan cleanup under `/overlays`. |
 
 The exact request fields are enforced in `cgi/api.cgi`; use the console for normal administration and the regression scripts as curl examples. The peer-only `/peer-api` is not a browser endpoint: it requires HTTP Basic authentication using the same paired credential as hub WebSocket upgrades.
