@@ -4,7 +4,7 @@ title: API reference
 ---
 # API reference
 
-All browser API paths begin with `/api` and require the same HTTP Basic authentication as the console. Forms use `application/x-www-form-urlencoded`; image/file/Compose uploads stream raw request bodies. Responses are JSON unless downloading content, logs, archives, or pairing bundles. The service identity returned from `GET /api/` is `litevmm`; it also reports the active deployment `profile`, management `port`, TLS state, and authoritative capability list. The established `vmapi` command and core filesystem identifiers remain, while retired peer-storage transport endpoints are not carried forward in 0.10.
+All browser API paths begin with `/api` and require the same HTTP Basic authentication as the console. Forms use `application/x-www-form-urlencoded`; image/file/Compose uploads stream raw request bodies. Responses are JSON unless downloading content, logs, archives, or pairing bundles. The service identity returned from `GET /api/` is `litevmm`; it also reports the active deployment `profile`, management `port`, TLS state, and authoritative capability list. The established `vmapi` command and core filesystem identifiers remain, while retired peer-storage transport endpoints are not carried forward.
 
 | Resource | Operations |
 |---|---|

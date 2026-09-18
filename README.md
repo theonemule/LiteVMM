@@ -1,6 +1,6 @@
-# LiteVMM 0.11
+# LiteVMM 0.12
 
-LiteVMM is a deliberately minimalist infrastructure API and console with selectable virtualization, Docker, combined virtualization + Docker, or backup-storage profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses the Linux NFSv4 client/server stack carried through the existing LiteVMM WebSocket endpoint.
+LiteVMM is a deliberately minimalist infrastructure API and console with selectable backup-only, VM + backup, Docker + backup, or VM + Docker + backup profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses the Linux NFSv4 client/server stack carried through the existing LiteVMM WebSocket endpoint.
 
 There is no application database, no libvirt dependency, no Python/Node backend, no custom userspace filesystem, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. The existing `vmapi` name remains for the core command and filesystem layout. LiteVMM 0.10 intentionally removes the retired custom-filesystem, per-volume share, backup-upload, and per-disk replication transport interfaces.
 
@@ -242,18 +242,18 @@ The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI val
 
 The LiteVMM API and console are always installed. Choose exactly one workload profile:
 
-- `virtualization` installs QEMU/KVM, VM networking and consoles, cloud-init, overlays, backup creation, live disk replication, and both storage-backplane client/server support.
-- `docker` installs Docker/Compose management, container terminals, storage-backend helpers, peer-volume and peer-image backplane client support, streamed image builds, and the optional local OCI registry.
-- `virtualization-docker` installs the complete virtualization and Docker feature sets plus both sides of the storage backplane.
-- `backup` is a storage-only node. It hosts the loopback-only NFSv4/WSS backplane used for backups, retained VM replicas, Docker volumes, image archives, and other peer storage. It does not run VMs or Docker workloads.
+- `backup` installs backup storage only. It hosts the loopback-only NFSv4/WSS backplane for backups, retained VM replicas, Docker volumes, image archives, and other peer storage.
+- `virtualization` installs VM + backup. It includes QEMU/KVM, VM networking and consoles, cloud-init, overlays, VM backup creation, live disk replication, and the backup storage backplane.
+- `docker` installs Docker + backup. It includes Docker/Compose management, container terminals, peer volumes, peer image storage, the optional OCI registry, and the backup storage backplane.
+- `virtualization-docker` installs VM + Docker + backup, combining the complete virtualization and Docker feature sets with the backup storage backplane.
 
 On Alpine, Debian, Ubuntu, or a Debian derivative:
 
 ```bash
+sudo ./install.sh --profile backup --port 5186
 sudo ./install.sh --profile virtualization --port 5186
 sudo ./install.sh --profile docker --port 5186
 sudo ./install.sh --profile virtualization-docker --port 5186
-sudo ./install.sh --profile backup --port 5186
 ```
 
 Running `sudo ./install.sh` interactively presents the four profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`.
@@ -298,25 +298,74 @@ POST    /api/admin/certificates/import        form: certificate=<PEM>&private_ke
 DELETE  /api/admin/certificates
 ```
 
-### Deploy to Alpine hosts from Windows
+### Install on a remote host over SSH
 
-After editing the repository, set/review the `$SshUser`, `$SshPassword`, and `$RootPassword` values near the top of `deploy-vmapi-full.ps1`, then run it from PowerShell to package the complete project source, upload it over SCP, and replace the remote source directory. It excludes local metadata and cache/archive artifacts. On an already bootstrapped Alpine installation, the deploy script then applies the source-controlled runtime files to their installed locations and restarts the VMAPI services. Connect as a normal SSH-enabled account; root SSH is not required or used. This deliberately hardcodes credentials for throwaway use and is insecure; it is not appropriate for production. It is not a first-time installer: it does not run a bootstrap or install script, install packages, create users, or otherwise validate the remote host.
+The supported setup path is to connect to the target Linux host over SSH, place the LiteVMM repository on that host, and run `install.sh` there. No separate deployment wrapper is required.
 
-```powershell
-.\deploy-vmapi-full.ps1
+Prepare SSH access first. On Debian or Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y openssh-server git
+sudo systemctl enable --now ssh
 ```
 
-The configured default targets are `10.0.4.62` and `10.0.1.170`; pass `-Hosts host-a,host-b` to override them. The default remote source directory is `/root/vmapi`; use `-RemoteDir /path/to/vmapi` to choose another target. `-IdentityFile PATH` and `-Port PORT` support non-default SSH setups. The script creates a fresh mode-700 stage under `/tmp` owned by that SSH user, then removes it after each host attempt. The target directory is replaced on each sync, so it contains the current source tree rather than accumulated archives.
+On Alpine:
 
-After the upload, the script runs the same `install.sh` used for a first installation. It reconciles dependencies, runtime files, authentication, service definitions, and overlay configuration in one idempotent operation.
+```bash
+sudo apk add openssh git
+sudo rc-update add sshd default
+sudo rc-service sshd start
+```
 
-The installer preserves existing HTTP credentials unless replacement credentials are supplied through its environment. It updates source-controlled runtime files, service definitions, generated command wrappers, packages, and overlay configuration.
+From the workstation, connect to the target:
 
-It sends the configured root password as a single line to `su` over SSH standard input, so no terminal is allocated and no prompt is shown. Passwords cannot contain carriage returns, line feeds, or NUL characters; NUL is not supported by Windows environment variables.
+```bash
+ssh YOUR_LOGIN@HOST
+```
 
-The remote stage is removed as the SSH user even when the root replacement fails. Local archive cleanup also runs if an SSH or SCP transport operation fails.
+Then, on the remote host, clone LiteVMM:
 
-Host bridge creation from the web/API requires root-level network changes. On Alpine, the bootstrap configures a narrow privilege rule allowing only `vmapi` to run `netctl bridge-create` and `netctl bridge-delete` without a password.
+```bash
+git clone https://github.com/theonemule/LiteVMM.git
+cd LiteVMM
+```
+
+For an existing installation, update the same working tree instead:
+
+```bash
+cd LiteVMM
+git pull --ff-only
+```
+
+Choose exactly one installation profile:
+
+```bash
+# Backup only
+sudo ./install.sh --profile backup --port 5186
+
+# VM + backup
+sudo ./install.sh --profile virtualization --port 5186
+
+# Docker + backup
+sudo ./install.sh --profile docker --port 5186
+
+# VM + Docker + backup
+sudo ./install.sh --profile virtualization-docker --port 5186
+```
+
+Omit `--profile` to use the interactive installer. The menu presents the same four choices in that order. Add `--certbot` when the host should manage a Let's Encrypt certificate itself.
+
+On Debian and Ubuntu, LiteVMM binds the management listener to loopback by default. Until HTTPS is configured, keep the SSH session open with local forwarding from the workstation:
+
+```bash
+ssh -L 5186:127.0.0.1:5186 YOUR_LOGIN@HOST
+```
+
+Then browse to `http://127.0.0.1:5186/`. Alpine uses Lighttpd on the configured management port, so firewall or network exposure should be restricted until HTTPS is enabled.
+
+Re-running `install.sh` on the same host is the supported upgrade/reconciliation path. It updates packages, runtime files, services, authentication policy, and profile-specific components while preserving host state managed outside the source tree.
+
 
 ### Docker security boundary
 

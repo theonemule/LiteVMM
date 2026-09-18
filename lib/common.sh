@@ -16,10 +16,10 @@ vmapi_has_capability() {
   local cap=${1:-}
   case "$cap" in
     api|system|metrics|cluster|admin) return 0;;
-    backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ]];;
+    backup) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ]];;
     backup-create|qemu-kvm|vm-network|vm-console|storage|cloud-init|replication-source) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker ]];;
     backplane-client) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
-    storage-backplane) [[ ${VMAPI_BACKPLANE_SERVER:-false} == true && ( $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == virtualization-docker || $VMAPI_PROFILE == backup ) ]];;
+    storage-backplane) [[ ${VMAPI_BACKPLANE_SERVER:-false} == true ]];;
     peer-volume-client) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     docker|compose|container-terminal) [[ $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;
     files|host-terminal) [[ $VMAPI_PROFILE == virtualization || $VMAPI_PROFILE == docker || $VMAPI_PROFILE == virtualization-docker ]];;

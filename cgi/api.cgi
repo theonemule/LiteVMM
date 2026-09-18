@@ -61,9 +61,9 @@ require_capability() {
 capabilities_json() {
   local caps=(api system metrics cluster admin) cap first=true
   case "$VMAPI_PROFILE" in
-    virtualization) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
-    docker) caps+=(docker compose container-terminal registry peer-volume-client backplane-client files host-terminal);;
-    virtualization-docker) caps+=(qemu-kvm backup backup-create vm-network vm-console storage cloud-init replication-source docker compose container-terminal registry peer-volume-client backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
+    virtualization) caps+=(qemu-kvm backup backup-create backup-storage vm-network vm-console storage cloud-init replication-source backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
+    docker) caps+=(docker compose container-terminal registry peer-volume-client backup backup-storage backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
+    virtualization-docker) caps+=(qemu-kvm backup backup-create backup-storage vm-network vm-console storage cloud-init replication-source docker compose container-terminal registry peer-volume-client backplane-client files host-terminal); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
     backup) caps+=(backup backup-storage); vmapi_has_capability storage-backplane && caps+=(storage-backplane);;
   esac
   printf '['
@@ -324,7 +324,7 @@ read_params
 
 if [[ -z $route ]]; then
   caps=$(capabilities_json)
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":11,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":12,\"profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
 fi
 
 case "${P[0]-}" in

@@ -32,13 +32,13 @@ INSTALL_CERTBOT=${VMAPI_INSTALL_CERTBOT:-false}
 
 usage() {
   cat <<'TXT'
-Usage: sudo ./install.sh [--profile virtualization|docker|virtualization-docker|backup] [--port PORT] [--certbot]
+Usage: sudo ./install.sh [--profile backup|virtualization|docker|virtualization-docker] [--port PORT] [--certbot]
 
-The LiteVMM API is always installed. Workload profiles are mutually exclusive:
-  virtualization  QEMU/KVM, VM networking/consoles, and VM backups
-  docker                  Docker/Compose management and container terminals
-  virtualization-docker   QEMU/KVM + backups + Docker/Compose
-  backup                  paired backup storage and archive management only
+The LiteVMM API and backup storage are always installed. Choose one workload profile:
+  backup                  Backup only
+  virtualization          VM + backup
+  docker                  Docker + backup
+  virtualization-docker   VM + Docker + backup
 TXT
 }
 valid_port() { [[ ${1:-} =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535)); }
@@ -55,16 +55,15 @@ parse_args() {
 }
 choose_profile() {
   if [[ -z $PROFILE && -t 0 ]]; then
-    printf '%s\n' 'Select LiteVMM installation profile:' '  1) virtualization         QEMU/KVM + backups' '  2) docker                 Docker/Compose' '  3) virtualization-docker  QEMU/KVM + backups + Docker/Compose' '  4) backup                 backup storage only'
+    printf '%s\n' 'Select LiteVMM installation profile:' '  1) backup                 Backup only' '  2) virtualization         VM + backup' '  3) docker                 Docker + backup' '  4) virtualization-docker  VM + Docker + backup'
     read -r -p 'Profile [1]: ' choice
-    case ${choice:-1} in 1) PROFILE=virtualization;; 2) PROFILE=docker;; 3) PROFILE=virtualization-docker;; 4) PROFILE=backup;; *) die 'Invalid profile selection';; esac
+    case ${choice:-1} in 1) PROFILE=backup;; 2) PROFILE=virtualization;; 3) PROFILE=docker;; 4) PROFILE=virtualization-docker;; *) die 'Invalid profile selection';; esac
   fi
-  PROFILE=${PROFILE:-virtualization}
+  PROFILE=${PROFILE:-backup}
   [[ $PROFILE == virtualization || $PROFILE == docker || $PROFILE == virtualization-docker || $PROFILE == backup ]] || die "Invalid profile: $PROFILE"
   valid_port "$HTTP_PORT" || die "Invalid management port: $HTTP_PORT (use 1024-65535)"
   [[ $INSTALL_CERTBOT == true || $INSTALL_CERTBOT == false ]] || die 'VMAPI_INSTALL_CERTBOT must be true or false'
 }
-
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_source() { [[ -e "$BASE/$1" ]] || die "Missing installer source: $1"; }
 
@@ -99,7 +98,7 @@ install_packages() {
       apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth lighttpd-mod_openssl apache2-utils openssh-client
       case $PROFILE in
         virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso nfs-utils websocat;;
-        docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websocat;;
+        docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websockify websocat;;
         virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso docker docker-openrc docker-cli-compose nfs-utils websocat;;
         backup) apk add --no-cache iproute2 nfs-utils websockify;;
       esac
@@ -111,7 +110,7 @@ install_packages() {
       apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils
       case $PROFILE in
         virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso nfs-common nfs-kernel-server websockify;;
-        docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common;;
+        docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server websockify;;
         virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso nfs-common nfs-kernel-server websockify;;
         backup) apt-get install -y --no-install-recommends iproute2 nfs-common nfs-kernel-server websockify;;
       esac
@@ -196,7 +195,7 @@ install_common_files() {
   [[ -f /etc/vmapi/vmapi.conf ]] || install -m 0644 "$BASE/etc/vmapi.conf" /etc/vmapi/vmapi.conf
   set_host_config VMAPI_PROFILE "$PROFILE"
   set_host_config VMAPI_HTTP_PORT "$HTTP_PORT"
-  if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker || $PROFILE == backup ]]; then set_host_config VMAPI_BACKPLANE_SERVER true; else set_host_config VMAPI_BACKPLANE_SERVER false; fi
+  set_host_config VMAPI_BACKPLANE_SERVER true
   install -m 0644 "$BASE/lib/common.sh" /usr/local/lib/vmapi/common.sh
   install -m 0644 "$BASE/VERSION" /usr/share/vmapi/VERSION
   for tool in vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl metricsctl consolectl peerctl vmbackupctl replicationctl registryctl peer-volumectl backplanectl filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
@@ -239,6 +238,8 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl overlay-credentials *, /usr/local/bin/peerctl overlay-profile *, /usr/local/bin/peerctl transport-profile *, /usr/local/bin/peerctl migrate *'
         ;;
       docker)
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list, /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl delete *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/replicationctl replica-purge *, /usr/local/bin/replicationctl replica-show *, /usr/local/bin/replicationctl replica-list'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/dockerexecctl start *, /usr/local/bin/dockerexecctl info *, /usr/local/bin/dockerexecctl touch *, /usr/local/bin/dockerexecctl stop *, /usr/local/bin/dockerexecctl gc'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/registryctl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl transport-profile *'
@@ -317,6 +318,8 @@ configure_alpine() {
       for svc in vmapi-backplane-server vmapi-backplane vmapi-network vmapi-autostart websockify-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
       rc-service vmapi-backplane-server restart; rc-service vmapi-backplane restart; rc-service websockify-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
     docker)
+      rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true
+      rc-service vmapi-backplane-server start || true
       rc-update add vmapi-backplane default >/dev/null 2>&1 || true
       rc-service vmapi-backplane start || true
       rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
@@ -360,7 +363,7 @@ configure_debian() {
   systemctl try-restart fcgiwrap-vmapi.service >/dev/null 2>&1 || true
   case $PROFILE in
     virtualization) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-host-vmapi.service;;
-    docker) systemctl enable --now vmapi-backplane.service; systemctl enable --now docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
+    docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
     virtualization-docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now docker.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
     backup) systemctl enable --now vmapi-backplane-server.service;;
   esac
@@ -414,7 +417,7 @@ choose_profile
 detect_platform
 ensure_admin_user
 install_packages
-if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker || $PROFILE == backup ]]; then disable_native_nfs; fi
+disable_native_nfs
 getent group vmapi-admin >/dev/null || groupadd --system vmapi-admin
 getent group vmapi >/dev/null || groupadd --system vmapi
 case $PROFILE in virtualization) getent group kvm >/dev/null || groupadd --system kvm;; docker) getent group docker >/dev/null || groupadd --system docker;; virtualization-docker) getent group kvm >/dev/null || groupadd --system kvm; getent group docker >/dev/null || groupadd --system docker;; esac

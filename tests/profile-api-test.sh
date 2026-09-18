@@ -32,14 +32,15 @@ x=json.loads(sys.argv[1])
 assert 'storage-backplane' in x['capabilities']
 PY
 
-docker=$(api docker /api/ | json_body)
+docker=$(api docker /api/ true | json_body)
 python3 - "$docker" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
 assert 'docker' in x['capabilities'] and 'registry' in x['capabilities']
 assert 'backplane-client' in x['capabilities']
 assert 'peer-volume-client' in x['capabilities']
-assert 'storage-backplane' not in x['capabilities']
+assert 'backup' in x['capabilities'] and 'backup-storage' in x['capabilities']
+assert 'storage-backplane' in x['capabilities']
 assert 'qemu-kvm' not in x['capabilities']
 PY
 
@@ -47,7 +48,7 @@ virt=$(api virtualization /api/ true | json_body)
 python3 - "$virt" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
-for cap in ('qemu-kvm','backup','replication-source','backplane-client','storage-backplane'):
+for cap in ('qemu-kvm','backup','backup-create','backup-storage','replication-source','backplane-client','storage-backplane'):
     assert cap in x['capabilities'], cap
 assert 'docker' not in x['capabilities']
 PY
@@ -56,7 +57,7 @@ combo=$(api virtualization-docker /api/ true | json_body)
 python3 - "$combo" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
-for cap in ('qemu-kvm','backup','replication-source','docker','registry','peer-volume-client','backplane-client','storage-backplane'):
+for cap in ('qemu-kvm','backup','backup-create','backup-storage','replication-source','docker','registry','peer-volume-client','backplane-client','storage-backplane'):
     assert cap in x['capabilities'], cap
 PY
 echo 'profile API filtering: PASS'

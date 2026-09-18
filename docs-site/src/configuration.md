@@ -8,7 +8,7 @@ title: Configuration reference
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `VMAPI_PROFILE` | `virtualization` | Installed workload surface: `virtualization`, `docker`, `virtualization-docker`, or `backup`. `virtualization` always includes VM backups; `virtualization-docker` adds Docker/Compose to that stack. The CGI rejects endpoints outside the selected profile. |
+| `VMAPI_PROFILE` | `backup` | `backup` = backup only, `virtualization` = VM + backup, `docker` = Docker + backup, `virtualization-docker` = VM + Docker + backup. The CGI rejects endpoints outside the selected profile. |
 | `VMAPI_HTTP_PORT` | `5186` | LiteVMM management HTTP/HTTPS port. |
 | `VMAPI_TLS_ENABLED` | `false` | Whether the management listener uses the configured TLS certificate. Managed by `certctl`. |
 | `VMAPI_TLS_MODE` | `none` | Active certificate source such as `certbot`, `imported-csr`, or `imported`. Managed by `certctl`. |
