@@ -21,6 +21,16 @@ state_disk_indexes(){ sed -nE 's/^DISK_([0-9]+)_JOB=.*/\1/p' "$1" | sort -n -u; 
 ensure_dirs(){ install -d -m 0750 "$JOB_ROOT"; }
 # Load a job's state.conf, clearing DISK_* values left over from another job.
 load_state(){ [[ -z ${!DISK_@} ]] || unset "${!DISK_@}"; PEER=''; SPEED=0; OWNER=''; source "$1"; }
+# A pause marker holds a VM's replication off while another block job (a live
+# backup) needs its disks. It records the holder's PID so a holder that dies
+# without unpausing cannot leave replication stopped: the marker is then stale.
+pause_file(){ printf '%s/paused\n' "$(job_dir "$1")"; }
+replication_paused(){
+  local file pid; file=$(pause_file "$1"); [[ -f $file ]] || return 1
+  pid=$(sed -n 's/^PID=//p' "$file" | head -n1)
+  [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 0
+  rm -f -- "$file"; return 1
+}
 replica_id(){ printf '%s' "$1/$2/$3" | sha256sum | cut -c1-24; }
 
 qmp(){
@@ -154,6 +164,7 @@ resume_replication(){
   local vm=${1:?VM required} dir state peer speed idx job target meta bytes obj current
   validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"; [[ -r $state ]] || return 0
   require_vm "$vm"; [[ $(vm_state "$vm") == running ]] || return 0
+  ! replication_paused "$vm" || return 0
   PEER=''; SPEED=0; OWNER=''; source "$state"; peer=$PEER; speed=${SPEED:-0}
   valid_peer_id "$peer"; validate_int "$speed"
   "$BACKPLANECTL" connect "$peer" >/dev/null
@@ -187,8 +198,8 @@ status_replication(){
   validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"
   [[ -r $state ]] || { printf '{"vm":"%s","configured":false}\n' "$vm"; return; }
   PEER=''; source "$state"; peer=$PEER; backplane_ready "$peer" && connected=true
-  printf '{"vm":"%s","configured":true,"peer_id":"%s","running":%s,"transport":"nfs4-wss-backplane","disks":[' \
-    "$vm" "$peer" "$([[ $(vm_state "$vm") == running ]] && echo true || echo false)"
+  printf '{"vm":"%s","configured":true,"paused":%s,"peer_id":"%s","running":%s,"transport":"nfs4-wss-backplane","disks":[' \
+    "$vm" "$(replication_paused "$vm" && echo true || echo false)" "$peer" "$([[ $(vm_state "$vm") == running ]] && echo true || echo false)"
   while IFS= read -r idx; do
     eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
     ready=false; offset=0; len=0; obj=''
@@ -202,6 +213,41 @@ status_replication(){
       "$idx" "$job" "$ready" "$offset" "$len" "$connected" "$connected"
   done < <(state_disk_indexes "$state")
   printf ']}\n'
+}
+
+# QEMU will not start another block job (such as a live backup) on a node a
+# mirror job owns, so a holder pauses replication around its own job. Resuming
+# restarts each mirror with sync=full, which resends the disk to the peer.
+pause_replication(){
+  local vm=${1:?VM required} holder=${2:?holder PID required} dir state idx job deadline tmp
+  validate_vm_name "$vm"; validate_positive_int "$holder"; dir=$(job_dir "$vm"); state="$dir/state.conf"
+  [[ -r $state ]] || { printf '{"vm":"%s","configured":false,"paused":false}\n' "$vm"; return 0; }
+  kill -0 "$holder" 2>/dev/null || die "Pause holder is not running: $holder"
+  tmp="$dir/.paused.$$"; printf 'PID=%s\nSINCE=%s\n' "$holder" "$(date +%s)" > "$tmp"; mv -f -- "$tmp" "$(pause_file "$vm")"
+  load_state "$state"
+  if [[ $(vm_state "$vm") == running ]]; then
+    while IFS= read -r idx; do
+      eval "job=\${DISK_${idx}_JOB:-}"; [[ -n $job ]] || continue
+      deadline=$((SECONDS + 60))
+      # Re-issue the cancel while waiting: a daemon pass that read the job list
+      # just before the marker appeared may have restarted the mirror.
+      while [[ -n $(query_job_json "$vm" "$job") ]]; do
+        ((SECONDS < deadline)) || { rm -f -- "$(pause_file "$vm")"; die "Replication job $job for $vm did not stop"; }
+        cancel_job "$vm" "$job"; sleep 0.5
+      done
+    done < <(state_disk_indexes "$state")
+  fi
+  printf '{"vm":"%s","configured":true,"paused":true,"holder":%s}\n' "$vm" "$holder"
+}
+
+unpause_replication(){
+  local vm=${1:?VM required} dir
+  validate_vm_name "$vm"; dir=$(job_dir "$vm")
+  # Drop the marker first so the daemon retries even if this resume fails.
+  rm -f -- "$(pause_file "$vm")"
+  [[ -r $dir/state.conf ]] || { printf '{"vm":"%s","configured":false,"paused":false}\n' "$vm"; return 0; }
+  resume_replication "$vm"
+  status_replication "$vm"
 }
 
 stop_replication(){
@@ -327,6 +373,8 @@ case ${1:-help} in
   resume-all) resume_all;;
   status) shift; status_replication "$@";;
   stop) shift; stop_replication "$@";;
+  pause) shift; pause_replication "$@";;
+  unpause) shift; unpause_replication "$@";;
   list) list_replications;;
   replica-show) shift; replica_show "$@";;
   replica-list) replica_list;;
@@ -334,6 +382,6 @@ case ${1:-help} in
   revoke-peer) shift; revoke_peer "$@";;
   suspend) suspend;;
   daemon) daemon;;
-  help|-h|--help) echo 'replicationctl start VM PEER_ID [BYTES_PER_SEC] | resume VM | status VM | stop VM | list | replica-list | replica-show ID | replica-purge ID [true|false] | daemon';;
+  help|-h|--help) echo 'replicationctl start VM PEER_ID [BYTES_PER_SEC] | resume VM | status VM | stop VM | pause VM HOLDER_PID | unpause VM | list | replica-list | replica-show ID | replica-purge ID [true|false] | daemon';;
   *) die "Unknown replication command: ${1:-}";;
 esac

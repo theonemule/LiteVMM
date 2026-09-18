@@ -17,6 +17,9 @@ SELF=${VMAPI_BACKUPCTL:-/usr/local/bin/vmbackupctl}
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
 BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
 BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
+REPLICATIONCTL=${VMAPI_REPLICATIONCTL:-/usr/local/bin/replicationctl}
+QMP_TIMEOUT=${VMAPI_QMP_TIMEOUT:-30}
+PAUSED_REPLICATION=''
 
 usage() { cat <<'TXT'
 vmbackupctl - VM archive backup manager
@@ -55,34 +58,95 @@ backup_progress() {
 backup_dir() { local root=${2:-$BACKUP_ROOT}; validate_vm_name "$1"; valid_destination "$root"; printf '%s/%s\n' "$root" "$1"; }
 archive_path() { printf '%s/%s\n' "$(backup_dir "$1")" "$2"; }
 require_stopped_vm() { require_vm "$1"; [[ $($VMCTL status "$1") == stopped ]] || die "VM must be stopped for a consistent backup; use --live for QMP disk copies: $1"; }
+# Send one QMP command and print only its reply. QEMU interleaves asynchronous
+# events (JOB_STATUS_CHANGE, BLOCK_JOB_*) with command replies, so the reply is
+# matched by a per-command id rather than taken from the end of the stream.
 qmp() {
-  local name=$1 payload=$2 socket
+  local name=$1 payload=$2 socket id line reply='' in out
   socket="$(vm_dir "$name")/runtime/qmp.sock"
   [[ -S $socket ]] || die 'QMP socket is unavailable'
   command -v socat >/dev/null 2>&1 || die 'socat is required for live backups'
-  { printf '%s\n' '{"execute":"qmp_capabilities"}'; printf '%s\n' "$payload"; } | socat -T 10 - "UNIX-CONNECT:$socket" | tail -n1
+  [[ $payload == '{"execute"'* ]] || die 'Invalid QMP command'
+  id="vmbackupctl-$$-$RANDOM"
+  coproc QMP_IO { exec socat - "UNIX-CONNECT:$socket" 2>/dev/null; }
+  in=${QMP_IO[0]:-}; out=${QMP_IO[1]:-}
+  [[ -n $in && -n $out ]] || die 'Could not connect to QMP'
+  printf '%s\n%s\n' '{"execute":"qmp_capabilities"}' "{\"id\":\"$id\",${payload#\{}" >&"$out" 2>/dev/null || true
+  while IFS= read -r -t "$QMP_TIMEOUT" line <&"$in"; do
+    if [[ $line == *"\"id\": \"$id\""* || $line == *"\"id\":\"$id\""* ]]; then reply=$line; break; fi
+  done
+  kill "$QMP_IO_PID" 2>/dev/null || true; wait "$QMP_IO_PID" 2>/dev/null || true
+  [[ -n $reply ]] || die "QMP did not answer: $payload"
+  printf '%s\n' "$reply"
 }
-live_disk_copy() {
-  local name=$1 target_dir=$2 conf idx file format bus target job output device
-  conf=$(vm_conf "$name")
+# JobInfo objects in a query-jobs reply contain no nested objects.
+qmp_job_info() { printf '%s' "$1" | grep -o '{[^{}]*"id": *"'"$2"'"[^{}]*}' | head -n1 || true; }
+json_str_field() { printf '%s' "$1" | sed -n 's/.*"'"$2"'": *"\(\([^"\\]\|\\.\)*\)".*/\1/p' | head -n1; }
+json_int_field() { printf '%s' "$1" | sed -n 's/.*"'"$2"'": *\([0-9][0-9]*\).*/\1/p' | head -n1; }
+
+# Continuous replication keeps a drive-mirror job on every disk, and QEMU will
+# not start a backup job on a node another block job owns ("Node 'drive0' is
+# busy: block device is in use by block job: mirror"). Hold replication off for
+# the disk copy only; replicationctl resumes it with a full resync afterwards.
+pause_replication_for_backup() {
+  local name=$1
+  [[ -x $REPLICATIONCTL ]] || return 0
+  [[ $("$REPLICATIONCTL" status "$name" 2>/dev/null || true) == *'"configured":true'* ]] || return 0
+  backup_progress 25 'Pausing continuous replication for the disk copy'
+  "$REPLICATIONCTL" pause "$name" "$$" >/dev/null || die "Could not pause continuous replication for $name"
+  PAUSED_REPLICATION=$name
+}
+resume_paused_replication() {
+  local name=$PAUSED_REPLICATION
+  [[ -n $name ]] || return 0
+  PAUSED_REPLICATION=''
+  "$REPLICATIONCTL" unpause "$name" >/dev/null 2>&1 || err "Continuous replication for $name did not resume; the replication service will retry it"
+}
+
+# Print the number of disks, refusing any a live backup cannot copy.
+live_backup_disk_count() {
+  local conf idx format bus count=0
+  conf=$(vm_conf "$1")
   while IFS= read -r idx; do
-    file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" ''); format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2); bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" virtio)
+    format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2); bus=$(cfg_get_file "$conf" "DISK_${idx}_BUS" virtio)
     [[ $format == qcow2 && $bus == virtio ]] || die "Live backup supports virtio qcow2 disks only: disk$idx"
+    count=$((count + 1))
+  done < <(indexes_for "$conf" DISK)
+  printf '%s\n' "$count"
+}
+
+live_disk_copy() {
+  local name=$1 target_dir=$2 conf idx file target job output info status error current total disks copied=0
+  conf=$(vm_conf "$name"); disks=$(live_backup_disk_count "$name")
+  while IFS= read -r idx; do
+    file=$(cfg_get_file "$conf" "DISK_${idx}_FILE" '')
+    # vmctl attaches every virtio disk as drive<idx>; there is no other name.
     target="$target_dir/$file"; job="vmapi-backup-$idx"
-    device="drive$idx"
-    output=$(qmp "$name" "{\"execute\":\"drive-backup\",\"arguments\":{\"device\":\"$device\",\"target\":\"$target\",\"format\":\"qcow2\",\"sync\":\"full\",\"job-id\":\"$job\",\"auto-finalize\":true,\"auto-dismiss\":true}}")
-    if [[ $output == *'"error"'* ]]; then
-      device="virtio$idx"
-      output=$(qmp "$name" "{\"execute\":\"drive-backup\",\"arguments\":{\"device\":\"$device\",\"target\":\"$target\",\"format\":\"qcow2\",\"sync\":\"full\",\"job-id\":\"$job\",\"auto-finalize\":true,\"auto-dismiss\":true}}")
+    info=$(qmp_job_info "$(qmp "$name" '{"execute":"query-jobs"}')" "$job")
+    if [[ -n $info ]]; then
+      [[ $(json_str_field "$info" status) == concluded ]] || die "A backup of disk$idx is already running for $name"
+      qmp "$name" "{\"execute\":\"job-dismiss\",\"arguments\":{\"id\":\"$job\"}}" >/dev/null
     fi
+    # auto-dismiss stays off: a failed copy must remain queryable as a concluded
+    # job carrying its error instead of vanishing and passing for success.
+    output=$(qmp "$name" "{\"execute\":\"drive-backup\",\"arguments\":{\"device\":\"drive$idx\",\"target\":\"$(json_escape "$target")\",\"format\":\"qcow2\",\"sync\":\"full\",\"job-id\":\"$job\",\"auto-finalize\":true,\"auto-dismiss\":false}}")
     [[ $output == *'"return"'* ]] || die "QMP could not start disk$idx backup: $output"
     while :; do
-      output=$(qmp "$name" '{"execute":"query-block-jobs"}')
-      [[ $output == *"$job"* ]] || break
-      [[ $output != *'"error"'* ]] || die "QMP disk copy failed: $output"
+      info=$(qmp_job_info "$(qmp "$name" '{"execute":"query-jobs"}')" "$job")
+      [[ -n $info ]] || die "QMP disk$idx backup job disappeared before it completed"
+      status=$(json_str_field "$info" status)
+      [[ $status != concluded ]] || break
+      current=$(json_int_field "$info" current-progress); total=$(json_int_field "$info" total-progress)
+      if [[ ${total:-0} -gt 0 ]]; then
+        backup_progress $((30 + 40 * (copied * total + ${current:-0}) / (disks * total))) "Creating live disk copies (disk$idx)"
+      fi
       sleep 1
     done
+    error=$(json_str_field "$info" error)
+    qmp "$name" "{\"execute\":\"job-dismiss\",\"arguments\":{\"id\":\"$job\"}}" >/dev/null
+    [[ -z $error ]] || die "QMP disk$idx copy failed: $error"
     [[ -f $target ]] || die "QMP disk copy did not create $file"
+    copied=$((copied + 1))
   done < <(indexes_for "$conf" DISK)
 }
 stage_vm_config() {
@@ -159,18 +223,24 @@ cmd_create() {
   install -d -o vmapi -g vmapi -m 0750 "$destination" "$(backup_dir "$name" "$destination")"
   stamp=$(date -u +%Y%m%dT%H%M%SZ); archive="${name}-${label}-${stamp}.tar.gz"; dir=$(backup_dir "$name" "$destination"); tmp="$dir/.${archive}.tmp"
   stage=$(mktemp -d "$dir/.archive.XXXXXX")
+  # Clean up on every exit, not only a normal return: a failed live copy used
+  # to strand full-size disk copies here, and a paused replication must resume.
+  trap "resume_paused_replication; rm -rf -- $(printf '%q' "$stage") $(printf '%q' "$tmp")" EXIT
   backup_progress 15 'Copying VM configuration'
   stage_vm_config "$name" "$stage"
   if $live; then
     [[ $($VMCTL status "$name") == running ]] || die "VM is not running; use a normal backup: $name"
     mkdir -p "$stage/$name/disks"; chown vmapi:vmapi "$stage" "$stage/$name" "$stage/$name/disks" 2>/dev/null || true; chmod 0750 "$stage" "$stage/$name" "$stage/$name/disks"
+    # Reject unsupported disks before touching replication.
+    live_backup_disk_count "$name" >/dev/null
+    pause_replication_for_backup "$name"
     backup_progress 30 'Creating live disk copies'
     live_disk_copy "$name" "$stage/$name/disks"
+    resume_paused_replication
   else
     backup_progress 30 'Copying attached virtual disks'
     stage_vm_disks "$name" "$stage"
   fi
-  trap 'rm -rf -- "$stage"' RETURN
   backup_progress 75 'Compressing backup archive'
   tar -C "$stage" -czf "$tmp" "$name"
   chmod 0640 "$tmp"; chown vmapi:vmapi "$tmp" 2>/dev/null || true; mv -f "$tmp" "$dir/$archive"
