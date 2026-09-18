@@ -203,8 +203,8 @@ qemu_image_info() {
   if out=$("$QEMU_IMG" info -U --output=json "$file" 2>/dev/null); then :
   elif out=$("$QEMU_IMG" info --output=json "$file" 2>/dev/null); then :
   else out=''; fi
-  virtual=$(printf '%s\n' "$out" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-  actual=$(printf '%s\n' "$out" | sed -n 's/.*"actual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+  virtual=$(printf '%s\n' "$out" | qemu_img_top_int virtual-size)
+  actual=$(printf '%s\n' "$out" | qemu_img_top_int actual-size)
   if [[ ! $virtual =~ ^[0-9]+$ ]]; then virtual=$(stat -c %s "$file" 2>/dev/null || echo 0); fi
   if [[ ! $actual =~ ^[0-9]+$ ]]; then actual=$(( $(du -k "$file" 2>/dev/null | awk '{print $1+0}') * 1024 )); fi
   printf '%s %s\n' "$virtual" "$actual"

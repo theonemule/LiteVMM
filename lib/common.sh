@@ -271,6 +271,37 @@ json_escape() {
   printf '%s' "$s"
 }
 
+# Print only the direct members of the top-level JSON object read from stdin,
+# dropping everything nested in child objects or arrays. qemu-img >= 8.0 puts a
+# "children" array ahead of the top-level fields, and every child node carries
+# its own "virtual-size"/"actual-size" (for the protocol node that is the host
+# file length), so a first-match grep returns the wrong node's value.
+json_top_level() {
+  awk '{
+    line = $0 "\n"; n = length(line)
+    for (i = 1; i <= n; i++) {
+      c = substr(line, i, 1)
+      if (in_str) {
+        if (depth == 1) printf "%s", c
+        if (esc) esc = 0; else if (c == "\\") esc = 1; else if (c == "\"") in_str = 0
+        continue
+      }
+      if (c == "\"") { in_str = 1; if (depth == 1) printf "%s", c; continue }
+      if (c == "{" || c == "[") { depth++; continue }
+      if (c == "}" || c == "]") { depth--; continue }
+      if (depth == 1) printf "%s", c
+    }
+  }'
+}
+
+# qemu_img_top_int FIELD: read `qemu-img info --output=json` on stdin and print
+# the image's own integer FIELD (e.g. virtual-size), ignoring child nodes.
+qemu_img_top_int() {
+  local field=${1:?field required}
+  [[ $field =~ ^[a-z-]+$ ]] || die "Invalid qemu-img field: $field"
+  json_top_level | sed -n 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1
+}
+
 probe_ovmf_code() {
   local p
   [[ -n ${OVMF_CODE:-} && -r ${OVMF_CODE:-} ]] && { printf '%s\n' "$OVMF_CODE"; return; }

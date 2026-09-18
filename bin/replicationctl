@@ -19,6 +19,8 @@ valid_replica_id(){ [[ ${1:-} =~ ^[a-f0-9]{24}$ ]] || die "Invalid replica id: $
 job_dir(){ validate_vm_name "$1"; printf '%s/%s\n' "$JOB_ROOT" "$1"; }
 state_disk_indexes(){ sed -nE 's/^DISK_([0-9]+)_JOB=.*/\1/p' "$1" | sort -n -u; }
 ensure_dirs(){ install -d -m 0750 "$JOB_ROOT"; }
+# Load a job's state.conf, clearing DISK_* values left over from another job.
+load_state(){ [[ -z ${!DISK_@} ]] || unset "${!DISK_@}"; PEER=''; SPEED=0; OWNER=''; source "$1"; }
 replica_id(){ printf '%s' "$1/$2/$3" | sha256sum | cut -c1-24; }
 
 qmp(){
@@ -68,7 +70,7 @@ image_virtual_size(){
   # replication must not try to acquire a conflicting shared lock.
   out=$("$QEMU_IMG" info --force-share --output=json "$file" 2>&1) ||
     die "Could not inspect image $file: $out"
-  bytes=$(printf '%s' "$out" | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+  bytes=$(printf '%s' "$out" | qemu_img_top_int virtual-size)
   validate_positive_int "$bytes"
   printf '%s\n' "$bytes"
 }
@@ -126,10 +128,13 @@ start_replication(){
   [[ $remote == /* && -d $remote ]] || die 'Peer backplane replica directory is unavailable'
   owner=$("$PEERCTL" identity | sed -n 's/.*"node_id":"\([a-fA-F0-9]*\)".*/\1/p' | head -n1)
   valid_peer_id "$owner"; owner=${owner,,}
+  # die() exits directly, which never fires an ERR trap, so a rejected
+  # drive-mirror used to leave a half-configured job behind for the daemon to
+  # retry forever. Roll back on any exit until every disk's mirror is running.
+  trap "stop_replication $(printf '%q' "$vm") true >/dev/null 2>&1 || true; rm -rf -- $(printf '%q' "$dir")" EXIT
   install -d -m 0700 "$dir"; state="$dir/state.conf"
   printf 'PEER=%q\nSPEED=%q\nOWNER=%q\n' "${peer,,}" "$speed" "$owner" > "$state"
   conf=$(vm_conf "$vm")
-  trap 'stop_replication "$vm" true >/dev/null 2>&1 || true' ERR
   while IFS= read -r idx; do
     source=$(vm_disk_path_index "$vm" "$idx")
     [[ -f $source ]] || die "Disk file missing: $source"
@@ -141,12 +146,12 @@ start_replication(){
       "$idx" "$job" "$idx" "$target" "$idx" "$meta" "$idx" "$bytes" >> "$state"
     start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
   done < <(indexes_for "$conf" DISK)
-  trap - ERR
+  trap - EXIT
   status_replication "$vm"
 }
 
 resume_replication(){
-  local vm=${1:?VM required} dir state peer speed idx job target meta bytes obj
+  local vm=${1:?VM required} dir state peer speed idx job target meta bytes obj current
   validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"; [[ -r $state ]] || return 0
   require_vm "$vm"; [[ $(vm_state "$vm") == running ]] || return 0
   PEER=''; SPEED=0; OWNER=''; source "$state"; peer=$PEER; speed=${SPEED:-0}
@@ -159,6 +164,17 @@ resume_replication(){
     # An active mirror job owns the destination qcow2 lock. Do not inspect or
     # recreate its target from the daemon while QEMU is writing it.
     if [[ -z $obj ]]; then
+      # Builds that misread qemu-img's JSON recorded the source's host file
+      # length instead of its virtual size. Re-measure before (re)creating the
+      # target so that state heals itself instead of failing every cycle.
+      current=$(image_virtual_size "$(vm_disk_path_index "$vm" "$idx")")
+      if [[ $current != "$bytes" ]]; then
+        sed -i "s/^DISK_${idx}_BYTES=.*/DISK_${idx}_BYTES=${current}/" "$state"; bytes=$current
+        if [[ -r $meta ]]; then
+          read_meta "$meta"
+          if [[ -n $OWNER && -n $FILE_NAME ]]; then write_meta "$meta" "$OWNER" "$vm" "$idx" "$bytes" "$FILE_NAME" true; fi
+        fi
+      fi
       ensure_replica_file "$target" "$bytes"
       start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
     fi
@@ -192,6 +208,7 @@ stop_replication(){
   local vm=${1:?VM required} quiet=${2:-false} dir state idx job meta
   validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"
   [[ -r $state ]] || { $quiet || printf '{"stopped":true,"vm":"%s"}\n' "$vm"; return; }
+  load_state "$state"
   while IFS= read -r idx; do
     eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
     [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"
@@ -290,6 +307,7 @@ daemon_cleanup(){
   local d vm state idx job meta
   for d in "$JOB_ROOT"/*; do
     [[ -d $d ]] || continue; vm=$(basename "$d"); state="$d/state.conf"; [[ -r $state ]] || continue
+    load_state "$state"
     while IFS= read -r idx; do
       eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
       [[ $(vm_state "$vm") == running && -n $job ]] && cancel_job "$vm" "$job"

@@ -24,8 +24,28 @@ truncate -s 1048576 "$T/vms/demo/disk0.qcow2"
 
 cat > "$T/qemu-img" <<'MOCK'
 #!/usr/bin/env bash
+# Real qemu-img >= 8.0 shape: the protocol child's sizes (the host file) come
+# first and must not be mistaken for the image's own.
 cat <<'JSON'
-{"virtual-size":10737418240,"actual-size":268435456,"format":"qcow2"}
+{
+    "children": [
+        {
+            "name": "file",
+            "info": {
+                "children": [
+                ],
+                "virtual-size": 268500992,
+                "filename": "disk0.qcow2",
+                "format": "file",
+                "actual-size": 111
+            }
+        }
+    ],
+    "virtual-size": 10737418240,
+    "filename": "disk0.qcow2",
+    "format": "qcow2",
+    "actual-size": 268435456
+}
 JSON
 MOCK
 chmod +x "$T/qemu-img"
