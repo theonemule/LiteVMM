@@ -10,6 +10,8 @@ source "$LIB"
 BACKUP_ROOT=${VMAPI_BACKUP_ROOT:-/var/lib/vmapi/backups}
 SCHEDULE_ROOT=${VMAPI_BACKUP_SCHEDULE_ROOT:-/etc/vmapi/backups}
 CRONTAB=${VMAPI_BACKUP_CRONTAB:-/etc/crontabs/root}
+CRON_D_ROOT=${VMAPI_BACKUP_CRON_D_ROOT:-/etc/cron.d}
+CRON_STYLE=${VMAPI_BACKUP_CRON_STYLE:-auto}
 LOG_ROOT=${VMAPI_BACKUP_LOG_ROOT:-/var/log/vmapi/backups}
 JOB_ROOT=${VMAPI_BACKUP_JOB_ROOT:-/var/lib/vmapi/backup-jobs}
 VMCTL=${VMCTL:-/usr/local/bin/vmctl}
@@ -35,6 +37,8 @@ Commands:
   restore VM ARCHIVE [--destination DIR] [--peer NODE_ID] [--replace]
   delete VM ARCHIVE
   schedule VM CRON [--label POLICY] [--destination DIR] [--keep COUNT] [--live] [--peer NODE_ID]
+  scheduled-run VM POLICY          Run one configured schedule (cron entry point)
+  sync-schedules                   Rebuild native cron entries from saved schedules
   unschedule VM [POLICY]
   schedules
 TXT
@@ -399,22 +403,146 @@ cmd_restore() {
   cmd_import_file "$archive" "$source"
 }
 cmd_delete() { local name=${1:?VM name required} archive=${2:?archive required} source; source=$(find_archive "$name" "$archive") || die 'Backup archive not found'; rm -f -- "$source"; }
+valid_cron_expr() {
+  local expr=$1 field
+  local -a fields
+  read -r -a fields <<< "$expr"
+  [[ ${#fields[@]} -eq 5 ]] || die 'Cron expression must contain exactly five fields'
+  for field in "${fields[@]}"; do
+    [[ $field =~ ^[-A-Za-z0-9*/,]+$ ]] || die "Invalid cron field: $field"
+  done
+}
+cron_style() {
+  case "$CRON_STYLE" in
+    alpine|debian) printf '%s\n' "$CRON_STYLE";;
+    auto)
+      if [[ -f /etc/alpine-release ]]; then printf 'alpine\n'; else printf 'debian\n'; fi;;
+    *) die "Invalid backup cron style: $CRON_STYLE";;
+  esac
+}
+cron_tag() { printf '# vmapi-backup:%s:%s\n' "$1" "$2"; }
+cron_d_file() { printf '%s/vmapi-backup-%s-%s\n' "$CRON_D_ROOT" "$1" "$2"; }
+remove_schedule_runtime() {
+  local name=$1 label=$2 tag
+  tag=$(cron_tag "$name" "$label")
+  sed -i "\|${tag%$'\n'}$|d" "$CRONTAB" 2>/dev/null || true
+  rm -f -- "$(cron_d_file "$name" "$label")"
+}
+install_schedule_runtime() {
+  local name=$1 label=$2 cron=$3 log tag tmp style
+  validate_vm_name "$name"; [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'
+  valid_cron_expr "$cron"
+  log="$LOG_ROOT/$name-$label.log"; tag=$(cron_tag "$name" "$label"); style=$(cron_style)
+  install -d -m 0755 "$LOG_ROOT"
+  remove_schedule_runtime "$name" "$label"
+  case "$style" in
+    alpine)
+      install -d -m 0755 "$(dirname "$CRONTAB")"
+      touch "$CRONTAB"; chmod 0600 "$CRONTAB"
+      printf '%s %q scheduled-run %q %q >> %q 2>&1 %s' \
+        "$cron" "$SELF" "$name" "$label" "$log" "$tag" >> "$CRONTAB";;
+    debian)
+      install -d -m 0755 "$CRON_D_ROOT"
+      tmp="$(cron_d_file "$name" "$label").tmp.$$"
+      {
+        printf 'SHELL=/bin/bash\n'
+        printf 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
+        printf '%s root %q scheduled-run %q %q >> %q 2>&1\n' "$cron" "$SELF" "$name" "$label" "$log"
+      } > "$tmp"
+      chmod 0644 "$tmp"; mv -f -- "$tmp" "$(cron_d_file "$name" "$label")";;
+  esac
+}
+ensure_cron_service() {
+  [[ ${VMAPI_BACKUP_SKIP_CRON_SERVICE:-false} == true ]] && return 0
+  case "$(cron_style)" in
+    alpine)
+      command -v crond >/dev/null 2>&1 || die 'crond is not installed; rerun the LiteVMM installer'
+      if command -v rc-update >/dev/null 2>&1; then rc-update add crond default >/dev/null 2>&1 || true; fi
+      if command -v rc-service >/dev/null 2>&1; then rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1 || die 'Could not start crond'
+      elif ! pgrep -x crond >/dev/null 2>&1; then crond || die 'Could not start crond'; fi;;
+    debian)
+      command -v cron >/dev/null 2>&1 || die 'cron is not installed; rerun the LiteVMM installer'
+      if command -v systemctl >/dev/null 2>&1; then systemctl enable --now cron.service >/dev/null 2>&1 || die 'Could not start cron.service'
+      elif command -v service >/dev/null 2>&1; then service cron start >/dev/null 2>&1 || die 'Could not start cron'
+      elif ! pgrep -x cron >/dev/null 2>&1; then cron || die 'Could not start cron'; fi;;
+  esac
+}
+scheduler_active() {
+  [[ ${VMAPI_BACKUP_SKIP_CRON_SERVICE:-false} == true ]] && { printf 'true\n'; return; }
+  case "$(cron_style)" in
+    alpine) pgrep -x crond >/dev/null 2>&1 && printf 'true\n' || printf 'false\n';;
+    debian) pgrep -x cron >/dev/null 2>&1 && printf 'true\n' || printf 'false\n';;
+  esac
+}
+load_schedule_file() {
+  local file=$1
+  NAME=''; LABEL=''; DESTINATION=''; KEEP=''; LIVE=false; PEER_ID=''; CRON=''
+  [[ -r $file ]] || die "Backup schedule not found: $file"
+  source "$file"
+  validate_vm_name "$NAME"; [[ $LABEL =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'
+  valid_cron_expr "$CRON"
+}
 cmd_schedule() {
-  local name=${1:?VM name required} cron=${2:?cron expression required}; shift 2; local label=scheduled destination=$BACKUP_ROOT keep='' live=false peer_id='' file live_arg='' peer_arg=''
-  validate_vm_name "$name"; [[ $cron != *$'\n'* && $cron != *$'\r'* && $cron != *';'* ]] || die 'Invalid cron expression'
+  local name=${1:?VM name required} cron=${2:?cron expression required}; shift 2
+  local label=scheduled destination=$BACKUP_ROOT keep='' live=false peer_id='' file
+  validate_vm_name "$name"; valid_cron_expr "$cron"
   while (($#)); do case "$1" in --live) live=true; shift;; --label) label=${2:?}; shift 2;; --destination) destination=${2:?}; shift 2;; --keep) keep=${2:?}; shift 2;; --peer) peer_id=${2:?}; shift 2;; *) die "Unknown option: $1";; esac; done
   [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'; valid_destination "$destination"; [[ -z $keep ]] || valid_keep "$keep"; [[ -z $peer_id ]] || valid_peer_id "$peer_id"
   install -d -m 0700 "$SCHEDULE_ROOT"; file="$SCHEDULE_ROOT/$name-$label"
   printf 'NAME=%q\nLABEL=%q\nDESTINATION=%q\nKEEP=%q\nLIVE=%q\nPEER_ID=%q\nCRON=%q\n' "$name" "$label" "$destination" "$keep" "$live" "$peer_id" "$cron" > "$file"; chmod 0600 "$file"
-  install -d -m 0755 /etc/crontabs "$LOG_ROOT"
-  touch "$CRONTAB"; chmod 0600 "$CRONTAB"
-  sed -i "\|# vmapi-backup:$name:$label$|d" "$CRONTAB"
-  $live && live_arg=' --live'
-  [[ -n $peer_id ]] && peer_arg=" --peer $(printf '%q' "$peer_id")"
-  # Run schedules as tracked jobs too.  Cron only needs to enqueue the work;
-  # the per-job state and log retain the real completion result for the UI.
-  printf '%s %s start %q --label %q --destination %q%s%s%s >> %q 2>&1 # vmapi-backup:%s:%s\n' "$cron" "$SELF" "$name" "$label" "$destination" "${keep:+ --keep $(printf '%q' "$keep")}" "$live_arg" "$peer_arg" "$LOG_ROOT/$name-$label.log" "$name" "$label" >> "$CRONTAB"
+  install_schedule_runtime "$name" "$label" "$cron"
+  ensure_cron_service
 }
-cmd_schedules() { local file NAME LABEL DESTINATION KEEP LIVE PEER_ID CRON; shopt -s nullglob; for file in "$SCHEDULE_ROOT"/*; do NAME=''; LABEL=''; DESTINATION=''; KEEP=''; LIVE=''; PEER_ID=''; CRON=''; source "$file"; printf '{"vm":"%s","cron":"%s","label":"%s","destination":"%s","keep":"%s","live":%s,"target":"%s","peer_id":"%s"}\n' "$(json_escape "$NAME")" "$(json_escape "$CRON")" "$(json_escape "$LABEL")" "$(json_escape "$DESTINATION")" "$(json_escape "$KEEP")" "${LIVE:-false}" "$([[ -n $PEER_ID ]] && printf peer || printf local)" "$(json_escape "$PEER_ID")"; done; shopt -u nullglob; }
-cmd_unschedule() { local name=${1:?VM name required} label=${2-}; validate_vm_name "$name"; if [[ -n $label ]]; then rm -f -- "$SCHEDULE_ROOT/$name-$label" "/etc/cron.d/vmapi-backup-$name-$label"; sed -i "\|# vmapi-backup:$name:$label$|d" "$CRONTAB" 2>/dev/null || true; else rm -f -- "$SCHEDULE_ROOT/$name" "$SCHEDULE_ROOT/$name-"* "/etc/cron.d/vmapi-backup-$name" "/etc/cron.d/vmapi-backup-$name-"*; sed -i "\|# vmapi-backup:$name:|d" "$CRONTAB" 2>/dev/null || true; fi; }
-case "${1:-help}" in list) shift; cmd_list "$@";; create) shift; cmd_create "$@";; start) shift; cmd_start "$@";; job) shift; cmd_job "$@";; download) shift; cmd_download "$@";; import) shift; cmd_import "$@";; import-file) shift; cmd_import_file "$@";; restore) shift; cmd_restore "$@";; delete) shift; cmd_delete "$@";; schedule) shift; cmd_schedule "$@";; unschedule) shift; cmd_unschedule "$@";; schedules) cmd_schedules;; help|-h|--help) usage;; *) usage >&2; die "Unknown command: ${1:-}";; esac
+cmd_scheduled_run() {
+  local name=${1:?VM name required} label=${2:?policy required} file
+  validate_vm_name "$name"; [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'
+  file="$SCHEDULE_ROOT/$name-$label"; load_schedule_file "$file"
+  local -a args=("$NAME" --label "$LABEL" --destination "$DESTINATION")
+  [[ -z $KEEP ]] || args+=(--keep "$KEEP")
+  [[ $LIVE == true ]] && args+=(--live)
+  [[ -z $PEER_ID ]] || args+=(--peer "$PEER_ID")
+  cmd_start "${args[@]}"
+}
+cmd_sync_schedules() {
+  local file
+  case "$(cron_style)" in
+    alpine)
+      if [[ -f $CRONTAB ]]; then sed -i '/# vmapi-backup:/d' "$CRONTAB"; fi;;
+    debian)
+      mkdir -p "$CRON_D_ROOT"; rm -f -- "$CRON_D_ROOT"/vmapi-backup-* 2>/dev/null || true;;
+  esac
+  shopt -s nullglob
+  for file in "$SCHEDULE_ROOT"/*; do
+    load_schedule_file "$file"
+    install_schedule_runtime "$NAME" "$LABEL" "$CRON"
+  done
+  shopt -u nullglob
+  ensure_cron_service
+}
+cmd_schedules() {
+  local file active
+  active=$(scheduler_active)
+  shopt -s nullglob
+  for file in "$SCHEDULE_ROOT"/*; do
+    load_schedule_file "$file"
+    printf '{"vm":"%s","cron":"%s","label":"%s","destination":"%s","keep":"%s","live":%s,"target":"%s","peer_id":"%s","scheduler_active":%s}\n' \
+      "$(json_escape "$NAME")" "$(json_escape "$CRON")" "$(json_escape "$LABEL")" "$(json_escape "$DESTINATION")" "$(json_escape "$KEEP")" "${LIVE:-false}" "$([[ -n $PEER_ID ]] && printf peer || printf local)" "$(json_escape "$PEER_ID")" "$active"
+  done
+  shopt -u nullglob
+}
+cmd_unschedule() {
+  local name=${1:?VM name required} label=${2-} file NAME LABEL DESTINATION KEEP LIVE PEER_ID CRON
+  validate_vm_name "$name"
+  if [[ -n $label ]]; then
+    [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'
+    remove_schedule_runtime "$name" "$label"
+    rm -f -- "$SCHEDULE_ROOT/$name-$label"
+  else
+    shopt -s nullglob
+    for file in "$SCHEDULE_ROOT/$name-"*; do
+      load_schedule_file "$file"; remove_schedule_runtime "$NAME" "$LABEL"; rm -f -- "$file"
+    done
+    shopt -u nullglob
+  fi
+}
+case "${1:-help}" in list) shift; cmd_list "$@";; create) shift; cmd_create "$@";; start) shift; cmd_start "$@";; job) shift; cmd_job "$@";; download) shift; cmd_download "$@";; import) shift; cmd_import "$@";; import-file) shift; cmd_import_file "$@";; restore) shift; cmd_restore "$@";; delete) shift; cmd_delete "$@";; schedule) shift; cmd_schedule "$@";; scheduled-run) shift; cmd_scheduled_run "$@";; sync-schedules) cmd_sync_schedules;; unschedule) shift; cmd_unschedule "$@";; schedules) cmd_schedules;; help|-h|--help) usage;; *) usage >&2; die "Unknown command: ${1:-}";; esac

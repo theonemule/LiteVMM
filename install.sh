@@ -104,7 +104,7 @@ install_packages() {
     debian)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
-      apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils
+      apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils cron
       case $PROFILE in
         virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso nfs-common nfs-kernel-server websockify;;
         docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server websockify;;
@@ -316,7 +316,8 @@ configure_alpine() {
   grep -Eq '^[[:space:]]*include_shell[[:space:]]+"cat /etc/lighttpd/conf.d/\*\.conf"' /etc/lighttpd/lighttpd.conf || printf '\ninclude_shell "cat /etc/lighttpd/conf.d/*.conf"\n' >> /etc/lighttpd/lighttpd.conf
   for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update del "$svc" default >/dev/null 2>&1 || true; done
   for svc in websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-service "$svc" stop >/dev/null 2>&1 || true; done
-  for svc in fcgiwrap-vmapi lighttpd; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+  for svc in fcgiwrap-vmapi lighttpd crond; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+  rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1 || true
   rc-service fcgiwrap-vmapi restart
   case $PROFILE in
     virtualization)
@@ -364,6 +365,7 @@ configure_debian() {
   systemctl daemon-reload
   systemctl disable --now ttyd-vmapi.service ttyd-host-vmapi.service vmapi-overlay.service vmapi-replication.service vmapi-backplane.service vmapi-backplane-server.service >/dev/null 2>&1 || true
   systemctl disable vmapi-network.service vmapi-autostart.service vmapi-replication.service >/dev/null 2>&1 || true
+  systemctl enable --now cron.service
   systemctl enable --now fcgiwrap-vmapi.socket
   systemctl try-restart fcgiwrap-vmapi.service >/dev/null 2>&1 || true
   case $PROFILE in
@@ -474,6 +476,9 @@ if [[ $PLATFORM == debian && ( $PROFILE == virtualization || $PROFILE == docker 
 install_common_files
 write_sudoers
 case $PLATFORM in alpine) configure_alpine;; debian) configure_debian;; esac
+if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then
+  /usr/local/bin/vmbackupctl sync-schedules
+fi
 finalize
 verify_profile_install
 if [[ $(awk -F= '$1=="VMAPI_TLS_ENABLED"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == true ]]; then /usr/local/bin/certctl apply; fi

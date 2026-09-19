@@ -246,7 +246,7 @@
   async function collectHostInventory(path) {
     // Storage inventory is deliberately global: one pane includes this host and
     // every directly paired host regardless of the host currently selected.
-    const targets = [{peerId:'',nodeId:state.hostCatalog.local?.node_id||'',label:hostLabelForPeer('')}, ...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,nodeId:peer.node_id,label:peer.label}))];
+    const targets = [{peerId:'',nodeId:state.hostCatalog.local?.node_id||'',label:hostLabelForPeer('')}, ...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,nodeId:peer.node_id,label:peer.label||peer.name||abbreviatedNodeId(peer.node_id)}))];
     const results = await Promise.all(targets.map(async target => {
       try {
         const data = await request(path, target.peerId ? {peerId:target.peerId} : {local:true});
@@ -1318,17 +1318,57 @@ ${commandLine(ci)} < user-data`;
     update();
   }
 
-  function replicaInventoryTable(replicas=[]) {
-    const rows=(replicas||[]).map(r=>{
-      const healthy=r.active===true && r.backplane===true;
-      const state=r.active===true?(healthy?'continuous':'reconnecting'):'retained';
-      const actions=r.active===true?'<span class="small text-secondary">Managed by source</span>':`<button class="btn btn-sm btn-outline-danger" data-replica-purge="${esc(r.id)}" data-replica-vm="${esc(r.vm||'')}" data-replica-disk="${esc(r.disk_index)}">Purge</button>`;
-      return `<tr><td><div class="mono">${esc(r.vm||'')}</div><div class="small text-secondary mono">${esc(r.owner||'')}</div></td><td>disk${esc(r.disk_index)}</td><td>${stateBadge(state)}</td><td>${bytes(r.bytes||0)}<div class="small text-secondary">${bytes(r.allocated_bytes||0)} allocated</div></td><td class="mono small text-break">${esc(r.replica||'')}</td><td>${actions}</td></tr>`;
-    });
-    return table(['VM / source','Disk','State','Virtual size','Replica file',''],rows,'No continuous or retained replicas are stored on this node.');
+  function nodeLabel(nodeId='') {
+    const id=String(nodeId||'').toLowerCase();
+    const localId=String(state.hostCatalog.local?.node_id||'').toLowerCase();
+    if(!id||id===localId)return state.hostCatalog.local?.name||'Local host';
+    const peer=state.hostCatalog.peers.find(p=>String(p.node_id||'').toLowerCase()===id);
+    return peer?.label||peer?.name||abbreviatedNodeId(nodeId);
   }
-  function bindReplicaInventoryActions(root=document) {
-    $$('[data-replica-purge]',root).forEach(button=>button.onclick=()=>confirmAction('Purge retained replica',`Delete the retained replica for ${button.dataset.replicaVm} disk${button.dataset.replicaDisk}? This deletes the replica disk file and cannot be undone.`,async()=>{await request(`/replications/replicas/${encodeURIComponent(button.dataset.replicaPurge)}?delete_file=true`,{method:'DELETE'});await loadBackups();}));
+
+  async function collectReplicationInventory() {
+    const [sources,hosted]=await Promise.all([
+      collectHostInventory('/replications'),
+      collectHostInventory('/replications/replicas')
+    ]);
+    const key=(source,vm,target)=>`${String(source||'').toLowerCase()}|${vm||''}|${String(target||'').toLowerCase()}`;
+    const hostedGroups=new Map();
+    for(const item of hosted.rows){
+      const k=key(item.owner,item.vm,item.storage_node_id);
+      if(!hostedGroups.has(k))hostedGroups.set(k,[]);
+      hostedGroups.get(k).push(item);
+    }
+    const matched=new Set();
+    const rows=sources.rows.map(item=>{
+      const k=key(item.storage_node_id,item.vm,item.peer_id);
+      const replicas=hostedGroups.get(k)||[];
+      if(replicas.length)matched.add(k);
+      const disks=Array.isArray(item.disks)?item.disks:[];
+      const allReady=disks.length>0&&disks.every(d=>d.ready===true);
+      const connected=disks.some(d=>d.backplane_connected===true);
+      const stateName=item.paused===true?'change tracking':(!item.running?'stopped':(allReady?'continuous':(connected?'initial sync':'disconnected')));
+      const configuredBytes=disks.reduce((n,d)=>n+Number(d.bytes||0),0);
+      const hostedBytes=replicas.reduce((n,d)=>n+Number(d.bytes||0),0);
+      return {
+        vm:item.vm||'',source_node_id:item.storage_node_id||'',source_host:item.storage_host||nodeLabel(item.storage_node_id),
+        source_peer_id:item.storage_peer_id||'',replica_node_id:item.peer_id||'',replica_host:nodeLabel(item.peer_id),
+        state:stateName,disk_count:Math.max(disks.length,replicas.length),bytes:configuredBytes||hostedBytes,
+        allocated_bytes:replicas.reduce((n,d)=>n+Number(d.allocated_bytes||0),0),source:item,replicas
+      };
+    });
+    for(const [k,replicas] of hostedGroups){
+      if(matched.has(k)||!replicas.length)continue;
+      const first=replicas[0],active=replicas.some(r=>r.active===true);
+      rows.push({
+        vm:first.vm||'',source_node_id:first.owner||'',source_host:nodeLabel(first.owner),
+        source_peer_id:'',replica_node_id:first.storage_node_id||'',replica_host:first.storage_host||nodeLabel(first.storage_node_id),
+        replica_peer_id:first.storage_peer_id||'',state:active?'incoming / active':'retained',
+        disk_count:replicas.length,bytes:replicas.reduce((n,d)=>n+Number(d.bytes||0),0),
+        allocated_bytes:replicas.reduce((n,d)=>n+Number(d.allocated_bytes||0),0),source:null,replicas
+      });
+    }
+    rows.sort((a,b)=>String(a.vm).localeCompare(String(b.vm))||String(a.source_host).localeCompare(String(b.source_host)));
+    return {rows,errors:[...sources.errors,...hosted.errors]};
   }
 
   function hostedPeerVolumeCard(items=[]) {
@@ -1343,12 +1383,12 @@ ${commandLine(ci)} < user-data`;
   async function loadBackups() {
     const canCreate=hasCap('backup-create');
     const hasStorageBackplane=hasCap('storage-backplane');
-    const [inventory,schedules,vms,peers,replicas,hostedVolumes]=await Promise.all([
+    const [inventory,scheduleInventory,vms,peers,replicationInventory,hostedVolumes]=await Promise.all([
       collectHostInventory('/backups'),
-      canCreate?request('/backups/schedules').catch(()=>[]):Promise.resolve([]),
+      collectHostInventory('/backups/schedules'),
       canCreate?request('/vms').catch(()=>[]):Promise.resolve([]),
       request('/cluster/peers').catch(()=>[]),
-      hasStorageBackplane?request('/replications/replicas').catch(()=>[]):Promise.resolve([]),
+      collectReplicationInventory(),
       hasStorageBackplane?request('/backplane/docker-volumes').catch(()=>[]):Promise.resolve([])
     ]);
     state.cache.backupPeers=(peers||[]).filter(usablePeer);
@@ -1363,6 +1403,8 @@ ${commandLine(ci)} < user-data`;
       return Number.isFinite(parsed)?parsed:0;
     };
     const backups=inventory.rows.slice().sort((a,b)=>backupTime(b.modified)-backupTime(a.modified));
+    const schedules=scheduleInventory.rows||[];
+    const replications=replicationInventory.rows||[];
     const vmNames=[...new Set([...backups.map(b=>b.vm),...(vms||[]).map(v=>v.name),...(initialVm?[initialVm]:[])].filter(Boolean))].sort((a,b)=>a.localeCompare(b));
     const hosts=[...new Set(backups.map(b=>b.storage_host).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
 
@@ -1375,18 +1417,23 @@ ${commandLine(ci)} < user-data`;
     const backupActions=canCreate?'<button class="btn btn-sm btn-primary" id="createBackupBtn">Create backup</button>':'';
     const backupCard=card('All backups',`${errors}${filters}<div id="backupInventoryTable"></div>`,backupActions);
 
+    const scheduleVms=[...new Set(schedules.map(x=>x.vm).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+    const scheduleHosts=[...new Set(schedules.map(x=>x.storage_host).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+    const scheduleFilters=`<div class="row g-2 mb-3"><div class="col-md-6"><label class="form-label small">VM</label><select id="scheduleVmFilter" class="form-select form-select-sm"><option value="">All VMs</option>${scheduleVms.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')}</select></div><div class="col-md-6"><label class="form-label small">Schedule host</label><select id="scheduleHostFilter" class="form-select form-select-sm"><option value="">All hosts</option>${scheduleHosts.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')}</select></div></div>`;
+    const scheduleErrors=scheduleInventory.errors.length?`<div class="alert alert-warning small">${esc(scheduleInventory.errors.join(' / '))}</div>`:'';
+    const scheduleActions=canCreate?'<button class="btn btn-sm btn-outline-primary" id="scheduleBackupBtn">Schedule backup</button>':'';
+
+    const replicationVms=[...new Set(replications.map(x=>x.vm).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+    const replicationHosts=[...new Set(replications.flatMap(x=>[x.source_host,x.replica_host]).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+    const replicationFilters=`<div class="row g-2 mb-3"><div class="col-md-6"><label class="form-label small">VM</label><select id="replicationVmFilter" class="form-select form-select-sm"><option value="">All VMs</option>${replicationVms.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')}</select></div><div class="col-md-6"><label class="form-label small">Host</label><select id="replicationHostFilter" class="form-select form-select-sm"><option value="">All source and replica hosts</option>${replicationHosts.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')}</select></div></div>`;
+    const replicationErrors=replicationInventory.errors.length?`<div class="alert alert-warning small">${esc(replicationInventory.errors.join(' / '))}</div>`:'';
+
     let page=`<div class="row g-3"><div class="col-12">${backupCard}</div>`;
-    if(canCreate){
-      const scheduleRows=(schedules||[]).map(item=>{
-        const destination=item.peer_id?hostLabelForPeer(item.peer_id):(item.destination||'/var/lib/vmapi/backups');
-        return `<tr><td>${esc(item.vm)}</td><td>${esc(item.label||'scheduled')}</td><td class="mono small">${esc(item.cron)}</td><td>${esc(item.keep||'Unlimited')}</td><td>${esc(destination)}</td><td><button class="btn btn-sm btn-outline-danger" data-unschedule="${esc(item.vm)}" data-label="${esc(item.label||'scheduled')}">Remove</button></td></tr>`;
-      });
-      page+=`<div class="col-12">${card('Schedules',table(['VM','Policy','Schedule','Keep','Destination',''],scheduleRows,'No scheduled backups.'),'<button class="btn btn-sm btn-outline-primary" id="scheduleBackupBtn">Schedule backup</button>')}</div>`;
+    if(canCreate||schedules.length){
+      page+=`<div class="col-12">${card('Schedules',`${scheduleErrors}${scheduleFilters}<div id="scheduleInventoryTable"></div>`,scheduleActions)}</div>`;
     }
-    if(hasStorageBackplane){
-      page+=`<div class="col-12">${card('Continuous replicas',replicaInventoryTable(replicas))}</div>`;
-      page+=`<div class="col-12">${hostedPeerVolumeCard(hostedVolumes)}</div>`;
-    }
+    page+=`<div class="col-12">${card('Continuous replication',`${replicationErrors}${replicationFilters}<div id="replicationInventoryTable"></div>`)}</div>`;
+    if(hasStorageBackplane)page+=`<div class="col-12">${hostedPeerVolumeCard(hostedVolumes)}</div>`;
     page+='</div>';
     $('#view').innerHTML=page;
 
@@ -1410,36 +1457,74 @@ ${commandLine(ci)} < user-data`;
         if(owner){
           targetPeer=owner===localNode?'':owner;
           sourcePeer=storageNode && storageNode!==owner ? storageNode : '';
-        }else{
-          targetPeer=storagePeer;
-        }
+        }else targetPeer=storagePeer;
         const targetLabel=targetPeer?hostLabelForPeer(targetPeer):hostLabelForPeer('');
         confirmAction('Restore backup',`Restore ${archive} as ${vm} on ${targetLabel}? If ${vm} already exists it must be stopped and its current disks/configuration will be replaced after a rollback copy is created.`,async()=>{
           await request('/backups/restore',{method:'POST',form:{name:vm,archive,replace:'true',peer_id:sourcePeer},...(targetPeer?{peerId:targetPeer}:{local:true})});
-          toast(`${vm}: backup restored`);
-          await loadBackups();
+          toast(`${vm}: backup restored`); await loadBackups();
         });
       });
       $$('[data-backup-download]').forEach(btn=>btn.onclick=()=>downloadFile(`/backups/${encodeURIComponent(btn.dataset.vm)}/${encodeURIComponent(btn.dataset.backupDownload)}`,btn.dataset.peer||''));
       $$('[data-backup-delete]').forEach(btn=>btn.onclick=()=>confirmAction('Delete backup',`Delete ${btn.dataset.backupDelete} from ${hostLabelForPeer(btn.dataset.peer||'')}?`,async()=>{
         await request(`/backups/${encodeURIComponent(btn.dataset.vm)}/${encodeURIComponent(btn.dataset.backupDelete)}`,{method:'DELETE',...(btn.dataset.peer?{peerId:btn.dataset.peer}:{local:true})});
-        toast('Backup deleted');
-        await loadBackups();
+        toast('Backup deleted'); await loadBackups();
       }));
     };
     ['backupVmFilter','backupHostFilter','backupSearchFilter'].forEach(id=>$('#'+id)?.addEventListener(id==='backupSearchFilter'?'input':'change',renderBackupRows));
     renderBackupRows();
 
+    const renderScheduleRows=()=>{
+      const vm=$('#scheduleVmFilter')?.value||'',host=$('#scheduleHostFilter')?.value||'';
+      const rows=schedules.filter(item=>(!vm||item.vm===vm)&&(!host||item.storage_host===host)).map(item=>{
+        const destination=item.peer_id?nodeLabel(item.peer_id):`${item.storage_host} · ${item.destination||'/var/lib/vmapi/backups'}`;
+        const scheduler=item.scheduler_active===false?stateBadge('not running'):stateBadge('active');
+        return `<tr><td>${esc(item.storage_host)}</td><td>${esc(item.vm)}</td><td>${esc(item.label||'scheduled')}</td><td class="mono small">${esc(item.cron)}</td><td>${item.live===true?'Live':'Stopped VM'}</td><td>${esc(item.keep||'Unlimited')}</td><td>${esc(destination)}</td><td>${scheduler}</td><td><button class="btn btn-sm btn-outline-danger" data-unschedule="${esc(item.vm)}" data-label="${esc(item.label||'scheduled')}" data-host-peer="${esc(item.storage_peer_id||'')}">Remove</button></td></tr>`;
+      });
+      if($('#scheduleInventoryTable'))$('#scheduleInventoryTable').innerHTML=table(['Host','VM','Policy','Schedule','Mode','Keep','Destination','Scheduler',''],rows,'No schedules match the selected filters.');
+      $$('[data-unschedule]').forEach(button=>button.onclick=()=>confirmAction('Remove schedule',`Remove the ${button.dataset.label} backup schedule for ${button.dataset.unschedule}?`,async()=>{
+        const peer=button.dataset.hostPeer||'';
+        await request('/backups/unschedule',{method:'DELETE',form:{name:button.dataset.unschedule,label:button.dataset.label},...(peer?{peerId:peer}:{local:true})});
+        await loadBackups();
+      }));
+    };
+    ['scheduleVmFilter','scheduleHostFilter'].forEach(id=>$('#'+id)?.addEventListener('change',renderScheduleRows));
+    renderScheduleRows();
+
+    const renderReplicationRows=()=>{
+      const vm=$('#replicationVmFilter')?.value||'',host=$('#replicationHostFilter')?.value||'';
+      const filtered=replications.filter(r=>(!vm||r.vm===vm)&&(!host||r.source_host===host||r.replica_host===host));
+      const rows=filtered.map(r=>{
+        let actions='<span class="small text-secondary">Observed</span>';
+        if(r.source){
+          actions=`<button class="btn btn-sm btn-outline-danger" data-replication-stop="${esc(r.vm)}" data-source-peer="${esc(r.source_peer_id||'')}">Stop</button>`;
+        }else if(r.replicas?.length&&r.replicas.every(x=>x.active!==true)){
+          actions=`<button class="btn btn-sm btn-outline-danger" data-replication-purge="${esc(r.replicas.map(x=>x.id).join(','))}" data-replica-peer="${esc(r.replica_peer_id||'')}" data-replica-vm="${esc(r.vm)}">Purge retained</button>`;
+        }
+        const allocation=r.allocated_bytes?`<div class="small text-secondary">${bytes(r.allocated_bytes)} allocated</div>`:'';
+        return `<tr><td><strong>${esc(r.vm)}</strong></td><td>${esc(r.source_host)}</td><td>${esc(r.replica_host)}</td><td>${esc(r.disk_count||0)}</td><td>${stateBadge(r.state)}</td><td>${bytes(r.bytes||0)}${allocation}</td><td>${actions}</td></tr>`;
+      });
+      $('#replicationInventoryTable').innerHTML=table(['VM','Source host','Replica host','Disks','State','Virtual size',''],rows,'No replication relationships match the selected filters.');
+      $$('[data-replication-stop]').forEach(button=>button.onclick=()=>confirmAction('Stop replication',`Stop continuous replication for ${button.dataset.replicationStop}? The replica files will be retained.`,async()=>{
+        const peer=button.dataset.sourcePeer||'';
+        await request(`/replications/${encodeURIComponent(button.dataset.replicationStop)}`,{method:'DELETE',...(peer?{peerId:peer}:{local:true})});
+        await loadBackups();
+      }));
+      $$('[data-replication-purge]').forEach(button=>button.onclick=()=>confirmAction('Purge retained replica',`Delete all retained replica disks for ${button.dataset.replicaVm}?`,async()=>{
+        const peer=button.dataset.replicaPeer||'';
+        for(const id of String(button.dataset.replicationPurge||'').split(',').filter(Boolean)){
+          await request(`/replications/replicas/${encodeURIComponent(id)}?delete_file=true`,{method:'DELETE',...(peer?{peerId:peer}:{local:true})});
+        }
+        await loadBackups();
+      }));
+    };
+    ['replicationVmFilter','replicationHostFilter'].forEach(id=>$('#'+id)?.addEventListener('change',renderReplicationRows));
+    renderReplicationRows();
+
     if(canCreate){
       const vmOptions=(vms||[]).map(vm=>`<option value="${esc(vm.name)}" ${vm.name===initialVm?'selected':''}>${esc(vm.name)} (${esc(vm.state)})</option>`).join('');
       $('#createBackupBtn')?.addEventListener('click',()=>openBackupCreate(vmOptions));
       $('#scheduleBackupBtn')?.addEventListener('click',()=>openBackupSchedule(vmOptions));
-      $$('[data-unschedule]').forEach(button=>button.onclick=()=>confirmAction('Remove schedule',`Remove the ${button.dataset.label} backup schedule for ${button.dataset.unschedule}?`,async()=>{
-        await request('/backups/unschedule',{method:'DELETE',form:{name:button.dataset.unschedule,label:button.dataset.label}});
-        await loadBackups();
-      }));
     }
-    bindReplicaInventoryActions();
     bindHostedPeerVolumeActions();
   }
 

@@ -312,14 +312,14 @@ resume_replication(){
 }
 
 status_replication(){
-  local vm=${1:?VM required} dir state peer idx job meta obj ready offset len first=true connected=false
+  local vm=${1:?VM required} dir state peer idx job meta disk_bytes obj ready offset len first=true connected=false
   validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"
   [[ -r $state ]] || { printf '{"vm":"%s","configured":false}\n' "$vm"; return; }
   PEER=''; source "$state"; peer=$PEER; backplane_ready "$peer" && connected=true
   printf '{"vm":"%s","configured":true,"paused":%s,"peer_id":"%s","running":%s,"transport":"nfs4-wss-backplane","disks":[' \
     "$vm" "$(replication_paused "$vm" && echo true || echo false)" "$peer" "$([[ $(vm_state "$vm") == running ]] && echo true || echo false)"
   while IFS= read -r idx; do
-    eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"
+    eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"; eval "disk_bytes=\${DISK_${idx}_BYTES:-0}"
     ready=false; offset=0; len=0; obj=''
     [[ $(vm_state "$vm") == running ]] && obj=$(query_job_json "$vm" "$job")
     [[ $obj == *'"ready":true'* ]] && ready=true
@@ -327,15 +327,15 @@ status_replication(){
     len=$(printf '%s' "$obj" | sed -n 's/.*"len":\([0-9][0-9]*\).*/\1/p' | head -n1); len=${len:-0}
     [[ -z $meta ]] || refresh_meta "$meta" true
     $first || printf ','; first=false
-    printf '{"index":%s,"job":"%s","ready":%s,"offset":%s,"length":%s,"tunnel_running":%s,"backplane_connected":%s}' \
-      "$idx" "$job" "$ready" "$offset" "$len" "$connected" "$connected"
+    printf '{"index":%s,"job":"%s","ready":%s,"offset":%s,"length":%s,"bytes":%s,"tunnel_running":%s,"backplane_connected":%s}' \
+      "$idx" "$job" "$ready" "$offset" "$len" "${disk_bytes:-0}" "$connected" "$connected"
   done < <(state_disk_indexes "$state")
   printf ']}\n'
 }
 
 # QEMU will not start another block job (such as a live backup) on a node a
-# mirror job owns, so a holder pauses replication around its own job. Resuming
-# restarts each mirror with sync=full, which resends the disk to the peer.
+# mirror job owns, so a holder swaps the mirror for dirty-bitmap tracking.
+# Unpause catches up only the changed blocks and then resumes continuous mirror.
 pause_replication(){
   local vm=${1:?VM required} holder=${2:?holder PID required} dir state tmp
   validate_vm_name "$vm"; validate_positive_int "$holder"; dir=$(job_dir "$vm"); state="$dir/state.conf"

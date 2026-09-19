@@ -361,7 +361,6 @@ case "${P[0]-}" in
 
   replications)
     if [[ ${P[1]-} == replicas ]]; then
-      [[ $PEER_API_REQUEST != true ]] || error_reply '403 Forbidden' 'Replica inventory is a local administration endpoint'
       case "${P[2]-}" in
         '')
           [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
