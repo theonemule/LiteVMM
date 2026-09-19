@@ -39,7 +39,11 @@ grep -qx 'SHELL=/bin/bash' "$cronfile"
 grep -Eq '^17 3 \* \* \* root .*/vmbackupctl scheduled-run demo nightly >> .*demo-nightly.log 2>&1$' "$cronfile"
 [[ $(stat -c %a "$cronfile") == 644 ]]
 
+# Listing schedules is also a reconciliation point. An upgraded host with saved
+# schedules but missing runtime cron entries must repair them automatically.
+rm -f "$cronfile"
 list=$(env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=debian bash "$ROOT/bin/vmbackupctl" schedules)
+[[ -f $cronfile ]]
 [[ $list == *'"vm":"demo"'* && $list == *'"scheduler_active":true'* ]]
 
 # The cron entry point reloads the saved policy and passes the exact backup

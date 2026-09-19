@@ -521,14 +521,30 @@ cmd_sync_schedules() {
 }
 cmd_schedules() {
   local file active
-  active=$(scheduler_active)
+  local -a files=()
   shopt -s nullglob
-  for file in "$SCHEDULE_ROOT"/*; do
+  files=("$SCHEDULE_ROOT"/*)
+  shopt -u nullglob
+
+  if ((${#files[@]})); then
+    # Schedule definitions are the source of truth. Listing schedules is also
+    # a reconciliation point for upgraded hosts: recreate the native cron
+    # entry and make sure the scheduler is enabled/running. This repairs
+    # pre-fix schedules without forcing users to recreate them, and enabling
+    # the service makes it survive the next reboot.
+    for file in "${files[@]}"; do
+      load_schedule_file "$file"
+      install_schedule_runtime "$NAME" "$LABEL" "$CRON"
+    done
+    ensure_cron_service
+  fi
+
+  active=$(scheduler_active)
+  for file in "${files[@]}"; do
     load_schedule_file "$file"
     printf '{"vm":"%s","cron":"%s","label":"%s","destination":"%s","keep":"%s","live":%s,"target":"%s","peer_id":"%s","scheduler_active":%s}\n' \
       "$(json_escape "$NAME")" "$(json_escape "$CRON")" "$(json_escape "$LABEL")" "$(json_escape "$DESTINATION")" "$(json_escape "$KEEP")" "${LIVE:-false}" "$([[ -n $PEER_ID ]] && printf peer || printf local)" "$(json_escape "$PEER_ID")" "$active"
   done
-  shopt -u nullglob
 }
 cmd_unschedule() {
   local name=${1:?VM name required} label=${2-} file NAME LABEL DESTINATION KEEP LIVE PEER_ID CRON
