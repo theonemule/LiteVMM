@@ -46,7 +46,7 @@
     return `<span class="badge rounded-pill ${cls} badge-state">${esc(s || 'unknown')}</span>`;
   };
 
-  const MOBILE_ACTION_BREAKPOINT = '(max-width: 767.98px)';
+  const MOBILE_ACTION_BREAKPOINT = '(max-width: 991.98px)';
   let responsiveActionOrigin = null;
   let responsiveActionItems = [];
 

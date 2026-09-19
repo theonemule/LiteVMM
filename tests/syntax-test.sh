@@ -82,6 +82,7 @@ if command -v node >/dev/null 2>&1; then node --check "$ROOT/www/app.js"; fi
 grep -Fq 'id="responsiveActionSheet"' "$ROOT/www/index.html"
 grep -Fq 'prepareResponsiveActionRows' "$ROOT/www/app.js"
 grep -Fq 'data-responsive-actions="true"' "$ROOT/www/app.css"
+grep -Fq "MOBILE_ACTION_BREAKPOINT = '(max-width: 991.98px)'" "$ROOT/www/app.js"
 bash "$ROOT/tests/host-selector-test.sh"
 bash "$ROOT/tests/cgi-error-response-test.sh"
 bash "$ROOT/tests/cgi-daemon-fd-test.sh"
