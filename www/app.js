@@ -345,11 +345,47 @@
     return peer?.label || peer?.name || abbreviatedNodeId(peerId);
   }
 
+  // Mirrors the capability gate in cgi/api.cgi. A host without the capability
+  // answers 404 by design, so inventory collection skips it instead of
+  // reporting it as a failure (e.g. backplane clients never host replicas).
+  function inventoryCapability(path) {
+    const parts = String(path || '').split('?')[0].replace(/^\/+/, '').split('/');
+    switch (parts[0]) {
+      case 'backups': return 'backup';
+      case 'replications': return parts[1] === 'replicas' ? 'storage-backplane' : 'replication-source';
+      case 'backplane': return 'storage-backplane';
+      case 'vms': case 'images': case 'migrations': case 'storage': case 'networks': case 'overlays': return 'qemu-kvm';
+      case 'docker': case 'compose': return 'docker';
+      case 'files': return 'files';
+      default: return '';
+    }
+  }
+
+  const peerCapabilityCache = new Map();
+  const PEER_CAPABILITY_TTL_MS = 60000;
+  // Resolves to the host's capability list, or null when it cannot be read
+  // (unreachable or older peer): callers then query anyway so real failures surface.
+  async function hostCapabilities(peerId) {
+    if (!peerId) return state.service?.capabilities || null;
+    const cached = peerCapabilityCache.get(peerId);
+    if (cached && Date.now() - cached.at < PEER_CAPABILITY_TTL_MS) return cached.caps;
+    const pending = request('/', {peerId}).then(svc => Array.isArray(svc?.capabilities) ? svc.capabilities : null).catch(() => null);
+    peerCapabilityCache.set(peerId, {at: Date.now(), caps: pending});
+    const caps = await pending;
+    peerCapabilityCache.set(peerId, {at: Date.now(), caps});
+    return caps;
+  }
+
   async function collectHostInventory(path) {
     // Storage inventory is deliberately global: one pane includes this host and
     // every directly paired host regardless of the host currently selected.
     const targets = [{peerId:'',nodeId:state.hostCatalog.local?.node_id||'',label:hostLabelForPeer('')}, ...state.hostCatalog.peers.map(peer=>({peerId:peer.node_id,nodeId:peer.node_id,label:peer.label||peer.name||abbreviatedNodeId(peer.node_id)}))];
+    const capability = inventoryCapability(path);
     const results = await Promise.all(targets.map(async target => {
+      if (capability) {
+        const caps = await hostCapabilities(target.peerId);
+        if (Array.isArray(caps) && !caps.includes(capability)) return {target, data:[], error:null};
+      }
       try {
         const data = await request(path, target.peerId ? {peerId:target.peerId} : {local:true});
         return {target, data:Array.isArray(data)?data:[], error:null};
