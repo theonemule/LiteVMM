@@ -27,18 +27,31 @@ render_web(){
   load
   case $mode in
     lighttpd)
-      install -d -m 0755 "$LIGHTTPD_ROOT/conf.d"; local f="$LIGHTTPD_ROOT/conf.d/zz-vmapi-registry.conf"; : > "$f"
+      # lighttpd's mod_proxy forwards the client Host header and adds X-Forwarded-For/Proto by
+      # default, so no proxy.header entry is needed (and "host" is not a valid proxy.header key).
+      # Stream bodies so multi-GB layer pushes/pulls are not spooled to disk before proxying.
+      install -d -m 0755 "$LIGHTTPD_ROOT/conf.d"; local f="$LIGHTTPD_ROOT/conf.d/zz-vmapi-registry.conf" prev errf
+      prev=$(mktemp); errf=$(mktemp); if [[ -e $f ]]; then cp -p "$f" "$prev"; fi
+      : > "$f"
       if [[ $ENABLED == true ]]; then cat > "$f" <<CFG
 \$HTTP["url"] =~ "^/v2(?:/|\$)" {
   auth.backend = "htpasswd"
   auth.backend.htpasswd.userfile = "$PASSWD_FILE"
   auth.require = ( "" => ( "method" => "basic", "realm" => "LiteVMM registry", "require" => "valid-user" ) )
   proxy.server = ( "" => (( "host" => "127.0.0.1", "port" => $PORT )) )
-  proxy.header = ( "host" => "enable" )
+  server.stream-request-body = 2
+  server.stream-response-body = 2
 }
 CFG
       fi
-      [[ ${VMAPI_REGISTRY_SKIP_RELOAD:-false} == true ]] || { lighttpd -tt -f "$LIGHTTPD_ROOT/lighttpd.conf" >/dev/null; if [[ -x ${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload} ]]; then VMAPI_LIGHTTPD_CONF="$LIGHTTPD_ROOT/lighttpd.conf" "${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}"; elif command -v rc-service >/dev/null 2>&1; then rc-service lighttpd restart >/dev/null; elif [[ -r /run/lighttpd.pid ]]; then kill -USR1 "$(cat /run/lighttpd.pid)"; fi; };;
+      if [[ ${VMAPI_REGISTRY_SKIP_RELOAD:-false} != true ]]; then
+        # Validate before reloading; never leave a config in conf.d that would stop lighttpd from starting.
+        if ! lighttpd -tt -f "$LIGHTTPD_ROOT/lighttpd.conf" >/dev/null 2>"$errf"; then
+          cat "$prev" > "$f"; err "lighttpd rejected the registry proxy configuration: $(tr '\n' ' ' < "$errf")"; rm -f "$prev" "$errf"; return 1
+        fi
+        if [[ -x ${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload} ]]; then VMAPI_LIGHTTPD_CONF="$LIGHTTPD_ROOT/lighttpd.conf" "${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}"; elif command -v rc-service >/dev/null 2>&1; then rc-service lighttpd restart >/dev/null; elif [[ -r /run/lighttpd.pid ]]; then kill -USR1 "$(cat /run/lighttpd.pid)"; fi
+      fi
+      rm -f "$prev" "$errf";;
     nginx)
       : > "$NGINX_CONF"
       if [[ $ENABLED == true ]]; then cat > "$NGINX_CONF" <<CFG
@@ -65,7 +78,12 @@ enable(){
   "$DOCKER_BIN" image inspect "$IMAGE" >/dev/null 2>&1 || "$DOCKER_BIN" pull "$IMAGE" >/dev/null
   if "$DOCKER_BIN" container inspect "$CONTAINER" >/dev/null 2>&1; then "$DOCKER_BIN" rm -f "$CONTAINER" >/dev/null; fi
   "$DOCKER_BIN" run -d --restart unless-stopped --name "$CONTAINER" -p "127.0.0.1:$PORT:5000" -v "$ROOT:/var/lib/registry" "$IMAGE" >/dev/null
-  write_conf; render_web; status
+  write_conf
+  if ! render_web; then
+    ENABLED=false; write_conf; "$DOCKER_BIN" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    die 'Registry was not enabled because the web server configuration could not be applied'
+  fi
+  status
 }
 disable(){ load; ENABLED=false; write_conf; "$DOCKER_BIN" rm -f "$CONTAINER" >/dev/null 2>&1 || true; render_web; status; }
 status(){ load; local running=false; container_running && running=true; printf '{"enabled":%s,"running":%s,"username":"%s","image":"%s","loopback_port":%s,"path":"/v2/"}\n' "$ENABLED" "$running" "$(json_escape "$USERNAME")" "$(json_escape "$IMAGE")" "$PORT"; }
