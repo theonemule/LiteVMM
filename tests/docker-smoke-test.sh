@@ -6,7 +6,7 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/state/containers" "$T/state/images" "$T/state/networks" "$T/state/volumes"
+mkdir -p "$T/state/containers" "$T/state/images" "$T/state/networks" "$T/state/volumes" "$T/peers"
 LOG="$T/docker.log"
 
 cat > "$T/docker" <<'MOCK'
@@ -55,7 +55,16 @@ case "$obj:$act" in
 esac
 MOCK
 chmod +x "$T/docker"
+cat > "$T/sudo" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ ${1:-} == -n ]] && shift
+exec "$@"
+MOCK
+chmod +x "$T/sudo"
+export PATH="$T:$PATH"
 export DOCKER_BIN="$T/docker" FAKE_DOCKER_STATE="$T/state" FAKE_DOCKER_LOG="$LOG" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_CONFIG=/dev/null
+export DOCKER_FEDERATIONCTL="$ROOT/bin/docker-federationctl" DOCKER_ROOTFSCTL="$ROOT/bin/docker-rootfsctl" VMAPI_DOCKER_ROOTFSCTL="$ROOT/bin/docker-rootfsctl" VMAPI_PEER_ROOT="$T/peers" VMAPI_JQ=/usr/bin/jq
 
 "$ROOT/bin/dockerctl" create web alpine:latest --cpus 1.5 --memory 512m --restart unless-stopped --network bridge --env MODE=prod --publish 8080:80 --volume data:/data --label app=web -- -- sleep 60 >/dev/null
 [[ -f "$T/state/containers/web" ]]
@@ -97,7 +106,21 @@ out=$(printf '%s' "$body" | REQUEST_METHOD=POST PATH_INFO=/api/docker/images/pul
   DOCKERCTL="$ROOT/bin/dockerctl" DOCKER_IMAGECTL="$ROOT/bin/docker-imagectl" DOCKER_NETCTL="$ROOT/bin/docker-netctl" DOCKER_VOLUMECTL="$ROOT/bin/docker-volumectl" \
   VMCTL="$ROOT/bin/vmctl" IMAGECTL="$ROOT/bin/imagectl" NETCTL="$ROOT/bin/netctl" "$ROOT/cgi/api.cgi")
 grep -q 'Status: 200 OK' <<< "$out"
-grep -q '"output":"Pulled alpine:latest"' <<< "$out"
+grep -q '"source":"registry"' <<< "$out"
+grep -q '"local":true' <<< "$out"
+
+out=$(REQUEST_METHOD=GET PATH_INFO=/api/docker/images/federated \
+  DOCKERCTL="$ROOT/bin/dockerctl" DOCKER_IMAGECTL="$ROOT/bin/docker-imagectl" DOCKER_NETCTL="$ROOT/bin/docker-netctl" DOCKER_VOLUMECTL="$ROOT/bin/docker-volumectl" \
+  VMCTL="$ROOT/bin/vmctl" IMAGECTL="$ROOT/bin/imagectl" NETCTL="$ROOT/bin/netctl" "$ROOT/cgi/api.cgi")
+grep -q 'Status: 200 OK' <<< "$out"
+grep -q '"ref":"alpine:latest"' <<< "$out"
+
+body='image=alpine%3Alatest'
+out=$(printf '%s' "$body" | REQUEST_METHOD=POST PATH_INFO=/api/docker/images/prepare CONTENT_TYPE=application/x-www-form-urlencoded CONTENT_LENGTH=${#body} \
+  DOCKERCTL="$ROOT/bin/dockerctl" DOCKER_IMAGECTL="$ROOT/bin/docker-imagectl" DOCKER_NETCTL="$ROOT/bin/docker-netctl" DOCKER_VOLUMECTL="$ROOT/bin/docker-volumectl" \
+  VMCTL="$ROOT/bin/vmctl" IMAGECTL="$ROOT/bin/imagectl" NETCTL="$ROOT/bin/netctl" "$ROOT/cgi/api.cgi")
+grep -q 'Status: 200 OK' <<< "$out"
+grep -q '"source":"local"' <<< "$out"
 
 body='name=webnet&subnet=172.31.0.0%2F24'
 out=$(printf '%s' "$body" | REQUEST_METHOD=POST PATH_INFO=/api/docker/networks CONTENT_TYPE=application/x-www-form-urlencoded CONTENT_LENGTH=${#body} \

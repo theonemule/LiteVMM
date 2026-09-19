@@ -36,6 +36,8 @@ STORAGECTL=${STORAGECTL:-/usr/local/bin/storagectl}
 CERTCTL=${CERTCTL:-/usr/local/bin/certctl}
 REPLICATIONCTL=${REPLICATIONCTL:-/usr/local/bin/replicationctl}
 REGISTRYCTL=${REGISTRYCTL:-/usr/local/bin/registryctl}
+DOCKER_FEDERATIONCTL=${DOCKER_FEDERATIONCTL:-/usr/local/bin/docker-federationctl}
+DOCKER_ROOTFSCTL=${DOCKER_ROOTFSCTL:-/usr/local/bin/docker-rootfsctl}
 PEER_VOLUMECTL=${PEER_VOLUMECTL:-/usr/local/bin/peer-volumectl}
 BACKPLANECTL=${BACKPLANECTL:-/usr/local/bin/backplanectl}
 declare -A FORM=()
@@ -72,6 +74,16 @@ capabilities_json() {
 }
 registry_cmd() {
   if command -v sudo >/dev/null 2>&1; then sudo -n "$REGISTRYCTL" "$@"; else "$REGISTRYCTL" "$@"; fi
+}
+federation_cmd() {
+  if [[ $EUID -eq 0 ]]; then "$DOCKER_FEDERATIONCTL" "$@"
+  elif command -v sudo >/dev/null 2>&1; then sudo -n "$DOCKER_FEDERATIONCTL" "$@"
+  else "$DOCKER_FEDERATIONCTL" "$@"; fi
+}
+rootfs_cmd() {
+  if [[ $EUID -eq 0 ]]; then "$DOCKER_ROOTFSCTL" "$@"
+  elif command -v sudo >/dev/null 2>&1; then sudo -n "$DOCKER_ROOTFSCTL" "$@"
+  else "$DOCKER_ROOTFSCTL" "$@"; fi
 }
 replication_cmd() {
   if command -v sudo >/dev/null 2>&1; then sudo -n "$REPLICATIONCTL" "$@"; else "$REPLICATIONCTL" "$@"; fi
@@ -778,6 +790,8 @@ case "${P[0]-}" in
               name=$(param name); image=$(param image)
               [[ -n $name ]] || error_reply '400 Bad Request' 'name is required'
               [[ -n $image ]] || error_reply '400 Bad Request' 'image is required'
+              # dockerctl keeps local images native and prepares peer-only images
+              # as remote read-only rootfs layers with a local writable overlay.
               requested_network=$(param network)
               args=(create "$name" "$image")
               [[ -n $(param hostname) ]] && args+=(--hostname "$(param hostname)")
@@ -888,11 +902,25 @@ case "${P[0]-}" in
                 reply '200 OK' "{\"deleted\":true,\"output\":\"$(json_escape "$output")\"}";;
               *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
             esac;;
+          federated)
+            [[ $PEER_API_REQUEST != true ]] || error_reply '403 Forbidden' 'Federated image inventory is a local administration endpoint'
+            [[ $method == GET ]] || error_reply '405 Method Not Allowed' 'Use GET'
+            raw_json_reply '200 OK' federation_cmd catalog-json;;
+          prepare)
+            [[ $PEER_API_REQUEST != true ]] || error_reply '403 Forbidden' 'Remote image preparation is a local administration endpoint'
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            image=$(param image); [[ -n $image ]] || error_reply '400 Bad Request' 'image is required'
+            raw_json_reply '200 OK' rootfs_cmd prepare "$image";;
+          expose)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            image=$(param image); [[ -n $image ]] || error_reply '400 Bad Request' 'image is required'
+            raw_json_reply '200 OK' rootfs_cmd expose "$image";;
           pull)
+            [[ $PEER_API_REQUEST != true ]] || error_reply '403 Forbidden' 'Image pulls are a local administration endpoint'
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
             image=$(param image); [[ -n $image ]] || error_reply '400 Bad Request' 'image is required'
             output=$(run_cmd "$DOCKER_IMAGECTL" pull "$image")
-            reply '200 OK' "{\"image\":\"$(json_escape "$image")\",\"output\":\"$(json_escape "$output")\"}";;
+            reply '200 OK' "{\"image\":\"$(json_escape "$image")\",\"source\":\"registry\",\"local\":true,\"output\":\"$(json_escape "$output")\"}";;
           tag)
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
             source=$(param source); target=$(param target)
@@ -920,14 +948,6 @@ case "${P[0]-}" in
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
             source=$(param source); repository=$(param repository); [[ -n $source && -n $repository ]] || error_reply '400 Bad Request' 'source and repository are required'
             raw_json_reply '200 OK' registry_cmd push "$source" "$repository";;
-          peer-pull)
-            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
-            peer_id=$(param peer_id); repository=$(param repository); [[ -n $peer_id && -n $repository ]] || error_reply '400 Bad Request' 'peer_id and repository are required'
-            raw_json_reply '200 OK' registry_cmd peer-pull "$peer_id" "$repository";;
-          peer-push)
-            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
-            peer_id=$(param peer_id); source=$(param source); repository=$(param repository); [[ -n $peer_id && -n $source && -n $repository ]] || error_reply '400 Bad Request' 'peer_id, source, and repository are required'
-            raw_json_reply '200 OK' registry_cmd peer-push "$peer_id" "$source" "$repository";;
           *) error_reply '404 Not Found' 'Unknown registry endpoint';;
         esac;;
 

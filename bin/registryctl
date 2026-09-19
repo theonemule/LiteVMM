@@ -5,8 +5,6 @@ LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 source "$LIB"
 DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
-PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
-BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
 ROOT=${VMAPI_REGISTRY_ROOT:-/var/lib/vmapi/registry}
 CONF=${VMAPI_REGISTRY_CONFIG:-/etc/vmapi/registry.conf}
 PASSWD_FILE=${VMAPI_REGISTRY_PASSWD_FILE:-/etc/vmapi-registry.htpasswd}
@@ -17,12 +15,9 @@ CONTAINER=${VMAPI_REGISTRY_CONTAINER:-litevmm-registry}
 LIGHTTPD_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
 NGINX_CONF=${VMAPI_NGINX_REGISTRY_CONF:-/etc/nginx/vmapi-registry.conf}
 WEB_MODE=${VMAPI_REGISTRY_WEB_MODE:-auto}
-ALLOW_INSECURE_PEER=${VMAPI_REGISTRY_ALLOW_INSECURE_PEER:-false}
 
 valid_user(){ [[ ${1:-} =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid registry username'; }
 valid_ref(){ local v=${1:-}; [[ -n $v && ${#v} -le 512 && $v != *[[:space:]]* && $v != /* && $v != *://* ]] || die "Invalid registry image reference: $v"; validate_no_newline "$v"; }
-valid_peer_id(){ [[ ${1:-} =~ ^[a-fA-F0-9]{32}$ ]] || die 'Invalid peer node id'; }
-json_string(){ local json=$1 key=$2; printf '%s' "$json" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -n1; }
 web_mode(){ [[ $WEB_MODE != auto ]] && { printf '%s\n' "$WEB_MODE"; return; }; if command -v lighttpd >/dev/null 2>&1 && [[ -d $LIGHTTPD_ROOT ]]; then echo lighttpd; elif command -v nginx >/dev/null 2>&1; then echo nginx; else echo none; fi; }
 load(){ ENABLED=false USERNAME='' PASSWORD=''; if [[ -r $CONF ]]; then source "$CONF"; fi; }
 write_conf(){ local tmp; tmp=$(mktemp "${CONF}.XXXXXX"); printf 'ENABLED=%q\nUSERNAME=%q\nPASSWORD=%q\n' "$ENABLED" "$USERNAME" "$PASSWORD" > "$tmp"; chmod 0600 "$tmp"; mv "$tmp" "$CONF"; }
@@ -77,42 +72,7 @@ status(){ load; local running=false; container_running && running=true; printf '
 credentials(){ load; [[ $ENABLED == true && -n $USERNAME && -n $PASSWORD ]] || die 'Registry is not enabled'; printf '{"username":"%s","password":"%s","path":"/v2/"}\n' "$(json_escape "$USERNAME")" "$(json_escape "$PASSWORD")"; }
 push(){ load; [[ $ENABLED == true ]] || die 'Registry is not enabled'; container_running || die 'Registry container is not running'; local src=${1:?source image required} dst=${2:?repository/tag required}; valid_ref "$src"; valid_ref "$dst"; local localref="127.0.0.1:$PORT/$dst"; "$DOCKER_BIN" image tag "$src" "$localref"; "$DOCKER_BIN" image push "$localref"; printf '{"published":true,"source":"%s","repository":"%s"}\n' "$(json_escape "$src")" "$(json_escape "$dst")"; }
 catalog(){ load; [[ $ENABLED == true ]] || die 'Registry is not enabled'; curl --fail --silent "http://127.0.0.1:$PORT/v2/_catalog"; printf '\n'; }
-peer_image_id(){ printf '%s' "$1" | sha256sum | cut -c1-24; }
-peer_transfer(){
-  local action=$1 peer=$2 src=${3:?} repo=${4-}
-  valid_peer_id "$peer"; need_cmd "$DOCKER_BIN"; need_cmd "$BACKPLANECTL"; need_cmd sha256sum
-  [[ $action != push ]] || valid_ref "$repo"
-  [[ $action != pull ]] || valid_ref "$src"
-  local root id archive meta tmp existed=false output
-  case "$action" in
-    push)
-      root=$("$BACKPLANECTL" path "$peer" docker-images)
-      [[ $root == /* && -d $root ]] || die 'Peer image backplane is unavailable'
-      id=$(peer_image_id "$repo"); archive="$root/$id.tar"; meta="$root/$id.ref"; tmp="$root/.$id.tar.tmp.$$"
-      "$DOCKER_BIN" image inspect "$src" >/dev/null 2>&1 || die "Local image not found: $src"
-      "$DOCKER_BIN" image inspect "$repo" >/dev/null 2>&1 && existed=true
-      if [[ $src != "$repo" ]]; then "$DOCKER_BIN" image tag "$src" "$repo"; fi
-      if ! "$DOCKER_BIN" image save --output "$tmp" "$repo"; then
-        rm -f -- "$tmp"; [[ $src == "$repo" || $existed == true ]] || "$DOCKER_BIN" image rm "$repo" >/dev/null 2>&1 || true
-        die 'Could not write Docker image archive to peer backplane'
-      fi
-      [[ $src == "$repo" || $existed == true ]] || "$DOCKER_BIN" image rm "$repo" >/dev/null 2>&1 || true
-      mv -f -- "$tmp" "$archive"
-      printf '%s\n' "$repo" > "$meta"; chmod 0640 "$archive" "$meta"
-      printf '{"published":true,"source":"%s","repository":"%s","peer":"%s","bytes":%s,"transport":"nfs4-wss-backplane"}\n' \
-        "$(json_escape "$src")" "$(json_escape "$repo")" "$peer" "$(stat -c %s "$archive")";;
-    pull)
-      root=$("$BACKPLANECTL" path "$peer" docker-images)
-      [[ $root == /* && -d $root ]] || die 'Peer image backplane is unavailable'
-      id=$(peer_image_id "$src"); archive="$root/$id.tar"; meta="$root/$id.ref"
-      [[ -f $archive && -f $meta && $(cat "$meta") == "$src" ]] || die "Image archive not found on peer backplane: $src"
-      output=$("$DOCKER_BIN" image load --input "$archive")
-      printf '{"pulled":true,"image":"%s","peer":"%s","bytes":%s,"transport":"nfs4-wss-backplane","result":"%s"}\n' \
-        "$(json_escape "$src")" "$peer" "$(stat -c %s "$archive")" "$(json_escape "$output")";;
-  esac
-}
 case ${1:-status} in
   enable) shift; enable "$@";; disable) disable;; status) status;; credentials) credentials;; push) shift; push "$@";; catalog) catalog;; render-web) render_web;;
-  peer-pull) shift; peer_transfer pull "$@";; peer-push) shift; peer_transfer push "$@";;
-  *) die 'Usage: registryctl status | enable [USERNAME] | disable | credentials | push SOURCE REPOSITORY[:TAG] | catalog | peer-pull PEER_ID REPOSITORY[:TAG] | peer-push PEER_ID SOURCE REPOSITORY[:TAG] | render-web';;
+  *) die 'Usage: registryctl status | enable [USERNAME] | disable | credentials | push SOURCE REPOSITORY[:TAG] | catalog | render-web';;
 esac

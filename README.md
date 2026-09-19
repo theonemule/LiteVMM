@@ -47,7 +47,7 @@ The console covers:
 - VM ISO/disk-image upload, listing and deletion
 - Docker container creation, lifecycle, inspection and resource/restart updates
 - Docker image pull/list/remove plus streamed build-context image builds
-- optional local OCI registry and direct image push/pull to paired LiteVMM Docker hosts
+- federated Docker image discovery plus zero-copy peer-backed container root filesystems, with explicit local pulls and an optional OCI registry
 - Docker network create/list/inspect/remove plus host bridge/interface visibility
 - named GOST TAP-over-WebSocket Layer-2 overlays for paired peers
 - continuous VM disk replication to paired storage-backplane nodes without requiring an overlay network
@@ -187,9 +187,9 @@ peer NFS mount
 /var/lib/vmapi/backplane
 ```
 
-The client runs `websocat` as a loopback TCP bridge and mounts it with the normal Linux NFS client. The storage host runs `websockify` on loopback behind Nginx or Lighttpd. One peer-wide mount is reused by backups, VM replicas, Docker volumes, Docker image archives, registry data, and future filesystem-backed storage features.
+The client runs `websocat` as a loopback TCP bridge and mounts it with the normal Linux NFS client. The storage host runs `websockify` on loopback behind Nginx or Lighttpd. One peer-wide mount is reused by backups, VM replicas, Docker volumes, read-only Docker image-rootfs exports, registry data, and future filesystem-backed storage features.
 
-Each source node receives a namespace under `peers/NODE_ID/` with storage classes including `backups`, `replicas`, `docker-volumes`, `docker-images`, `registry`, and `artifacts`.
+Each source node receives a namespace under `peers/NODE_ID/` with storage classes including `backups`, `replicas`, `docker-volumes`, `registry`, and `artifacts`. Shared read-only resources such as ISO media and Docker image-rootfs exports live under the backplane `shared/` tree.
 
 ### VM backups
 
@@ -203,11 +203,19 @@ There is no replication-specific block receiver, per-disk WebSocket endpoint, or
 
 This is disk replication, not lock-step VM fault tolerance. LiteVMM does not replicate guest RAM or CPU state, perform distributed fencing, or automatically boot the destination VM after source failure.
 
-### Peer-backed Docker volumes and image storage
+### Peer-backed Docker volumes and zero-copy image rootfs
 
 A Docker-capable host allocates a directory under the peer's `docker-volumes/` namespace and exposes it to Docker as an ordinary bind-backed named volume. Docker never talks to NFS directly and LiteVMM does not implement a custom filesystem or Docker volume plugin.
 
-Peer image transfer uses the same backplane. `peer-push` saves an image archive under `docker-images/`; `peer-pull` loads that archive into Docker. The optional local OCI registry remains available when registry semantics are desired, but peer image storage does not require a registry on the storage host.
+Docker images use a different model. LiteVMM does **not** replicate image archives and does not share or symlink Docker's mutable data root. The Docker daemon that pulled or built an image remains the only owner of those image layers. `docker-federationctl` combines local image metadata with the `/docker/images` inventory of directly paired hosts so every LiteVMM host can present one logical image catalog while the physical layers stay where they were created.
+
+When a container on Host B uses an image that exists only on Host A, Host B asks Host A to expose an immutable merged root filesystem for that image under `shared/docker-rootfs/IMAGE_ID/rootfs`. On legacy `overlay2` stores, LiteVMM creates a read-only overlay mount over Docker's existing image layers. On Docker's containerd image store, LiteVMM asks the embedded containerd daemon to mount the image. That mounted rootfs crosses the existing NFSv4/WSS peer backplane. No `docker save`, tar archive, `docker load`, or layer replication is performed.
+
+Host B creates only a tiny metadata stub image so Docker has the image configuration it needs for container creation. The `litevmm-remote` OCI runtime then uses the peer rootfs as the OverlayFS lower layer and creates the container's writable upper/work layers locally under `/var/lib/vmapi/remote-container-layers`. Unchanged files continue to come from Host A. Files written or copy-on-written by the container consume storage only on Host B.
+
+This deliberately has remote-storage semantics. A peer-backed container requires the source host and its backplane path to be available when the container starts, and later reads of untouched lower-layer files still depend on that path. LiteVMM refreshes the source rootfs export when a peer-backed container starts; it does not poll or proactively copy images. If the same tag points to different image IDs on different peers, LiteVMM reports a conflict instead of selecting one silently.
+
+An explicit `docker pull IMAGE` still means “store this image in the local Docker daemon.” Use it when a full local copy is desired. Normal peer-backed execution is selected by LiteVMM container creation and by the `/usr/local/bin/docker run|create` federation shim.
 
 ### Cloud-init provisioning
 
@@ -248,9 +256,9 @@ The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI val
 
 The LiteVMM API and console are always installed. Choose exactly one workload profile:
 
-- `backup` installs backup storage only. It hosts the loopback-only NFSv4/WSS backplane for backups, retained VM replicas, Docker volumes, image archives, and other peer storage.
+- `backup` installs backup storage only. It hosts the loopback-only NFSv4/WSS backplane for backups, retained VM replicas, Docker volumes, read-only image-rootfs exports, and other peer storage.
 - `virtualization` installs VM + backup. It includes QEMU/KVM, VM networking and consoles, cloud-init, overlays, VM backup creation, live disk replication, and the backup storage backplane.
-- `docker` installs Docker + backup. It includes Docker/Compose management, container terminals, peer volumes, peer image storage, the optional OCI registry, and the backup storage backplane.
+- `docker` installs Docker + backup. It includes Docker/Compose management, container terminals, peer volumes, federated image discovery, zero-copy peer-backed image rootfs execution, the optional OCI registry, and the backup storage backplane.
 - `virtualization-docker` installs VM + Docker + backup, combining the complete virtualization and Docker feature sets with the backup storage backplane.
 
 On Alpine, Debian, Ubuntu, or a Debian derivative:
@@ -517,13 +525,19 @@ The Images page can also build an image from an uploaded tar or compressed-tar b
 
 Docker's own image store remains authoritative. VM installation media in `/var/lib/vmapi/isos` is unrelated to Docker's image store.
 
-### Local and peer OCI registry
+For Docker profiles, LiteVMM also installs `/usr/local/bin/docker` as a thin federation shim when that path is free or already LiteVMM-managed. `/usr/bin/docker` remains the untouched native Docker CLI used by LiteVMM internals. With the normal `/usr/local/bin` path precedence, bare `docker images` and `docker image ls` show the federated catalog. `docker run` and `docker create` use the `litevmm-remote` OCI runtime automatically when the requested image exists only on a paired host. The peer's image rootfs remains remote and only the new container's writable layer is stored locally.
+
+`docker pull IMAGE` is intentionally **not** federated. It delegates to the native Docker CLI and creates a normal local image copy. Commands with explicit `--platform`, `--pull`, or `--runtime` options also retain native Docker semantics instead of silently changing the requested behavior. All other Docker commands pass through unchanged. Set `LITEVMM_DOCKER_NATIVE=true` or call `/usr/bin/docker` directly to bypass the shim.
+
+HTTP API container creation uses the same zero-copy rootfs preparation path. Docker Compose deployments currently remain native Docker Compose operations; Compose-referenced images therefore follow Docker's normal local pull behavior rather than the peer-rootfs runtime unless the Compose file explicitly configures that runtime itself.
+
+### Federated image catalog and optional OCI registry
 
 Docker profiles can optionally run a CNCF Distribution `registry:3` container bound only to `127.0.0.1:5000`. LiteVMM exposes the Registry v2 API at `/v2/` through the existing management web server, so the registry does not require a second remotely reachable port. Registry data persists under `/var/lib/vmapi/registry`.
 
 The UI can publish a local image to this registry. A paired Docker-capable LiteVMM host can also pull from or push to the registry directly. Pairing is used to retrieve the registry credential without exposing the peer API credential to the browser; image layers then transfer through the peer's normal HTTPS registry endpoint. Peer registry transfers require HTTPS by default.
 
-This registry is optional. Containers do not need it to share persistent files; use bind/NFS/SMB-backed storage when the requirement is shared data rather than image distribution.
+This registry is optional and is not the mechanism that makes peer images discoverable. The federated catalog uses the trusted LiteVMM peer API, while peer-backed containers read the source image rootfs through the NFSv4/WSS storage backplane. The OCI registry remains useful when an ordinary Registry v2 endpoint or an intentional copied image is required by software outside LiteVMM.
 
 ### Docker network management
 
@@ -815,18 +829,19 @@ curl -u alice -X PATCH \
 ```text
 GET     /api/docker/images
 GET     /api/docker/images?image=alpine%3Alatest
-POST    /api/docker/images/pull       form: image=...
-POST    /api/docker/images/tag        form: source=...&target=...
+GET     /api/docker/images/federated
+POST    /api/docker/images/prepare     form: image=...   # local admin; prepare peer rootfs metadata without copying layers
+POST    /api/docker/images/expose      form: image=...   # paired host; expose a local image as read-only rootfs
+POST    /api/docker/images/pull        form: image=...   # explicit normal local Docker pull
+POST    /api/docker/images/tag         form: source=...&target=...
 PUT     /api/docker/images/build?tag=...&dockerfile=Dockerfile   raw tar build context
 DELETE  /api/docker/images?image=...&force=true
 
 GET     /api/docker/registry
-POST    /api/docker/registry          form: username=...
+POST    /api/docker/registry           form: username=...
 DELETE  /api/docker/registry
 GET     /api/docker/registry/catalog
-POST    /api/docker/registry/push     form: source=...&repository=...
-POST    /api/docker/registry/peer-pull form: peer_id=...&repository=...
-POST    /api/docker/registry/peer-push form: peer_id=...&source=...&repository=...
+POST    /api/docker/registry/push      form: source=...&repository=...
 ```
 
 ### Docker network endpoints

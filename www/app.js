@@ -36,6 +36,12 @@
     return `${n < 10 && i ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
   };
   const first = v => Array.isArray(v) ? v[0] : v;
+  const dockerLabel = (labels, key) => {
+    if (labels && typeof labels === 'object' && !Array.isArray(labels)) return String(labels[key] || '');
+    const prefix = `${key}=`;
+    const hit = String(labels || '').split(',').find(v => v.startsWith(prefix));
+    return hit ? hit.slice(prefix.length) : '';
+  };
   const lines = text => String(text || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean);
   const shellQuote = v => `'${String(v ?? '').replace(/'/g, `'"'"'`)}'`;
   const commandLine = parts => parts.map(shellQuote).join(' ');
@@ -436,6 +442,37 @@ ${commandLine(ci)} < user-data`;
         $('#modalBody', el).prepend(error); toast(error.textContent, 'Request failed');
       } finally { btn.disabled = false; btn.removeAttribute('aria-busy'); btn.innerHTML = original; }
     };
+    m.show();
+    return m;
+  }
+
+  function editorModal({eyebrow='Container option', title='', body='', submitText='Save', submitClass='btn-primary', onSubmit=null, size='md'}) {
+    const el = $('#editorModal');
+    const dialog = $('.modal-dialog', el);
+    dialog.className = 'modal-dialog modal-' + size + ' modal-dialog-centered modal-dialog-scrollable';
+    $('#editorEyebrow').textContent = eyebrow;
+    $('#editorTitle').textContent = title;
+    $('#editorBody').innerHTML = body;
+    $('#editorFooter').innerHTML = '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>' + (submitText ? '<button id="editorSubmit" type="button" class="btn ' + submitClass + '">' + esc(submitText) + '</button>' : '');
+    const m = bootstrap.Modal.getOrCreateInstance(el, {backdrop:'static'});
+    if (submitText && onSubmit) $('#editorSubmit').onclick = async () => {
+      const btn = $('#editorSubmit'); const original = btn.innerHTML; btn.disabled = true; btn.setAttribute('aria-busy','true');
+      btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>Working…';
+      $('#editorActionError', el)?.remove();
+      try { await onSubmit(el, m); }
+      catch (e) {
+        const error = document.createElement('div'); error.id='editorActionError'; error.className='alert alert-danger mb-3'; error.setAttribute('role','alert');
+        error.textContent = e?.message || 'The value could not be saved.';
+        $('#editorBody', el).prepend(error);
+      } finally { btn.disabled = false; btn.removeAttribute('aria-busy'); btn.innerHTML = original; }
+    };
+    el.addEventListener('shown.bs.modal', () => {
+      const backdrops = $$('.modal-backdrop');
+      backdrops[backdrops.length - 1]?.classList.add('editor-modal-backdrop');
+    }, {once:true});
+    el.addEventListener('hidden.bs.modal', () => {
+      if ($('#formModal')?.classList.contains('show')) document.body.classList.add('modal-open');
+    }, {once:true});
     m.show();
     return m;
   }
@@ -955,10 +992,10 @@ ${commandLine(ci)} < user-data`;
 
   async function loadContainers() {
     const containers = await request('/docker/containers'); state.cache.containers=containers;
-    const rows = containers.map(c=>{const labels=c.Labels||{};const project=labels['com.docker.compose.project'] || labels['com.docker.compose.project.name'] || '';const service=labels['com.docker.compose.service'] || '';return `<tr><td><div class="resource-name">${esc(c.Names || c.Name || '')}</div><div class="small text-secondary mono">${esc(c.ID || '')}</div>${project?`<div class="small text-primary">Compose: ${esc(project)}${service?` / ${esc(service)}`:''}</div>`:''}</td><td>${stateBadge(c.State || '')}</td><td class="mono small">${esc(c.Image || '')}</td><td class="small text-secondary">${esc(c.Status || '')}</td><td><div class="action-row">
+    const rows = containers.map(c=>{const labels=c.Labels||{};const project=dockerLabel(labels,'com.docker.compose.project') || dockerLabel(labels,'com.docker.compose.project.name');const service=dockerLabel(labels,'com.docker.compose.service');const originalImage=dockerLabel(labels,'io.litevmm.remote.image');const displayImage=originalImage||c.Image||'';return `<tr><td><div class="resource-name">${esc(c.Names || c.Name || '')}</div><div class="small text-secondary mono">${esc(c.ID || '')}</div>${project?`<div class="small text-primary">Compose: ${esc(project)}${service?` / ${esc(service)}`:''}</div>`:''}</td><td>${stateBadge(c.State || '')}</td><td class="mono small">${esc(displayImage)}${originalImage?'<div class="small text-secondary">peer-backed</div>':''}</td><td class="small text-secondary">${esc(c.Status || '')}</td><td><div class="action-row">
       <button class="btn btn-sm btn-outline-secondary" data-ctr-details="${esc(c.Names || c.Name || '')}">Inspect</button>
       <button class="btn btn-sm btn-outline-secondary" data-ctr-logs="${esc(c.Names || c.Name || '')}">Logs</button>
-      <button class="btn btn-sm btn-outline-secondary" data-ctr-commit="${esc(c.Names || c.Name || '')}">Snapshot</button>
+      ${originalImage?'':`<button class="btn btn-sm btn-outline-secondary" data-ctr-commit="${esc(c.Names || c.Name || '')}">Snapshot</button>`}
       ${String(c.State||'').toLowerCase()==='running'?`<button class="btn btn-sm btn-outline-warning" data-ctr-stop="${esc(c.Names || '')}">Stop</button><button class="btn btn-sm btn-outline-secondary" data-ctr-restart="${esc(c.Names || '')}">Restart</button>`:`<button class="btn btn-sm btn-outline-success" data-ctr-start="${esc(c.Names || '')}">Start</button>`}
       ${String(c.State||'').toLowerCase()==='running'?`<button class="btn btn-sm btn-outline-primary" data-ctr-terminal="${esc(c.Names || '')}">Terminal</button>`:''}
       <button class="btn btn-sm btn-outline-danger" data-ctr-delete="${esc(c.Names || '')}">Delete</button>
@@ -1050,23 +1087,227 @@ ${commandLine(ci)} < user-data`;
   }
 
   async function openCreateContainer(){
-    const [images,nets,vols]=await Promise.all([request('/docker/images'),request('/docker/networks'),request('/docker/volumes')]);
-    const imageNames=[...new Set(images.flatMap(i=>[i.Repository && i.Tag && i.Tag!=='<none>'?`${i.Repository}:${i.Tag}`:null,i.Tag && i.Repository?null:i.Name]).filter(Boolean))];
-    const imageList=imageNames.map(n=>`<option value="${esc(n)}"></option>`).join('');
-    const netOpts=[`<option value="">Default</option>`,...nets.map(n=>`<option value="${esc(n.Name||n.name||'')}">${esc(n.Name||n.name||'')}</option>`)].join('');
-    const volNote=vols.length?`Available named volumes: ${vols.map(v=>esc(v.Name||v.name||'')).join(', ')}`:'No named volumes yet.';
+    const [images,nets,vols,peers,service,peerMounts,imageInventory]=await Promise.all([
+      request('/docker/images'),
+      request('/docker/networks'),
+      request('/docker/volumes'),
+      request('/cluster/peers').catch(()=>[]),
+      request('/').catch(()=>({capabilities:[]})),
+      request('/docker/peer-volumes').catch(()=>[]),
+      collectHostInventory('/docker/images').catch(()=>({rows:[],errors:[]}))
+    ]);
+
+    const imageRef=i=>(i.Repository&&i.Tag&&i.Repository!=='<none>'&&i.Tag!=='<none>')?`${i.Repository}:${i.Tag}`:(i.Name||i.ID||'');
+    const activeRefs=[...new Set((images||[]).map(imageRef).filter(Boolean))].sort();
+    const activeRefSet=new Set(activeRefs);
+    const activeHostName=activeHost().name;
+    const seenRemote=new Set();
+    const remoteImages=(imageInventory.rows||[])
+      .map(i=>({...i,_ref:imageRef(i)}))
+      .filter(i=>{
+        if(!i._ref) return false;
+        const isActive=state.remotePeerId ? i.storage_peer_id===state.remotePeerId : !i.storage_peer_id;
+        if(isActive) return false;
+        const key=`${i.storage_host}|${i._ref}`;
+        if(seenRemote.has(key)) return false;
+        seenRemote.add(key); return true;
+      });
+    const netOpts=[`<option value="">Default</option>`,...(nets||[]).map(n=>`<option value="${esc(n.Name||n.name||'')}">${esc(n.Name||n.name||'')}</option>`)].join('');
+    const peerOptions=(peers||[]).filter(p=>p.url).map(p=>`<option value="${esc(p.node_id)}">${esc(p.name||p.label||abbreviatedNodeId(p.node_id))}</option>`).join('');
+    const namedVolumeOptions=(vols||[]).map(v=>v.Name||v.name||'').filter(Boolean).map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join('');
+    const canPeerVolumes=(service.capabilities||[]).includes('peer-volume-client') && !!peerOptions;
+    const runtime={env:[],publish:[],volume:[],label:[],cmd:[]};
+    let remoteImageSelection=null;
+
+    const localImageOptions=activeRefs.map(ref=>`<option value="${esc(ref)}">${esc(ref)}</option>`).join('');
+    const remoteImageOptions=remoteImages.map(i=>`<option value="${esc(i._ref)}" data-remote="true" data-host="${esc(i.storage_host||'Paired host')}">${esc(i._ref)} · ${esc(i.storage_host||'Paired host')}</option>`).join('');
+    const inventoryWarning=(imageInventory.errors||[]).length?`<div class="alert alert-warning small py-2 mt-2 mb-0">Some paired image inventories could not be read: ${esc(imageInventory.errors.join(' / '))}</div>`:'';
+
     modal({eyebrow:'Docker daemon',title:'Create container',submitText:'Create container',body:`<form id="ctrCreateForm">
-      <div class="form-section"><div class="form-section-title">Identity</div><div class="row g-3"><div class="col-md-5"><label class="form-label">Name</label><input name="name" class="form-control" required></div><div class="col-md-7"><label class="form-label">Image</label><input name="image" list="dockerImageList" class="form-control" placeholder="nginx:latest" required><datalist id="dockerImageList">${imageList}</datalist></div></div></div>
-      <div class="form-section"><div class="form-section-title">Resources and lifecycle</div><div class="row g-3"><div class="col-md-3"><label class="form-label">CPUs</label><input name="cpus" class="form-control" placeholder="2"></div><div class="col-md-3"><label class="form-label">Memory</label><input name="memory" class="form-control" placeholder="512m"></div><div class="col-md-3"><label class="form-label">Restart</label><select name="restart" class="form-select"><option value="">Default</option><option>no</option><option>unless-stopped</option><option>always</option><option>on-failure</option></select></div><div class="col-md-3"><label class="form-label">Network</label><select name="network" id="ctrNetMode" class="form-select">${netOpts}</select></div><div class="col-12"><div class="form-check form-switch"><input name="start_at_boot" id="ctrStartAtBoot" class="form-check-input" type="checkbox"><label class="form-check-label" for="ctrStartAtBoot">Start at host boot</label></div><div class="form-text">Uses Docker's <span class="mono">unless-stopped</span> restart policy.</div></div></div></div>
-      <div class="form-section"><div class="form-section-title">Runtime options</div><div class="row g-3"><div class="col-md-6"><label class="form-label">Environment <span class="text-secondary">one per line</span></label><textarea name="env" rows="4" class="form-control mono" placeholder="MODE=production"></textarea></div><div class="col-md-6"><label class="form-label">Published ports <span class="text-secondary">one per line</span></label><textarea name="publish" rows="4" class="form-control mono" placeholder="8080:80"></textarea></div><div class="col-md-6"><label class="form-label">Volumes / bind mounts</label><textarea name="volume" rows="4" class="form-control mono" placeholder="appdata:/data"></textarea><div class="form-text">${volNote}</div></div><div class="col-md-6"><label class="form-label">Labels</label><textarea name="label" rows="4" class="form-control mono" placeholder="role=frontend"></textarea></div><div class="col-12"><label class="form-label">Command arguments <span class="text-secondary">one argument per line</span></label><textarea name="cmd" rows="3" class="form-control mono" placeholder="sleep&#10;3600"></textarea></div><div class="col-md-4"><label class="form-label">Hostname</label><input name="hostname" class="form-control"></div><div class="col-md-4"><label class="form-label">User</label><input name="user" class="form-control"></div><div class="col-md-4"><label class="form-label">Working directory</label><input name="workdir" class="form-control"></div><div class="col-md-6"><label class="form-label">Entrypoint</label><input name="entrypoint" class="form-control"></div><div class="col-md-6 d-flex align-items-end"><div class="form-check form-switch mb-2"><input name="read_only" id="ctrRO" class="form-check-input" type="checkbox"><label class="form-check-label" for="ctrRO">Read-only root filesystem</label></div></div></div></div>
+      <div class="form-section">
+        <div class="form-section-title">Identity</div>
+        <div class="row g-3">
+          <div class="col-md-5"><label class="form-label">Name</label><input name="name" class="form-control" required></div>
+          <div class="col-md-7">
+            <label class="form-label">Image</label>
+            <input name="image" id="ctrImageValue" class="form-control mono" placeholder="nginx:latest" required>
+            <select id="ctrImagePick" class="form-select form-select-sm mt-2">
+              <option value="">Choose from image library…</option>
+              ${localImageOptions?`<optgroup label="${esc(activeHostName)}">${localImageOptions}</optgroup>`:''}
+              ${remoteImageOptions?`<optgroup label="Images on paired hosts">${remoteImageOptions}</optgroup>`:''}
+            </select>
+            <div id="ctrImageNote" class="runtime-image-host-note mt-2">Type any registry reference, or choose an image already visible in the image library. Images on paired hosts stay on those hosts. When you create a container from a peer-only image, LiteVMM uses that peer rootfs read-only and stores only this container's writable layer locally. A typed image that is nowhere in the peer catalog is pulled normally.</div>
+            ${inventoryWarning}
+          </div>
+        </div>
+      </div>
+      <div class="form-section">
+        <div class="form-section-title">Resources and lifecycle</div>
+        <div class="row g-3">
+          <div class="col-md-3"><label class="form-label">CPUs</label><input name="cpus" class="form-control" placeholder="2"></div>
+          <div class="col-md-3"><label class="form-label">Memory</label><input name="memory" class="form-control" placeholder="512m"></div>
+          <div class="col-md-3"><label class="form-label">Restart</label><select name="restart" class="form-select"><option value="">Default</option><option>no</option><option>unless-stopped</option><option>always</option><option>on-failure</option></select></div>
+          <div class="col-md-3"><label class="form-label">Network</label><select name="network" class="form-select">${netOpts}</select></div>
+          <div class="col-12"><div class="form-check form-switch"><input name="start_at_boot" id="ctrStartAtBoot" class="form-check-input" type="checkbox"><label class="form-check-label" for="ctrStartAtBoot">Start at host boot</label></div><div class="form-text">Uses Docker's <span class="mono">unless-stopped</span> restart policy.</div></div>
+        </div>
+      </div>
+      <div class="form-section">
+        <div class="form-section-title">Runtime options</div>
+        <div class="row g-3">
+          <div class="col-md-6"><div class="runtime-option-card"><div class="d-flex justify-content-between align-items-start gap-2 mb-2"><div><div class="fw-semibold">Environment</div><div class="small text-secondary">Variables passed to the container</div></div><button type="button" class="btn btn-sm btn-outline-primary" id="ctrEnvAdd">Add</button></div><div id="ctrEnvList" class="runtime-values"></div></div></div>
+          <div class="col-md-6"><div class="runtime-option-card"><div class="d-flex justify-content-between align-items-start gap-2 mb-2"><div><div class="fw-semibold">Published ports</div><div class="small text-secondary">Host source to container destination</div></div><button type="button" class="btn btn-sm btn-outline-primary" id="ctrPortAdd">Add</button></div><div id="ctrPortList" class="runtime-values"></div></div></div>
+          <div class="col-md-6"><div class="runtime-option-card"><div class="d-flex justify-content-between align-items-start gap-2 mb-2"><div><div class="fw-semibold">Volumes / bind mounts</div><div class="small text-secondary">Local folders, Docker volumes, or paired storage</div></div><button type="button" class="btn btn-sm btn-outline-primary" id="ctrVolumeAdd">Add</button></div><div id="ctrVolumeList" class="runtime-values"></div></div></div>
+          <div class="col-md-6"><div class="runtime-option-card"><div class="d-flex justify-content-between align-items-start gap-2 mb-2"><div><div class="fw-semibold">Labels</div><div class="small text-secondary">Container metadata</div></div><button type="button" class="btn btn-sm btn-outline-primary" id="ctrLabelAdd">Add</button></div><div id="ctrLabelList" class="runtime-values"></div></div></div>
+          <div class="col-12"><div class="runtime-option-card"><div class="d-flex justify-content-between align-items-start gap-2 mb-2"><div><div class="fw-semibold">Command arguments</div><div class="small text-secondary">Arguments appended after the image</div></div><button type="button" class="btn btn-sm btn-outline-primary" id="ctrCmdAdd">Add</button></div><div id="ctrCmdList" class="runtime-values"></div></div></div>
+          <div class="col-md-4"><label class="form-label">Hostname</label><input name="hostname" class="form-control"></div>
+          <div class="col-md-4"><label class="form-label">User</label><input name="user" class="form-control"></div>
+          <div class="col-md-4"><label class="form-label">Working directory</label><input name="workdir" class="form-control"></div>
+          <div class="col-md-6"><label class="form-label">Entrypoint</label><input name="entrypoint" class="form-control"></div>
+          <div class="col-md-6 d-flex align-items-end"><div class="form-check form-switch mb-2"><input name="read_only" id="ctrRO" class="form-check-input" type="checkbox"><label class="form-check-label" for="ctrRO">Read-only root filesystem</label></div></div>
+        </div>
+      </div>
       <div class="form-section"><div class="form-section-title">Create command</div><pre id="ctrCreatePreview" class="code-panel command-preview mb-0"></pre></div>
-    </form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#ctrCreateForm',el));const o={name:fd.get('name'),image:fd.get('image'),cpus:fd.get('cpus'),memory:fd.get('memory'),restart:fd.has('start_at_boot')?'unless-stopped':fd.get('restart'),network:fd.get('network'),hostname:fd.get('hostname'),user:fd.get('user'),workdir:fd.get('workdir'),entrypoint:fd.get('entrypoint'),read_only:fd.has('read_only')?'true':'false',env:lines(fd.get('env')),publish:lines(fd.get('publish')),volume:lines(fd.get('volume')),label:lines(fd.get('label')),cmd:lines(fd.get('cmd'))};await request('/docker/containers',{method:'POST',form:o});m.hide();toast(`${o.name} created`);await renderRoute();}});
-    const form = $('#ctrCreateForm', $('#formModal'));
-    const syncCtrForm = () => {
-      const fd = new FormData(form);
-      setPreview('#ctrCreatePreview', containerCreateCommand({name:fd.get('name'),image:fd.get('image'),cpus:fd.get('cpus'),memory:fd.get('memory'),restart:fd.get('restart'),network:fd.get('network'),hostname:fd.get('hostname'),user:fd.get('user'),workdir:fd.get('workdir'),entrypoint:fd.get('entrypoint'),read_only:fd.has('read_only')?'true':'false',env:lines(fd.get('env')),publish:lines(fd.get('publish')),volume:lines(fd.get('volume')),label:lines(fd.get('label')),cmd:lines(fd.get('cmd'))}));
+    </form>`,onSubmit:async(el,m)=>{
+      const form=$('#ctrCreateForm',el),fd=new FormData(form);
+      const image=String(fd.get('image')||'').trim(),name=String(fd.get('name')||'').trim();
+      if(!name) throw new Error('Container name is required.');
+      if(!image) throw new Error('Select or enter an image.');
+      const env=runtime.env.map(v=>`${v.key}=${v.value}`);
+      const publish=runtime.publish.map(v=>`${v.hostIp?`${v.hostIp}:`:''}${v.host}:${v.container}${v.protocol&&v.protocol!=='tcp'?`/${v.protocol}`:''}`);
+      const label=runtime.label.map(v=>`${v.key}=${v.value}`);
+      const cmd=runtime.cmd.map(v=>v.value);
+      const volume=runtime.volume.map(v=>`${v.kind==='remote'?v.localName:v.source}:${v.destination}${v.readOnly?':ro':''}`);
+
+      const newlyAttached=[];
+      try{
+        for(const mount of runtime.volume.filter(v=>v.kind==='remote')){
+          const exists=(peerMounts||[]).find(item=>item.name===mount.localName || (item.peer_id===mount.peerId && item.remote_name===mount.remoteName));
+          if(exists){ mount.localName=exists.name; continue; }
+          const result=await request('/docker/peer-volumes',{method:'POST',form:{peer_id:mount.peerId,remote_name:mount.remoteName,name:mount.localName}});
+          peerMounts.push(result); newlyAttached.push(mount.localName);
+        }
+        const o={name,image,cpus:fd.get('cpus'),memory:fd.get('memory'),restart:fd.has('start_at_boot')?'unless-stopped':fd.get('restart'),network:fd.get('network'),hostname:fd.get('hostname'),user:fd.get('user'),workdir:fd.get('workdir'),entrypoint:fd.get('entrypoint'),read_only:fd.has('read_only')?'true':'false',env,publish,volume,label,cmd};
+        await request('/docker/containers',{method:'POST',form:o});
+        m.hide(); toast(`${o.name} created`); await renderRoute();
+      }catch(error){
+        for(const localName of newlyAttached.reverse()){
+          try{ await request(`/docker/peer-volumes/${encodeURIComponent(localName)}`,{method:'DELETE'}); }catch(_){}
+        }
+        throw error;
+      }
+    }});
+
+    const root=$('#formModal'),form=$('#ctrCreateForm',root),imageInput=$('#ctrImageValue',form),imagePick=$('#ctrImagePick',form),imageNote=$('#ctrImageNote',form);
+    const empty='<div class="runtime-option-empty">None configured.</div>';
+    const row=(title,detail,type,index)=>`<div class="runtime-value-row"><div class="runtime-value-main"><div class="runtime-value-title mono">${esc(title)}</div>${detail?`<div class="runtime-value-detail">${esc(detail)}</div>`:''}</div><div class="btn-group btn-group-sm"><button type="button" class="btn btn-outline-secondary" data-runtime-edit="${type}" data-index="${index}">Edit</button><button type="button" class="btn btn-outline-danger" data-runtime-delete="${type}" data-index="${index}">Remove</button></div></div>`;
+
+    const syncPreview=()=>{
+      const fd=new FormData(form);
+      const o={name:fd.get('name'),image:fd.get('image'),cpus:fd.get('cpus'),memory:fd.get('memory'),restart:fd.has('start_at_boot')?'unless-stopped':fd.get('restart'),network:fd.get('network'),hostname:fd.get('hostname'),user:fd.get('user'),workdir:fd.get('workdir'),entrypoint:fd.get('entrypoint'),read_only:fd.has('read_only')?'true':'false',
+        env:runtime.env.map(v=>`${v.key}=${v.value}`),
+        publish:runtime.publish.map(v=>`${v.hostIp?`${v.hostIp}:`:''}${v.host}:${v.container}${v.protocol&&v.protocol!=='tcp'?`/${v.protocol}`:''}`),
+        volume:runtime.volume.map(v=>`${v.kind==='remote'?v.localName:v.source}:${v.destination}${v.readOnly?':ro':''}`),
+        label:runtime.label.map(v=>`${v.key}=${v.value}`),
+        cmd:runtime.cmd.map(v=>v.value)};
+      setPreview('#ctrCreatePreview',containerCreateCommand(o));
     };
-    form.addEventListener('input', syncCtrForm); form.addEventListener('change', syncCtrForm); syncCtrForm();
+
+    const renderRuntime=()=>{
+      $('#ctrEnvList',form).innerHTML=runtime.env.length?runtime.env.map((v,i)=>row(v.key,v.value,'env',i)).join(''):empty;
+      $('#ctrPortList',form).innerHTML=runtime.publish.length?runtime.publish.map((v,i)=>row(`${v.hostIp?`${v.hostIp}:`:''}${v.host} → ${v.container}/${v.protocol}`,v.hostIp?'Bound to a specific host address':'All host addresses','publish',i)).join(''):empty;
+      $('#ctrLabelList',form).innerHTML=runtime.label.length?runtime.label.map((v,i)=>row(v.key,v.value,'label',i)).join(''):empty;
+      $('#ctrCmdList',form).innerHTML=runtime.cmd.length?runtime.cmd.map((v,i)=>row(v.value,`Argument ${i+1}`,'cmd',i)).join(''):empty;
+      $('#ctrVolumeList',form).innerHTML=runtime.volume.length?runtime.volume.map((v,i)=>{
+        const source=v.kind==='remote'?`${v.peerLabel}: ${v.remoteName}`:v.source;
+        const kind=v.kind==='remote'?'Paired storage':(v.kind==='named'?'Docker volume':'Local host folder');
+        return row(`${source} → ${v.destination}`,`${kind}${v.readOnly?' · read-only':''}`,'volume',i);
+      }).join(''):empty;
+      $$('[data-runtime-delete]',form).forEach(b=>b.onclick=()=>{runtime[b.dataset.runtimeDelete].splice(Number(b.dataset.index),1);renderRuntime();});
+      $$('[data-runtime-edit]',form).forEach(b=>openRuntimeEditor(b.dataset.runtimeEdit,Number(b.dataset.index)));
+      syncPreview();
+    };
+
+    const openRuntimeEditor=(type,index=null)=>{
+      const current=index===null?null:runtime[type][index];
+      const save=value=>{if(index===null)runtime[type].push(value);else runtime[type][index]=value;renderRuntime();};
+      if(type==='env'){
+        editorModal({title:index===null?'Add environment variable':'Edit environment variable',body:`<form id="runtimeEditorForm"><label class="form-label">Variable</label><input name="key" class="form-control mono mb-3" value="${esc(current?.key||'')}" placeholder="MODE" required><label class="form-label">Value</label><input name="value" class="form-control mono" value="${esc(current?.value||'')}" placeholder="production"></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#runtimeEditorForm',el)),key=String(fd.get('key')||'').trim();if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))throw new Error('Use a valid environment variable name.');save({key,value:String(fd.get('value')??'')});m.hide();}});
+        return;
+      }
+      if(type==='label'){
+        editorModal({title:index===null?'Add label':'Edit label',body:`<form id="runtimeEditorForm"><label class="form-label">Label</label><input name="key" class="form-control mono mb-3" value="${esc(current?.key||'')}" placeholder="role" required><label class="form-label">Value</label><input name="value" class="form-control mono" value="${esc(current?.value||'')}" placeholder="frontend"></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#runtimeEditorForm',el)),key=String(fd.get('key')||'').trim();if(!key||/[\s=]/.test(key))throw new Error('Label name cannot be empty or contain whitespace or =.');save({key,value:String(fd.get('value')??'')});m.hide();}});
+        return;
+      }
+      if(type==='publish'){
+        editorModal({title:index===null?'Publish port':'Edit published port',body:`<form id="runtimeEditorForm"><div class="row g-3"><div class="col-md-6"><label class="form-label">Host port</label><input name="host" type="number" min="1" max="65535" class="form-control" value="${esc(current?.host||'')}" placeholder="8080" required></div><div class="col-md-6"><label class="form-label">Container port</label><input name="container" type="number" min="1" max="65535" class="form-control" value="${esc(current?.container||'')}" placeholder="80" required></div><div class="col-md-8"><label class="form-label">Host IP <span class="text-secondary">(optional)</span></label><input name="hostIp" class="form-control mono" value="${esc(current?.hostIp||'')}" placeholder="127.0.0.1"></div><div class="col-md-4"><label class="form-label">Protocol</label><select name="protocol" class="form-select"><option value="tcp" ${current?.protocol!=='udp'?'selected':''}>TCP</option><option value="udp" ${current?.protocol==='udp'?'selected':''}>UDP</option></select></div></div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#runtimeEditorForm',el)),host=Number(fd.get('host')),container=Number(fd.get('container'));if(host<1||host>65535||container<1||container>65535)throw new Error('Ports must be between 1 and 65535.');save({host:String(host),container:String(container),hostIp:String(fd.get('hostIp')||'').trim(),protocol:String(fd.get('protocol')||'tcp')});m.hide();}});
+        return;
+      }
+      if(type==='cmd'){
+        editorModal({title:index===null?'Add command argument':'Edit command argument',body:`<form id="runtimeEditorForm"><label class="form-label">Argument</label><input name="value" class="form-control mono" value="${esc(current?.value||'')}" placeholder="--verbose" required><div class="form-text">Add each argument separately so spaces inside one argument are preserved.</div></form>`,onSubmit:async(el,m)=>{const value=String(new FormData($('#runtimeEditorForm',el)).get('value')||'');if(!value)throw new Error('Argument cannot be empty.');save({value});m.hide();}});
+        return;
+      }
+      if(type==='volume'){
+        const remoteAllowed=canPeerVolumes;
+        editorModal({title:index===null?'Add volume or bind mount':'Edit volume or bind mount',size:'lg',body:`<form id="runtimeEditorForm">
+          <div class="row g-3">
+            <div class="col-md-6"><label class="form-label">Source</label><select name="kind" id="runtimeVolumeKind" class="form-select"><option value="bind" ${!current||current.kind==='bind'?'selected':''}>Local host folder</option><option value="named" ${current?.kind==='named'?'selected':''}>Docker named volume</option>${remoteAllowed?`<option value="remote" ${current?.kind==='remote'?'selected':''}>Paired host storage</option>`:''}</select></div>
+            <div class="col-md-6"><label class="form-label">Container destination</label><input name="destination" class="form-control mono" value="${esc(current?.destination||'')}" placeholder="/data" required></div>
+            <div class="col-12" id="runtimeVolumeSourceFields"></div>
+            <div class="col-12"><div class="form-check form-switch"><input name="readOnly" id="runtimeVolumeRO" class="form-check-input" type="checkbox" ${current?.readOnly?'checked':''}><label class="form-check-label" for="runtimeVolumeRO">Read-only mount</label></div></div>
+          </div>
+        </form>`,onSubmit:async(el,m)=>{
+          const editor=$('#runtimeEditorForm',el),fd=new FormData(editor),kind=fd.get('kind'),destination=String(fd.get('destination')||'').trim();
+          if(!destination.startsWith('/'))throw new Error('Container destination must be an absolute path.');
+          if(kind==='bind'){
+            const source=String(fd.get('source')||'').trim();if(!source.startsWith('/'))throw new Error('Local host folder must be an absolute path.');
+            save({kind,source,destination,readOnly:fd.has('readOnly')});m.hide();return;
+          }
+          if(kind==='named'){
+            const source=String(fd.get('source')||'').trim();if(!source)throw new Error('Choose or enter a Docker volume name.');
+            save({kind,source,destination,readOnly:fd.has('readOnly')});m.hide();return;
+          }
+          const peerId=String(fd.get('peerId')||''),remoteName=String(fd.get('remoteName')||'').trim();
+          if(!peerId)throw new Error('Choose a paired storage host.');
+          if(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(remoteName))throw new Error('Remote storage folder must use letters, numbers, period, underscore, or hyphen.');
+          const peer=(peers||[]).find(p=>p.node_id===peerId),peerLabel=peer?.name||peer?.label||abbreviatedNodeId(peerId);
+          const existing=(peerMounts||[]).find(item=>item.peer_id===peerId&&item.remote_name===remoteName);
+          const localName=existing?.name||`peer-${peerId.slice(0,8)}-${remoteName}`.replace(/[^A-Za-z0-9._-]/g,'-').slice(0,64);
+          save({kind:'remote',peerId,peerLabel,remoteName,localName,destination,readOnly:fd.has('readOnly')});m.hide();
+        }});
+        const editor=$('#runtimeEditorForm',$('#editorModal')),kind=$('#runtimeVolumeKind',editor),fields=$('#runtimeVolumeSourceFields',editor);
+        const syncVolumeFields=()=>{
+          const k=kind.value;
+          if(k==='bind')fields.innerHTML=`<label class="form-label">Folder on ${esc(activeHostName)}</label><input name="source" class="form-control mono" value="${esc(current?.kind==='bind'?current.source:'')}" placeholder="/srv/appdata" required><div class="form-text">This path is on the host running the container.</div>`;
+          else if(k==='named')fields.innerHTML=`<label class="form-label">Docker volume</label><input name="source" list="ctrNamedVolumeList" class="form-control mono" value="${esc(current?.kind==='named'?current.source:'')}" placeholder="appdata" required><datalist id="ctrNamedVolumeList">${namedVolumeOptions}</datalist><div class="form-text">Choose an existing named volume or enter a new volume name Docker can create.</div>`;
+          else fields.innerHTML=`<div class="alert alert-light border small">LiteVMM stores this folder on the paired host and mounts it through the existing NFSv4/WebSocket storage backplane. Docker receives a normal local named volume; no NFS port is exposed.</div><div class="row g-3"><div class="col-md-6"><label class="form-label">Paired storage host</label><select name="peerId" class="form-select" required><option value="">Select peer</option>${(peers||[]).filter(p=>p.url).map(p=>`<option value="${esc(p.node_id)}" ${current?.peerId===p.node_id?'selected':''}>${esc(p.name||p.label||abbreviatedNodeId(p.node_id))}</option>`).join('')}</select></div><div class="col-md-6"><label class="form-label">Remote storage folder</label><input name="remoteName" class="form-control mono" value="${esc(current?.kind==='remote'?current.remoteName:'')}" placeholder="appdata" required><div class="form-text">A durable folder under the peer's Docker storage backplane.</div></div></div>`;
+        };
+        kind.onchange=syncVolumeFields;syncVolumeFields();
+      }
+    };
+
+    $('#ctrEnvAdd',form).onclick=()=>openRuntimeEditor('env');
+    $('#ctrPortAdd',form).onclick=()=>openRuntimeEditor('publish');
+    $('#ctrVolumeAdd',form).onclick=()=>openRuntimeEditor('volume');
+    $('#ctrLabelAdd',form).onclick=()=>openRuntimeEditor('label');
+    $('#ctrCmdAdd',form).onclick=()=>openRuntimeEditor('cmd');
+
+    imagePick.onchange=()=>{
+      const option=imagePick.selectedOptions[0];
+      if(!option?.value)return;
+      imageInput.value=option.value;
+      remoteImageSelection=option.dataset.remote==='true'?{ref:option.value,host:option.dataset.host}:null;
+      imageNote.textContent=remoteImageSelection?`This image is currently visible on ${remoteImageSelection.host}. LiteVMM will pull the same reference onto ${activeHostName} before creation if needed.`:`Using an image already available on ${activeHostName}.`;
+      syncPreview();
+    };
+    imageInput.oninput=()=>{
+      if(remoteImageSelection?.ref!==imageInput.value)remoteImageSelection=null;
+      imagePick.value='';
+      imageNote.textContent=activeRefSet.has(imageInput.value)?`This image is already available on ${activeHostName}.`:'If this image is not local, LiteVMM will pull it before creating the container.';
+      syncPreview();
+    };
+    form.addEventListener('input',e=>{if(e.target!==imageInput)syncPreview();});
+    form.addEventListener('change',e=>{if(e.target!==imagePick)syncPreview();});
+    renderRuntime();
   }
 
   async function openContainerDetails(name){
@@ -1074,16 +1315,16 @@ ${commandLine(ci)} < user-data`;
       request(`/docker/containers/${encodeURIComponent(name)}`),
       request(`/docker/containers/${encodeURIComponent(name)}/metrics`).catch(()=>null)
     ]);
-    const d=first(data)||{}; const hc=d.HostConfig||{}; const cfg=d.Config||{}; const st=d.State||{};
+    const d=first(data)||{}; const hc=d.HostConfig||{}; const cfg=d.Config||{}; const st=d.State||{}; const originalImage=dockerLabel(cfg.Labels,'io.litevmm.remote.image'); const displayImage=originalImage||cfg.Image||'';
     modal({eyebrow:`Docker · ${st.Status || ''}`,title:name,submitText:'Update resources',body:`<form id="ctrEditForm">
       <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center"><span>Resource usage</span><span class="fw-normal text-lowercase">5 second refresh</span></div>${meterRow('ctrmetric',[{key:'cpu',label:'CPU'},{key:'memory',label:'Memory'},{key:'disk',label:'Writable layer',progress:false},{key:'network',label:'Network',progress:false}])}<div class="form-text mt-2">Docker disk usage is the writable layer size. There is no fixed virtual-disk capacity unless storage quotas are configured outside this layer.</div></div>
       <div class="form-section"><div class="form-section-title">Runtime resources</div><div class="row g-3"><div class="col-md-4"><label class="form-label">CPUs</label><input name="cpus" class="form-control" placeholder="2"></div><div class="col-md-4"><label class="form-label">Memory</label><input name="memory" class="form-control" placeholder="512m"></div><div class="col-md-4"><label class="form-label">Restart policy</label><select name="restart" class="form-select"><option value="">No change</option><option>no</option><option>unless-stopped</option><option>always</option><option>on-failure</option></select></div></div></div>
-      <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center"><span>Summary</span><span class="action-row"><button type="button" class="btn btn-sm btn-outline-secondary" id="detailsLogsBtn">Logs</button><button type="button" class="btn btn-sm btn-outline-secondary" id="detailsCommitBtn">Snapshot</button>${st.Status==='running'?'<button type="button" class="btn btn-sm btn-outline-primary" id="detailsTerminalBtn">Terminal</button>':''}</span></div><dl class="row small mb-0"><dt class="col-4 text-secondary">Image</dt><dd class="col-8 mono text-break">${esc(cfg.Image||'')}</dd><dt class="col-4 text-secondary">Status</dt><dd class="col-8">${esc(st.Status||'')}</dd><dt class="col-4 text-secondary">Restart</dt><dd class="col-8">${esc(hc.RestartPolicy?.Name||'')}</dd><dt class="col-4 text-secondary">Network mode</dt><dd class="col-8">${esc(hc.NetworkMode||'')}</dd></dl></div>
+      <div class="form-section"><div class="form-section-title d-flex justify-content-between align-items-center"><span>Summary</span><span class="action-row"><button type="button" class="btn btn-sm btn-outline-secondary" id="detailsLogsBtn">Logs</button>${originalImage?'':'<button type="button" class="btn btn-sm btn-outline-secondary" id="detailsCommitBtn">Snapshot</button>'}${st.Status==='running'?'<button type="button" class="btn btn-sm btn-outline-primary" id="detailsTerminalBtn">Terminal</button>':''}</span></div><dl class="row small mb-0"><dt class="col-4 text-secondary">Image</dt><dd class="col-8 mono text-break">${esc(displayImage)}${originalImage?'<div class="small text-secondary">Peer-backed read-only image rootfs</div>':''}</dd><dt class="col-4 text-secondary">Status</dt><dd class="col-8">${esc(st.Status||'')}</dd><dt class="col-4 text-secondary">Restart</dt><dd class="col-8">${esc(hc.RestartPolicy?.Name||'')}</dd><dt class="col-4 text-secondary">Network mode</dt><dd class="col-8">${esc(hc.NetworkMode||'')}</dd></dl></div>
       <div class="form-section"><div class="form-section-title">Docker inspect</div><pre class="code-panel mb-0">${esc(JSON.stringify(d,null,2))}</pre></div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#ctrEditForm',el));for(const field of ['cpus','memory','restart']){const value=fd.get(field);if(value)await request(`/docker/containers/${encodeURIComponent(name)}`,{method:'PATCH',form:{field,value}});}m.hide();toast(`${name} updated`);await renderRoute();}});
     if(metrics) renderContainerMetrics(metrics,name);
     startDetailMetrics(`/docker/containers/${encodeURIComponent(name)}/metrics`,m=>renderContainerMetrics(m,name));
     $('#detailsLogsBtn', $('#formModal')).onclick=()=>openContainerLogs(name);
-    $('#detailsCommitBtn', $('#formModal')).onclick=()=>openCommitContainer(name);
+    const commitBtn=$('#detailsCommitBtn', $('#formModal')); if(commitBtn) commitBtn.onclick=()=>openCommitContainer(name);
     const terminalBtn=$('#detailsTerminalBtn', $('#formModal')); if(terminalBtn) terminalBtn.onclick=()=>openContainerTerminal(name);
   }
 
@@ -1100,9 +1341,8 @@ ${commandLine(ci)} < user-data`;
   async function loadDockerImages(){
     const images=await request('/docker/images'); state.cache.dockerImages=images;
     const rows=images.map(i=>{const ref=(i.Repository&&i.Tag&&i.Repository!=='<none>'&&i.Tag!=='<none>')?`${i.Repository}:${i.Tag}`:(i.ID||'');return `<tr><td><div class="resource-name mono">${esc(ref)}</div><div class="small text-secondary mono">${esc(i.ID||'')}</div></td><td>${esc(i.Size||'')}</td><td>${esc(i.CreatedSince||i.CreatedAt||'')}</td><td><div class="action-row"><button class="btn btn-sm btn-outline-danger" data-di-delete="${esc(ref)}">Remove</button></div></td></tr>`;});
-    $('#view').innerHTML=card('Docker images',table(['Repository / tag','Size','Created',''],rows,'No Docker images are present.'),`<button class="btn btn-sm btn-outline-secondary me-2" id="peerRegistryBtn">Peer image storage</button><button class="btn btn-sm btn-outline-secondary me-2" id="registryBtn">Local registry</button><button class="btn btn-sm btn-outline-secondary me-2" id="buildImageBtn">Build image</button><button class="btn btn-sm btn-primary" id="pullImageBtn">Pull image</button>`);
+    $('#view').innerHTML=card('Docker images',table(['Repository / tag','Size','Created',''],rows,'No Docker images are present.'),`<button class="btn btn-sm btn-outline-secondary me-2" id="registryBtn">OCI registry</button><button class="btn btn-sm btn-outline-secondary me-2" id="buildImageBtn">Build image</button><button class="btn btn-sm btn-primary" id="pullImageBtn">Pull image</button>`);
     $('#registryBtn').onclick=()=>openDockerRegistry(images);
-    $('#peerRegistryBtn').onclick=()=>openPeerRegistry(images);
     $('#buildImageBtn').onclick=()=>openDockerBuild();
     $('#pullImageBtn').onclick=()=>modal({eyebrow:'Docker registry',title:'Pull image',submitText:'Pull',size:'sm',body:`<form id="pullForm"><label class="form-label">Image reference</label><input name="image" class="form-control mono" placeholder="alpine:latest"></form>`,onSubmit:async(el,m)=>{const image=new FormData($('#pullForm',el)).get('image');await request('/docker/images/pull',{method:'POST',form:{image}});m.hide();toast(`${image} pulled`);await renderRoute();}});
     $$('[data-di-delete]').forEach(b=>b.onclick=()=>confirmAction('Remove Docker image',`Remove ${b.dataset.diDelete}?`,async()=>{await request(`/docker/images?image=${encodeURIComponent(b.dataset.diDelete)}`,{method:'DELETE'});await renderRoute();}));
@@ -1112,26 +1352,20 @@ ${commandLine(ci)} < user-data`;
     modal({eyebrow:'Docker build',title:'Build container image',submitText:'Build image',body:`<div class="alert alert-light border small">Upload a tar or compressed-tar Docker build context containing the Dockerfile and any files it needs. LiteVMM streams the archive directly into <span class="mono">docker build</span>; it is not extracted onto the host.</div><form id="dockerBuildForm"><div class="row g-3"><div class="col-md-6"><label class="form-label">Image tag</label><input name="tag" class="form-control mono" placeholder="team/app:latest" required></div><div class="col-md-6"><label class="form-label">Dockerfile path in context</label><input name="dockerfile" class="form-control mono" value="Dockerfile" required></div><div class="col-12"><label class="form-label">Build context</label><input name="context" type="file" class="form-control" accept=".tar,.tar.gz,.tgz" required></div><div id="dockerBuildProgress" class="col-12 d-none"><div class="d-flex justify-content-between small mb-1"><span id="dockerBuildStatus">Preparing build context</span><span id="dockerBuildPercent">0%</span></div><div class="progress"><div id="dockerBuildBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div></div></div></div></form>`,onSubmit:async(el,m)=>{const form=$('#dockerBuildForm',el),fd=new FormData(form),file=form.context.files[0],tag=String(fd.get('tag')||'').trim(),dockerfile=String(fd.get('dockerfile')||'Dockerfile').trim();if(!file||!tag)throw new Error('Choose a build context and image tag.');const q=new URLSearchParams({tag,dockerfile}),progress=$('#dockerBuildProgress',form),bar=$('#dockerBuildBar',form),status=$('#dockerBuildStatus',form),pct=$('#dockerBuildPercent',form);progress.classList.remove('d-none');const result=await uploadFile(`/docker/images/build?${q}`,file,(loaded,total,known)=>{const value=known&&total?Math.round(loaded/total*100):0;bar.style.width=`${value}%`;pct.textContent=known?`${value}%`:'Uploading';status.textContent=known?`${file.name} · ${bytes(loaded)} of ${bytes(total)}`:`Uploading ${file.name}`;});m.hide();toast(`${result?.image||tag} built`);await renderRoute();}});
   }
 
-  async function openPeerRegistry(images=[]) {
-    const peers=(await request('/cluster/peers')).filter(p=>p.url),eligible=[];
-    for(const peer of peers){try{const svc=await request('/',{peerId:peer.node_id});if((svc.capabilities||[]).includes('storage-backplane'))eligible.push(peer);}catch(_){}}
-    const refs=(images||[]).map(i=>(i.Repository&&i.Tag&&i.Repository!=='<none>'&&i.Tag!=='<none>')?`${i.Repository}:${i.Tag}`:(i.ID||'')).filter(Boolean);
-    const peerOptions=eligible.map(p=>`<option value="${esc(p.node_id)}">${esc(p.name||p.node_id)} · ${esc(p.url)}</option>`).join('');
-    modal({eyebrow:'Paired image storage',title:'Use peer image storage',submitText:'Transfer image',body:`<div class="alert alert-light border small">Docker images are saved as archives in the selected peer's shared NFSv4 storage backplane. NFS remains bound to loopback on the storage host and the archive traffic crosses the existing peer WSS connection.</div><form id="peerRegistryForm"><div class="row g-3"><div class="col-md-6"><label class="form-label">Peer</label><select name="peer_id" class="form-select" required><option value="">Select paired host</option>${peerOptions}</select></div><div class="col-md-6"><label class="form-label">Operation</label><select name="action" id="peerRegistryAction" class="form-select"><option value="pull">Pull from peer</option><option value="push">Push to peer</option></select></div><div class="col-12" id="peerRegistrySourceWrap"><label class="form-label">Local image</label><select name="source" class="form-select">${refs.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('')}</select></div><div class="col-12"><label class="form-label">Repository / tag on peer</label><input name="repository" class="form-control mono" placeholder="team/app:latest" required></div></div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#peerRegistryForm',el));const peer_id=fd.get('peer_id'),action=fd.get('action'),repository=fd.get('repository'),source=fd.get('source');if(!peer_id||!repository)throw new Error('Select a peer and repository.');if(action==='push'&&!source)throw new Error('Select a local image to push.');const path=action==='push'?'/docker/registry/peer-push':'/docker/registry/peer-pull';const form=action==='push'?{peer_id,source,repository}:{peer_id,repository};const result=await request(path,{method:'POST',form});m.hide();toast(action==='push'?`${source} stored on peer backplane`:`${result.image||repository} loaded from peer backplane`);await renderRoute();}});
-    const form=$('#peerRegistryForm',$('#formModal')),action=$('#peerRegistryAction',form),sourceWrap=$('#peerRegistrySourceWrap',form);const sync=()=>sourceWrap.classList.toggle('d-none',action.value!=='push');action.addEventListener('change',sync);sync();
-  }
-
   async function openDockerRegistry(images=[]) {
     const status=await request('/docker/registry');
     let credentials=null,catalog=null;
     if(status.enabled){credentials=await request('/docker/registry/credentials').catch(()=>null);catalog=await request('/docker/registry/catalog').catch(()=>null);}
     const refs=(images||[]).map(i=>(i.Repository&&i.Tag&&i.Repository!=='<none>'&&i.Tag!=='<none>')?`${i.Repository}:${i.Tag}`:(i.ID||'')).filter(Boolean);
-    const endpoint=location.host;
+    const activePeer=state.remotePeerId?state.hostCatalog.peers.find(p=>String(p.node_id).toLowerCase()===String(state.remotePeerId).toLowerCase()):null;
+    let registryOrigin=location.origin;
+    try{if(activePeer?.url)registryOrigin=new URL(activePeer.url,location.href).origin;}catch(_){}
+    const endpoint=new URL(registryOrigin).host;
     const enabled=status.enabled===true;
-    const body=enabled?`<div class="alert alert-info small">The registry container listens only on <span class="mono">127.0.0.1:${status.loopback_port}</span>. LiteVMM proxies the Docker Registry v2 API through <span class="mono">${esc(location.protocol+'//'+endpoint)}/v2/</span>. Other hosts should use <span class="mono">${esc(endpoint)}/repository:tag</span>.</div><div class="row g-3 mb-3"><div class="col-md-6"><label class="form-label">Registry username</label><input class="form-control mono" readonly value="${esc(credentials?.username||status.username||'')}"></div><div class="col-md-6"><label class="form-label">Registry password</label><input class="form-control mono" readonly value="${esc(credentials?.password||'')}"></div></div><form id="registryPublishForm"><div class="row g-3"><div class="col-md-6"><label class="form-label">Local image</label><select name="source" class="form-select">${refs.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('')}</select></div><div class="col-md-6"><label class="form-label">Registry repository/tag</label><input name="repository" class="form-control mono" placeholder="team/app:latest" required></div></div></form><div class="small text-secondary mt-3">Repositories: ${esc((catalog?.repositories||[]).join(', ')||'none yet')}</div><div class="d-flex gap-2 mt-3"><button type="button" id="publishRegistryBtn" class="btn btn-primary">Publish image</button><button type="button" id="disableRegistryBtn" class="btn btn-outline-danger">Disable registry</button></div>`:`<div class="alert alert-light border small">Runs CNCF Distribution <span class="mono">registry:3</span> as a loopback-only Docker container and exposes it through this LiteVMM endpoint. HTTPS is strongly recommended before another host uses it.</div><form id="registryEnableForm"><label class="form-label">Registry username</label><input name="username" class="form-control" value="registry"></form>`;
-    modal({eyebrow:'Docker image distribution',title:'Local OCI registry',submitText:enabled?'':'Enable registry',body,onSubmit:async(el,m)=>{const username=new FormData($('#registryEnableForm',el)).get('username');await request('/docker/registry',{method:'POST',form:{username}});m.hide();toast('Local registry enabled');await openDockerRegistry(images);}});
+    const body=enabled?`<div class="alert alert-info small"><strong>OCI registry endpoint:</strong> <span class="mono">${esc(registryOrigin)}/v2/</span>. The registry container itself stays loopback-only on <span class="mono">127.0.0.1:${status.loopback_port}</span>; LiteVMM publishes it through the normal management HTTPS endpoint. Any paired host that can reach this endpoint can log in with the credentials below and use <span class="mono">${esc(endpoint)}/repository:tag</span>.</div><div class="row g-3 mb-3"><div class="col-md-6"><label class="form-label">Registry username</label><input class="form-control mono" readonly value="${esc(credentials?.username||status.username||'')}"></div><div class="col-md-6"><label class="form-label">Registry password</label><input class="form-control mono" readonly value="${esc(credentials?.password||'')}"></div></div><form id="registryPublishForm"><div class="row g-3"><div class="col-md-6"><label class="form-label">Local image</label><select name="source" class="form-select">${refs.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('')}</select></div><div class="col-md-6"><label class="form-label">Registry repository/tag</label><input name="repository" class="form-control mono" placeholder="team/app:latest" required></div></div></form><div class="small text-secondary mt-3">Repositories: ${esc((catalog?.repositories||[]).join(', ')||'none yet')}</div><div class="d-flex gap-2 mt-3"><button type="button" id="publishRegistryBtn" class="btn btn-primary">Publish image</button><button type="button" id="disableRegistryBtn" class="btn btn-outline-danger">Disable registry</button></div>`:`<div class="alert alert-light border small">Enable an optional CNCF Distribution <span class="mono">registry:3</span> on this host. The registry daemon remains loopback-only while LiteVMM exposes the Registry v2 API through the management endpoint, so this host and paired hosts can use a conventional Registry v2 endpoint when one is needed. LiteVMM peer image federation works independently of this registry. HTTPS is strongly recommended before another host uses it.</div><form id="registryEnableForm"><label class="form-label">Registry username</label><input name="username" class="form-control" value="registry"></form>`;
+    modal({eyebrow:'Docker image distribution',title:'Optional OCI registry',submitText:enabled?'':'Enable registry',body,onSubmit:async(el,m)=>{const username=new FormData($('#registryEnableForm',el)).get('username');await request('/docker/registry',{method:'POST',form:{username}});m.hide();toast('OCI registry enabled');await openDockerRegistry(images);}});
     $('#publishRegistryBtn', $('#formModal'))?.addEventListener('click',async()=>{const fd=new FormData($('#registryPublishForm',$('#formModal')));const source=fd.get('source'),repository=fd.get('repository');if(!source||!repository){toast('Choose an image and repository tag','Registry');return;}await request('/docker/registry/push',{method:'POST',form:{source,repository}});toast(`${source} published as ${endpoint}/${repository}`);await openDockerRegistry(images);});
-    $('#disableRegistryBtn', $('#formModal'))?.addEventListener('click',async()=>{if(!window.confirm('Disable the local registry? Stored registry data will be retained.'))return;await request('/docker/registry',{method:'DELETE'});bootstrap.Modal.getInstance($('#formModal'))?.hide();toast('Registry disabled');});
+    $('#disableRegistryBtn', $('#formModal'))?.addEventListener('click',async()=>{if(!window.confirm('Disable the OCI registry? Stored registry data will be retained.'))return;await request('/docker/registry',{method:'DELETE'});bootstrap.Modal.getInstance($('#formModal'))?.hide();toast('Registry disabled');});
   }
 
   async function openStorageLocations(){
@@ -1223,11 +1457,58 @@ ${commandLine(ci)} < user-data`;
   }
 
   async function openDockerImageLibrary(){
-    const images=await request('/docker/images'); state.cache.dockerImages=images;
-    const rows=images.map(i=>{const ref=(i.Repository&&i.Tag&&i.Repository!=='<none>'&&i.Tag!=='<none>')?`${i.Repository}:${i.Tag}`:(i.ID||'');return `<tr><td><div class="resource-name mono">${esc(ref)}</div><div class="small text-secondary mono">${esc(i.ID||'')}</div></td><td>${esc(i.Size||'')}</td><td>${esc(i.CreatedSince||i.CreatedAt||'')}</td><td><button class="btn btn-sm btn-outline-danger" data-library-image-delete="${esc(ref)}">Remove</button></td></tr>`;});
-    modal({eyebrow:'Docker registry',title:'Container image library',body:`<section class="border rounded-3 p-3 mb-4"><div class="form-section-title mb-2">Pull an image</div><form id="pullLibraryForm" class="row g-2"><div class="col-sm-9"><label class="form-label">Image reference</label><input name="image" class="form-control mono" placeholder="alpine:latest" required></div><div class="col-sm-3 d-grid align-self-end"><button class="btn btn-primary" type="submit">Pull image</button></div></form><pre id="dockerImageOutput" class="code-panel mt-3 mb-0" style="display:none;min-height:0;max-height:12rem"></pre></section>${table(['Repository / tag','Size','Created',''],rows,'No Docker images are present.')}`});
-    $('#pullLibraryForm').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,image=new FormData(form).get('image'),btn=$('button',form),out=$('#dockerImageOutput');btn.disabled=true;btn.textContent='Pulling…';out.style.display='block';out.textContent=`$ docker pull ${image}\n`;try{const result=await request('/docker/images/pull',{method:'POST',form:{image}});out.textContent+=result.output || 'Pull complete.';toast(`${image} pulled`);}catch(err){out.textContent+=err.message;toast(err.message,'Pull failed');}finally{btn.disabled=false;btn.textContent='Pull image';}};
-    $$('[data-library-image-delete]', $('#formModal')).forEach(b=>b.onclick=async()=>{const ref=b.dataset.libraryImageDelete;if(!window.confirm(`Remove ${ref}?`))return;const out=$('#dockerImageOutput');out.style.display='block';out.textContent=`$ docker image rm ${ref}\n`;try{const result=await request(`/docker/images?image=${encodeURIComponent(ref)}`,{method:'DELETE'});out.textContent+=result.output || 'Image removed.';toast(`${ref} removed`);}catch(err){out.textContent+=err.message;if(!window.confirm(`${ref} is still referenced. Force removal removes its local tag even when a container uses it. Continue?`)){toast(err.message,'Removal failed');return;}try{out.textContent+=`\n$ docker image rm --force ${ref}\n`;const result=await request(`/docker/images?image=${encodeURIComponent(ref)}&force=true`,{method:'DELETE'});out.textContent+=result.output || 'Image force-removed.';toast(`${ref} force-removed`);}catch(forceErr){out.textContent+=forceErr.message;toast(forceErr.message,'Force removal failed');}}});
+    const inventory=await collectHostInventory('/docker/images');
+    const imageRef=i=>(i.Repository&&i.Tag&&i.Repository!=='<none>'&&i.Tag!=='<none>')?`${i.Repository}:${i.Tag}`:(i.ID||'');
+    const rows=(inventory.rows||[]).map(i=>{
+      const ref=imageRef(i),peer=i.storage_peer_id||'';
+      return `<tr><td><div class="resource-name mono">${esc(ref)}</div><div class="small text-secondary mono">${esc(i.ID||'')}</div></td><td>${esc(i.storage_host||'Local host')}</td><td>${esc(i.Size||'')}</td><td>${esc(i.CreatedSince||i.CreatedAt||'')}</td><td><button class="btn btn-sm btn-outline-danger" data-library-image-delete="${esc(ref)}" data-image-peer="${esc(peer)}">Remove</button></td></tr>`;
+    });
+    const errors=(inventory.errors||[]).length?`<div class="alert alert-warning small">${esc(inventory.errors.join(' / '))}</div>`:'';
+    const activeImages=await request('/docker/images').catch(()=>[]);
+    const body=`${errors}
+      <div class="alert alert-light border small">This federated library combines Docker images on this host and every directly paired host without replicating them. A peer-only image remains on its owning host. Containers can use that image as a read-only root filesystem over the NFSv4/WSS backplane while keeping only their writable layer on <strong>${esc(activeHost().name)}</strong>. <strong>Pull image</strong> explicitly creates a normal local Docker copy.</div>
+      <section class="border rounded-3 p-3 mb-4">
+        <div class="d-flex justify-content-between align-items-center gap-2 mb-2"><div class="form-section-title mb-0">Pull an image</div><button type="button" class="btn btn-sm btn-outline-secondary" id="sharedRegistryBtn">OCI registry</button></div>
+        <form id="pullLibraryForm" class="row g-2"><div class="col-sm-9"><label class="form-label">Image reference</label><input name="image" class="form-control mono" placeholder="alpine:latest" required></div><div class="col-sm-3 d-grid align-self-end"><button class="btn btn-primary" type="submit">Pull image</button></div></form>
+        <pre id="dockerImageOutput" class="code-panel mt-3 mb-0" style="display:none;min-height:0;max-height:12rem"></pre>
+      </section>
+      ${table(['Repository / tag','Host','Size','Created',''],rows,'No Docker images are present on this host or its paired hosts.')}`;
+    modal({eyebrow:'Docker images',title:'Federated image library',size:'xl',body});
+    $('#sharedRegistryBtn',$('#formModal')).onclick=()=>openDockerRegistry(activeImages);
+    $('#pullLibraryForm',$('#formModal')).onsubmit=async e=>{
+      e.preventDefault();
+      const form=e.currentTarget,image=String(new FormData(form).get('image')||'').trim(),btn=$('button[type="submit"]',form),out=$('#dockerImageOutput',$('#formModal'));
+      if(!image)return;
+      btn.disabled=true;btn.textContent='Pulling…';out.style.display='block';out.textContent=`$ docker pull ${image}\n`;
+      try{
+        const result=await request('/docker/images/pull',{method:'POST',form:{image}});
+        out.textContent+=result.output||'Pulled into the local Docker image store.';
+        toast(`${image} pulled locally on ${activeHost().name}`);
+        bootstrap.Modal.getInstance($('#formModal'))?.hide();
+        await openDockerImageLibrary();
+      }catch(err){out.textContent+=err.message;toast(err.message,'Pull failed');}
+      finally{btn.disabled=false;btn.textContent='Pull image';}
+    };
+    $$('[data-library-image-delete]',$('#formModal')).forEach(b=>b.onclick=async()=>{
+      const ref=b.dataset.libraryImageDelete,peer=b.dataset.imagePeer||'',host=hostLabelForPeer(peer);
+      if(!window.confirm(`Remove ${ref} from ${host}?`))return;
+      const out=$('#dockerImageOutput',$('#formModal'));out.style.display='block';out.textContent=`$ docker image rm ${ref}\n`;
+      const target=peer?{peerId:peer}:{local:true};
+      try{
+        const result=await request(`/docker/images?image=${encodeURIComponent(ref)}`,{method:'DELETE',...target});
+        out.textContent+=result.output||'Image removed.';toast(`${ref} removed from ${host}`);
+        bootstrap.Modal.getInstance($('#formModal'))?.hide();await openDockerImageLibrary();
+      }catch(err){
+        out.textContent+=err.message;
+        if(!window.confirm(`${ref} is still referenced on ${host}. Force removal removes its local tag even when a container uses it. Continue?`)){toast(err.message,'Removal failed');return;}
+        try{
+          out.textContent+=`\n$ docker image rm --force ${ref}\n`;
+          const result=await request(`/docker/images?image=${encodeURIComponent(ref)}&force=true`,{method:'DELETE',...target});
+          out.textContent+=result.output||'Image force-removed.';toast(`${ref} force-removed from ${host}`);
+          bootstrap.Modal.getInstance($('#formModal'))?.hide();await openDockerImageLibrary();
+        }catch(forceErr){out.textContent+=forceErr.message;toast(forceErr.message,'Force removal failed');}
+      }
+    });
   }
 
   const bridgeWarning = `<div class="alert alert-warning small mb-3"><strong>This can disrupt connectivity.</strong><div class="mt-1">Changing bridge members, addresses, or the default gateway can disconnect this host from the network. Do not attach the active management interface unless you have another way back in.</div></div>`;

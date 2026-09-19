@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Zero-copy Docker image rootfs federation for LiteVMM.
+set -Eeuo pipefail
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "$0")/../lib" && pwd)/common.sh"
+source "$LIB"
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
+PEER_ROOT=${VMAPI_PEER_ROOT:-/var/lib/vmapi/peers}
+BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
+EXPORT_ROOT=${VMAPI_DOCKER_ROOTFS_EXPORT_ROOT:-$BACKPLANE_ROOT/shared/docker-rootfs}
+REMOTE_LAYER_ROOT=${VMAPI_DOCKER_REMOTE_LAYER_ROOT:-/var/lib/vmapi/remote-container-layers}
+CTR_BIN=${VMAPI_CTR_BIN:-/usr/bin/ctr}
+CONTAINERD_ADDRESS=${VMAPI_DOCKER_CONTAINERD_ADDRESS:-/var/run/docker/containerd/containerd.sock}
+CONTAINERD_NAMESPACE=${VMAPI_DOCKER_CONTAINERD_NAMESPACE:-moby}
+MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
+UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
+MOUNTPOINT_BIN=${VMAPI_MOUNTPOINT_BIN:-/bin/mountpoint}
+JQ=${VMAPI_JQ:-/usr/bin/jq}
+
+valid_ref(){ local v=${1:-}; [[ -n "$v" && "$v" != *[[:space:]]* && "$v" != /* && "$v" != *://* ]] || die "Invalid image reference: $v"; }
+valid_peer(){ [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
+valid_export(){ [[ ${1:-} =~ ^[a-f0-9]{32}$ ]] || die 'Invalid rootfs export id'; }
+mounted(){ [[ -x "$MOUNTPOINT_BIN" ]] && "$MOUNTPOINT_BIN" -q "$1"; }
+local_has(){ "$DOCKER_BIN" image inspect "$1" >/dev/null 2>&1; }
+
+form_encode(){
+  local s=${1-} out='' c hex i
+  LC_ALL=C
+  for ((i=0;i<${#s};i++)); do
+    c=${s:i:1}
+    case "$c" in [a-zA-Z0-9.~_-]) out+="$c";; *) printf -v hex '%%%02X' "'$c"; out+="$hex";; esac
+  done
+  printf '%s' "$out"
+}
+
+peer_rows(){
+  local f NAME='' NODE_ID='' URL=''
+  shopt -s nullglob
+  for f in "$PEER_ROOT"/*.conf; do
+    NAME=''; NODE_ID=''; URL=''; source "$f"
+    [[ "$NODE_ID" =~ ^[A-Fa-f0-9]{32}$ ]] || continue
+    printf '%s\t%s\n' "$(tr A-F a-f <<<"$NODE_ID")" "${NAME:-peer-${NODE_ID:0:8}}"
+  done
+  shopt -u nullglob
+}
+
+peer_sources(){
+  local image="$1" peer name out id path
+  path="/docker/images?image=$(form_encode "$image")"
+  while IFS=$'\t' read -r peer name; do
+    out=$("$PEERCTL" proxy "$peer" GET "$path" 2>/dev/null) || continue
+    id=$(printf '%s' "$out" | "$JQ" -r '.[0].Id // empty' 2>/dev/null || true)
+    [[ -n "$id" ]] && printf '%s\t%s\t%s\n' "$peer" "$name" "$id"
+  done < <(peer_rows)
+}
+
+export_id(){
+  local id="$1" hex
+  hex=${id#sha256:}
+  if [[ "$hex" =~ ^[A-Fa-f0-9]{64}$ ]]; then printf '%s' "$hex" | tr A-F a-f | cut -c1-32
+  else printf '%s' "$id" | sha256sum | cut -c1-32
+  fi
+}
+
+containerd_ref(){
+  local inspect="$1" requested="$2" list ref normalized first
+  [[ -x "$CTR_BIN" && -S "$CONTAINERD_ADDRESS" ]] || return 1
+  list=$("$CTR_BIN" --address "$CONTAINERD_ADDRESS" --namespace "$CONTAINERD_NAMESPACE" images list -q 2>/dev/null) || return 1
+  {
+    printf '%s\n' "$requested"
+    printf '%s' "$inspect" | "$JQ" -r '.[0].RepoTags[]?,.[0].RepoDigests[]?' 2>/dev/null || true
+  } | while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    grep -Fxq "$ref" <<<"$list" && { printf '%s\n' "$ref"; exit 0; }
+    first=${ref%%/*}
+    normalized=''
+    if [[ "$ref" != *"/"* ]]; then normalized="docker.io/library/$ref"
+    elif [[ "$first" != *.* && "$first" != *:* && "$first" != localhost ]]; then normalized="docker.io/$ref"; fi
+    [[ -z "$normalized" ]] || { grep -Fxq "$normalized" <<<"$list" && { printf '%s\n' "$normalized"; exit 0; }; }
+  done
+}
+
+write_meta(){
+  local dir="$1" image="$2" id="$3" backend="$4" inspect="$5" tmp
+  tmp=$(mktemp "$dir/.image.XXXXXX")
+  printf '%s\n' "$inspect" >"$tmp"; chmod 0644 "$tmp"; mv "$tmp" "$dir/image.json"
+  printf '%s\n' "$image" >"$dir/image.ref"; printf '%s\n' "$id" >"$dir/image.id"; printf '%s\n' "$backend" >"$dir/backend"
+  chmod 0644 "$dir/image.ref" "$dir/image.id" "$dir/backend"
+}
+
+expose(){
+  local image="$1" inspect id eid dir rootfs graph upper lowers chain ref backend='' old=''
+  valid_ref "$image"; need_cmd "$DOCKER_BIN"; need_cmd "$JQ"
+  local_has "$image" || die "Local image not found: $image"
+  inspect=$("$DOCKER_BIN" image inspect "$image")
+  id=$(printf '%s' "$inspect" | "$JQ" -r '.[0].Id // empty')
+  [[ -n "$id" ]] || die 'Docker returned no image ID'
+  eid=$(export_id "$id"); dir="$EXPORT_ROOT/$eid"; rootfs="$dir/rootfs"
+  install -d -m 0755 "$EXPORT_ROOT" "$dir" "$rootfs"
+  [[ -r "$dir/image.id" ]] && old=$(cat "$dir/image.id")
+  if mounted "$rootfs" && [[ "$old" == "$id" ]]; then
+    backend=$(cat "$dir/backend" 2>/dev/null || printf unknown)
+    write_meta "$dir" "$image" "$id" "$backend" "$inspect"
+    printf '{"image":"%s","image_id":"%s","export_id":"%s","backend":"%s","reused":true}\n' "$(json_escape "$image")" "$(json_escape "$id")" "$eid" "$backend"
+    return
+  fi
+  mounted "$rootfs" && "$UMOUNT_BIN" "$rootfs"
+  graph=$(printf '%s' "$inspect" | "$JQ" -r '.[0].GraphDriver.Name // empty')
+  upper=$(printf '%s' "$inspect" | "$JQ" -r '.[0].GraphDriver.Data.UpperDir // empty')
+  lowers=$(printf '%s' "$inspect" | "$JQ" -r '.[0].GraphDriver.Data.LowerDir // empty')
+  if [[ "$graph" == overlay2 && -n "$upper" && -d "$upper" ]]; then
+    chain="$upper"; [[ -z "$lowers" ]] || chain="$chain:$lowers"
+    "$MOUNT_BIN" -t overlay overlay -o "ro,lowerdir=$chain" "$rootfs"; backend=overlay2
+  elif ref=$(containerd_ref "$inspect" "$image") && [[ -n "$ref" ]]; then
+    "$CTR_BIN" --address "$CONTAINERD_ADDRESS" --namespace "$CONTAINERD_NAMESPACE" images mount "$ref" "$rootfs" >/dev/null
+    backend=containerd
+  else
+    die "Cannot expose $image zero-copy: neither overlay2 layer paths nor Docker's containerd image mount are available"
+  fi
+  "$MOUNT_BIN" -o remount,ro "$rootfs" >/dev/null 2>&1 || true
+  write_meta "$dir" "$image" "$id" "$backend" "$inspect"
+  printf '{"image":"%s","image_id":"%s","export_id":"%s","backend":"%s","reused":false}\n' "$(json_escape "$image")" "$(json_escape "$id")" "$eid" "$backend"
+}
+
+stub(){
+  local ref="$1" meta="$2" original="$3" id="$4" v json key tmp
+  local -a changes=()
+  local_has "$ref" && return 0
+  changes+=(--change "LABEL io.litevmm.remote.stub=true" --change "LABEL io.litevmm.remote.image=$original" --change "LABEL io.litevmm.remote.image-id=$id")
+  while IFS= read -r -d '' v; do changes+=(--change "ENV $v"); done < <("$JQ" -j '.[0].Config.Env[]?,"\u0000"' "$meta")
+  v=$("$JQ" -r '.[0].Config.WorkingDir // empty' "$meta"); [[ -z "$v" ]] || changes+=(--change "WORKDIR $v")
+  v=$("$JQ" -r '.[0].Config.User // empty' "$meta"); [[ -z "$v" ]] || changes+=(--change "USER $v")
+  v=$("$JQ" -r '.[0].Config.StopSignal // empty' "$meta"); [[ -z "$v" ]] || changes+=(--change "STOPSIGNAL $v")
+  json=$("$JQ" -c '.[0].Config.Entrypoint // empty' "$meta"); [[ -z "$json" || "$json" == null ]] || changes+=(--change "ENTRYPOINT $json")
+  json=$("$JQ" -c '.[0].Config.Cmd // empty' "$meta"); [[ -z "$json" || "$json" == null ]] || changes+=(--change "CMD $json")
+  while IFS= read -r key; do [[ -z "$key" ]] || changes+=(--change "EXPOSE $key"); done < <("$JQ" -r '.[0].Config.ExposedPorts // {} | keys[]?' "$meta")
+  tmp=$(mktemp -d); tar -C "$tmp" -cf - . | "$DOCKER_BIN" image import "${changes[@]}" - "$ref" >/dev/null; rm -rf "$tmp"
+}
+
+prepare(){
+  local image="$1" peer_only="${2:-false}" row peer name id canonical='' out eid exposed root meta hex stubref
+  local -a rows=()
+  valid_ref "$image"; need_cmd "$JQ"
+  if [[ "$peer_only" != true ]] && local_has "$image"; then printf '{"image":"%s","source":"local","remote":false}\n' "$(json_escape "$image")"; return; fi
+  need_cmd "$BACKPLANECTL"
+  mapfile -t rows < <(peer_sources "$image")
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r peer name id <<<"$row"
+    [[ -z "$canonical" ]] && canonical="$id"
+    [[ "$id" == "$canonical" ]] || die "Federated tag conflict for $image: paired hosts advertise different image IDs"
+  done
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r peer name id <<<"$row"
+    out=$(printf 'image=%s' "$(form_encode "$image")" | "$PEERCTL" proxy "$peer" POST /docker/images/expose application/x-www-form-urlencoded 2>/dev/null) || continue
+    eid=$(printf '%s' "$out" | "$JQ" -r '.export_id // empty'); exposed=$(printf '%s' "$out" | "$JQ" -r '.image_id // empty')
+    [[ -n "$eid" && "$exposed" == "$id" ]] || continue; valid_export "$eid"
+    root=$("$BACKPLANECTL" shared-path "$peer" docker-rootfs "$eid" 2>/dev/null) || continue; meta="$root/image.json"
+    [[ -d "$root/rootfs" && -r "$meta" ]] || continue
+    [[ $("$JQ" -r '.[0].Id // empty' "$meta") == "$id" ]] || continue
+    hex=${id#sha256:}; hex=$(printf '%s' "$hex" | tr -cd A-Fa-f0-9); [[ -n "$hex" ]] || hex="$eid"
+    stubref="litevmm-remote/${hex:0:32}:stub"; stub "$stubref" "$meta" "$image" "$id"
+    printf '{"image":"%s","source":"peer-rootfs","remote":true,"peer_id":"%s","peer_name":"%s","image_id":"%s","export_id":"%s","stub_ref":"%s","lowerdir":"%s"}\n' \
+      "$(json_escape "$image")" "$peer" "$(json_escape "$name")" "$(json_escape "$id")" "$eid" "$stubref" "$(json_escape "$root/rootfs")"
+    return
+  done
+  printf '{"image":"%s","source":"external","remote":false}\n' "$(json_escape "$image")"
+}
+
+
+valid_container_id(){ [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$ ]] || die 'Invalid container id'; }
+
+cleanup_container(){
+  local cid="$1" dir
+  valid_container_id "$cid"
+  dir="$REMOTE_LAYER_ROOT/$cid"
+  [[ -d "$dir" ]] || { printf '{"removed":false,"container_id":"%s"}\n' "$(json_escape "$cid")"; return; }
+  # runc delete removes only the live overlay mount. Docker's destroy event is
+  # the authoritative point at which the persistent writable layer can go away.
+  rm -rf -- "$dir"
+  printf '{"removed":true,"container_id":"%s"}\n' "$(json_escape "$cid")"
+}
+
+gc_exports(){
+  local dir id removed=0
+  install -d -m 0755 "$EXPORT_ROOT"
+  shopt -s nullglob
+  for dir in "$EXPORT_ROOT"/*; do
+    [[ -d "$dir" && -r "$dir/image.id" ]] || continue
+    id=$(cat "$dir/image.id")
+    if ! "$DOCKER_BIN" image inspect "$id" >/dev/null 2>&1; then
+      mounted "$dir/rootfs" && "$UMOUNT_BIN" "$dir/rootfs" >/dev/null 2>&1 || true
+      rm -rf -- "$dir"
+      removed=$((removed+1))
+    fi
+  done
+  shopt -u nullglob
+  printf '{"removed":%d}\n' "$removed"
+}
+
+unexpose(){
+  local eid="$1" dir
+  valid_export "$eid"; dir="$EXPORT_ROOT/$eid"
+  [[ -d "$dir" ]] || { printf '{"removed":false}\n'; return; }
+  mounted "$dir/rootfs" && "$UMOUNT_BIN" "$dir/rootfs"
+  rm -rf "$dir"; printf '{"removed":true,"export_id":"%s"}\n' "$eid"
+}
+
+case ${1:-help} in
+  expose) shift; expose "${1:?image required}";;
+  prepare) shift; prepare "${1:?image required}" false;;
+  prepare-peer) shift; prepare "${1:?image required}" true;;
+  cleanup-container) shift; cleanup_container "${1:?container id required}";;
+  gc-exports) gc_exports;;
+  unexpose) shift; unexpose "${1:?export id required}";;
+  help|-h|--help) echo 'Usage: docker-rootfsctl expose IMAGE | prepare IMAGE | prepare-peer IMAGE | cleanup-container ID | gc-exports | unexpose EXPORT_ID';;
+  *) die "Unknown docker-rootfsctl command: ${1:-}";;
+esac

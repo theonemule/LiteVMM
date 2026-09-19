@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# LiteVMM Docker CLI federation shim.
+#
+# Image listings are federated. Explicit pulls remain ordinary local Docker
+# pulls. For run/create, a peer-only image can be executed zero-copy through the
+# LiteVMM remote-rootfs runtime instead of being copied into this daemon.
+set -uo pipefail
+
+REAL_DOCKER=${LITEVMM_REAL_DOCKER:-/usr/bin/docker}
+FEDCTL=${VMAPI_DOCKER_FEDERATIONCTL:-/usr/local/bin/docker-federationctl}
+ROOTFSCTL=${VMAPI_DOCKER_ROOTFSCTL:-/usr/local/bin/docker-rootfsctl}
+JQ=${VMAPI_JQ:-/usr/bin/jq}
+REMOTE_RUNTIME=${VMAPI_DOCKER_REMOTE_RUNTIME:-litevmm-remote}
+
+[[ ${LITEVMM_DOCKER_NATIVE:-false} != true && -x "$FEDCTL" ]] || exec "$REAL_DOCKER" "$@"
+
+as_root(){
+  local tool="$1"; shift
+  if [[ $EUID -eq 0 ]]; then "$tool" "$@"
+  elif command -v sudo >/dev/null 2>&1; then sudo -n "$tool" "$@"
+  else "$tool" "$@"
+  fi
+}
+fed(){ as_root "$FEDCTL" "$@"; }
+rootfs(){ as_root "$ROOTFSCTL" "$@"; }
+
+IMAGE_INDEX=-1
+IMAGE=''
+find_run_image(){
+  local expect=false after_dash=false a i=0
+  IMAGE_INDEX=-1; IMAGE=''
+  for a in "$@"; do
+    if $after_dash; then IMAGE_INDEX=$i; IMAGE="$a"; return 0; fi
+    if $expect; then expect=false; i=$((i+1)); continue; fi
+    case "$a" in
+      --) after_dash=true;;
+      --*=*) ;;
+      --add-host|--annotation|--attach|--blkio-weight|--blkio-weight-device|--cap-add|--cap-drop|--cgroup-parent|--cgroupns|--cidfile|--cpu-period|--cpu-quota|--cpu-rt-period|--cpu-rt-runtime|--cpu-shares|--cpus|--cpuset-cpus|--cpuset-mems|--detach-keys|--device|--device-cgroup-rule|--device-read-bps|--device-read-iops|--device-write-bps|--device-write-iops|--dns|--dns-option|--dns-search|--domainname|--entrypoint|--env|--env-file|--expose|--gpus|--group-add|--health-cmd|--health-interval|--health-retries|--health-start-interval|--health-start-period|--health-timeout|--hostname|--ip|--ip6|--ipc|--isolation|--label|--label-file|--link|--link-local-ip|--log-driver|--log-opt|--mac-address|--memory|--memory-reservation|--memory-swap|--memory-swappiness|--mount|--name|--network|--network-alias|--oom-score-adj|--pid|--pids-limit|--platform|--publish|--pull|--restart|--runtime|--security-opt|--shm-size|--stop-signal|--stop-timeout|--storage-opt|--sysctl|--tmpfs|--ulimit|--user|--userns|--uts|--volume|--volume-driver|--volumes-from|--workdir)
+        expect=true;;
+      -a|-c|-e|-h|-l|-m|-p|-u|-v|-w) expect=true;;
+      -a*|-c*|-e*|-h*|-l*|-m*|-p*|-u*|-v*|-w*) ;;
+      -*) ;;
+      *) IMAGE_INDEX=$i; IMAGE="$a"; return 0;;
+    esac
+    i=$((i+1))
+  done
+  return 1
+}
+
+native_semantics_requested(){
+  local a
+  for a in "$@"; do
+    case "$a" in --platform|--platform=*|--pull|--pull=*|--runtime|--runtime=*) return 0;; esac
+  done
+  return 1
+}
+
+REMOTE_REWRITTEN=()
+rewrite_remote_run(){
+  local -a original=("$@") prefix suffix
+  local prepared source stub lower peer pname
+  REMOTE_REWRITTEN=("$@")
+  find_run_image "$@" || return 0
+  "$REAL_DOCKER" image inspect "$IMAGE" >/dev/null 2>&1 && return 0
+  native_semantics_requested "$@" && return 0
+  [[ -x "$ROOTFSCTL" && -x "$JQ" ]] || return 0
+  prepared=$(rootfs prepare "$IMAGE") || return 1
+  source=$(printf '%s' "$prepared" | "$JQ" -r '.source // empty')
+  [[ "$source" == peer-rootfs ]] || return 0
+  stub=$(printf '%s' "$prepared" | "$JQ" -r '.stub_ref // empty')
+  lower=$(printf '%s' "$prepared" | "$JQ" -r '.lowerdir // empty')
+  peer=$(printf '%s' "$prepared" | "$JQ" -r '.peer_id // empty')
+  pname=$(printf '%s' "$prepared" | "$JQ" -r '.peer_name // .peer_id // "peer"')
+  [[ -n "$stub" && -n "$lower" && -n "$peer" ]] || { echo 'LiteVMM remote image preparation returned incomplete metadata.' >&2; return 1; }
+
+  prefix=("${original[@]:0:IMAGE_INDEX}")
+  suffix=("${original[@]:IMAGE_INDEX+1}")
+  REMOTE_REWRITTEN=(
+    "${prefix[@]}"
+    --runtime "$REMOTE_RUNTIME"
+    --annotation "io.litevmm.remote.lowerdir=$lower"
+    --annotation "io.litevmm.remote.image=$IMAGE"
+    --annotation "io.litevmm.remote.peer=$peer"
+    --label "io.litevmm.remote.image=$IMAGE"
+    --label "io.litevmm.remote.peer=$peer"
+    "$stub"
+    "${suffix[@]}"
+  )
+  printf 'LiteVMM: using %s from %s as a remote read-only image rootfs; container writes remain local.\n' "$IMAGE" "$pname" >&2
+}
+
+case ${1:-} in
+  images)
+    if (($# == 1)); then fed images; exit $?; fi
+    ;;
+  image)
+    if [[ ${2:-} == ls && $# -eq 2 ]]; then fed images; exit $?; fi
+    ;;
+  run|create)
+    cmd="$1"; shift
+    rewrite_remote_run "$@" || exit $?
+    exec "$REAL_DOCKER" "$cmd" "${REMOTE_REWRITTEN[@]}"
+    ;;
+  container)
+    if [[ ${2:-} == run || ${2:-} == create ]]; then
+      sub="$2"; shift 2
+      rewrite_remote_run "$@" || exit $?
+      exec "$REAL_DOCKER" container "$sub" "${REMOTE_REWRITTEN[@]}"
+    fi
+    ;;
+esac
+
+# Pull intentionally means "store this image locally". It is not intercepted by
+# federation. All other commands retain native Docker semantics.
+exec "$REAL_DOCKER" "$@"

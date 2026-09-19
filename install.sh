@@ -92,7 +92,7 @@ install_packages() {
     alpine)
       enable_alpine_community
       apk update
-      apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client-default
+      apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip jq fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client-default
       case $PROFILE in
         virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso nfs-utils websocat;;
         docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websockify websocat;;
@@ -104,7 +104,7 @@ install_packages() {
     debian)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
-      apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils cron
+      apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip jq nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils cron
       case $PROFILE in
         virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso nfs-common nfs-kernel-server websockify;;
         docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server websockify;;
@@ -203,9 +203,21 @@ install_common_files() {
   set_host_config VMAPI_BACKPLANE_SERVER true
   install -m 0644 "$BASE/lib/common.sh" /usr/local/lib/vmapi/common.sh
   install -m 0644 "$BASE/VERSION" /usr/share/vmapi/VERSION
-  for tool in vmapi-web-reload vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl metricsctl consolectl peerctl vmbackupctl replicationctl registryctl peer-volumectl backplanectl filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
+  for tool in vmapi-web-reload vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl docker-federationctl docker-rootfsctl litevmm-docker litevmm-runc metricsctl consolectl peerctl vmbackupctl replicationctl registryctl peer-volumectl backplanectl filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
     need_source "bin/$tool"; install -m 0755 "$BASE/bin/$tool" "/usr/local/bin/$tool"
   done
+  # Keep /usr/bin/docker as the native CLI used by LiteVMM internals. For
+  # interactive/admin use, /usr/local/bin/docker adds the federated catalog and
+  # peer-first pulls. Never overwrite an unrelated administrator-installed shim.
+  if [[ $PROFILE == docker || $PROFILE == virtualization-docker ]]; then
+    if [[ ! -e /usr/local/bin/docker ]] || grep -Fq 'LiteVMM Docker CLI federation shim' /usr/local/bin/docker 2>/dev/null; then
+      install -m 0755 "$BASE/bin/litevmm-docker" /usr/local/bin/docker
+    else
+      echo 'WARNING: /usr/local/bin/docker already exists and is not LiteVMM-managed; leaving it unchanged. Use /usr/local/bin/litevmm-docker for federation.' >&2
+    fi
+  elif [[ -f /usr/local/bin/docker ]] && grep -Fq 'LiteVMM Docker CLI federation shim' /usr/local/bin/docker 2>/dev/null; then
+    rm -f /usr/local/bin/docker
+  fi
   install -m 0755 "$BASE/cgi/api.cgi" /usr/lib/vmapi/cgi/api.cgi
   install -m 0755 "$BASE/cgi/peer-api.cgi" /usr/lib/vmapi/cgi/peer-api.cgi
   while IFS= read -r -d '' asset; do relative=${asset#"$BASE/www/"}; install -D -m 0644 "$asset" "/usr/share/vmapi/www/$relative"; done < <(find "$BASE/www" -type f -print0)
@@ -229,6 +241,10 @@ write_sudoers() {
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl identity, /usr/local/bin/peerctl request, /usr/local/bin/peerctl request *, /usr/local/bin/peerctl pending, /usr/local/bin/peerctl cancel-pending, /usr/local/bin/peerctl accept *, /usr/local/bin/peerctl complete *, /usr/local/bin/peerctl list, /usr/local/bin/peerctl set-url *, /usr/local/bin/peerctl authorize-user *, /usr/local/bin/peerctl cors-origin *, /usr/local/bin/peerctl proxy *, /usr/local/bin/peerctl revoke *'
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/backplanectl list, /usr/local/bin/backplanectl show *, /usr/local/bin/backplanectl path *, /usr/local/bin/backplanectl shared-path *, /usr/local/bin/backplanectl server-status'
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peer-volumectl list-hosted, /usr/local/bin/peer-volumectl list-hosted *, /usr/local/bin/peer-volumectl show-hosted *, /usr/local/bin/peer-volumectl delete-hosted *'
+    if [[ $PROFILE == docker || $PROFILE == virtualization-docker ]]; then
+      echo '%docker ALL=(root) NOPASSWD: /usr/local/bin/docker-federationctl *'
+      echo '%docker ALL=(root) NOPASSWD: /usr/local/bin/docker-rootfsctl *'
+    fi
     case $PROFILE in
       virtualization)
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl *'
@@ -247,6 +263,8 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/replicationctl replica-purge *, /usr/local/bin/replicationctl replica-show *, /usr/local/bin/replicationctl replica-list'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/dockerexecctl start *, /usr/local/bin/dockerexecctl info *, /usr/local/bin/dockerexecctl touch *, /usr/local/bin/dockerexecctl stop *, /usr/local/bin/dockerexecctl gc'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/registryctl *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/docker-federationctl *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/docker-rootfsctl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl transport-profile *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peer-volumectl attach *, /usr/local/bin/peer-volumectl detach *, /usr/local/bin/peer-volumectl mount-show *, /usr/local/bin/peer-volumectl mount-list'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop'
@@ -259,6 +277,8 @@ write_sudoers() {
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/consolectl start *, /usr/local/bin/consolectl info *, /usr/local/bin/consolectl touch *, /usr/local/bin/consolectl stop *, /usr/local/bin/consolectl gc'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/dockerexecctl start *, /usr/local/bin/dockerexecctl info *, /usr/local/bin/dockerexecctl touch *, /usr/local/bin/dockerexecctl stop *, /usr/local/bin/dockerexecctl gc'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/registryctl *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/docker-federationctl *'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/docker-rootfsctl *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peer-volumectl attach *, /usr/local/bin/peer-volumectl detach *, /usr/local/bin/peer-volumectl mount-show *, /usr/local/bin/peer-volumectl mount-list'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
@@ -328,7 +348,7 @@ configure_alpine() {
       rc-service vmapi-backplane-server start || true
       rc-update add vmapi-backplane default >/dev/null 2>&1 || true
       rc-service vmapi-backplane start || true
-      rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
+      rc-update add docker default >/dev/null 2>&1 || true; rc-service docker restart || rc-service docker start || true
       for svc in ttyd-vmapi ttyd-host-vmapi; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
       rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart;;
     virtualization-docker)
@@ -336,11 +356,23 @@ configure_alpine() {
       rc-service vmapi-backplane-server start || true
       rc-update add vmapi-backplane default >/dev/null 2>&1 || true
       rc-service vmapi-backplane start || true
-      rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true
+      rc-update add docker default >/dev/null 2>&1 || true; rc-service docker restart || rc-service docker start || true
       for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
       rc-service websockify-vmapi restart; rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
     backup) rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true; rc-service vmapi-backplane-server restart || true;;
   esac
+}
+
+configure_docker_runtime() {
+  [[ $PROFILE == docker || $PROFILE == virtualization-docker ]] || return 0
+  install -d -m 0755 /etc/docker
+  local config=/etc/docker/daemon.json tmp
+  [[ -s $config ]] || printf '{}\n' > "$config"
+  jq empty "$config" >/dev/null || die "Existing $config is not valid JSON"
+  tmp=$(mktemp /etc/docker/.daemon.json.XXXXXX)
+  jq '.runtimes = (.runtimes // {}) | .runtimes["litevmm-remote"] = {"path":"/usr/local/bin/litevmm-runc"}' "$config" > "$tmp"
+  chmod --reference="$config" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+  mv "$tmp" "$config"
 }
 
 configure_debian() {
@@ -370,8 +402,8 @@ configure_debian() {
   systemctl try-restart fcgiwrap-vmapi.service >/dev/null 2>&1 || true
   case $PROFILE in
     virtualization) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-host-vmapi.service;;
-    docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
-    virtualization-docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now docker.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
+    docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable docker.service; systemctl restart docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
+    virtualization-docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable docker.service; systemctl restart docker.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
     backup) systemctl enable --now vmapi-backplane-server.service;;
   esac
   nginx -t && systemctl reload nginx
@@ -475,6 +507,7 @@ if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then i
 if [[ $PLATFORM == debian && ( $PROFILE == virtualization || $PROFILE == docker || $PROFILE == virtualization-docker ) ]]; then install_websocat; fi
 install_common_files
 write_sudoers
+configure_docker_runtime
 case $PLATFORM in alpine) configure_alpine;; debian) configure_debian;; esac
 if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then
   /usr/local/bin/vmbackupctl sync-schedules

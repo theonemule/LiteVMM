@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Federated Docker image discovery for LiteVMM peers.
+#
+# Docker's daemon metadata remains host-local. This tool presents the images of
+# trusted peers as one logical catalog without copying image layers.
+set -Eeuo pipefail
+
+LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+# shellcheck source=/dev/null
+source "$LIB"
+
+DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
+PEER_ROOT=${VMAPI_PEER_ROOT:-/var/lib/vmapi/peers}
+FEDERATION_ENABLED=${VMAPI_DOCKER_FEDERATION:-true}
+
+validate_ref() {
+  local v=${1:-}
+  [[ -n $v && ${#v} -le 512 && $v != *[[:space:]]* && $v != /* && $v != *://* ]] || die "Invalid Docker image reference: $v"
+  validate_no_newline "$v"
+}
+
+form_encode() {
+  local s=${1-} out='' c hex i
+  LC_ALL=C
+  for ((i=0; i<${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+=$c ;;
+      *) printf -v hex '%%%02X' "'$c"; out+=$hex ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+json_value() {
+  local object=$1 key=$2
+  printf '%s' "$object" | sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -n1
+}
+
+peer_objects() {
+  local file NAME='' NODE_ID='' URL=''
+  shopt -s nullglob
+  for file in "$PEER_ROOT"/*.conf; do
+    NAME=''; NODE_ID=''; URL=''
+    # Peer files are root-owned trusted configuration written by peerctl.
+    # shellcheck source=/dev/null
+    source "$file"
+    [[ $NODE_ID =~ ^[A-Fa-f0-9]{32}$ ]] || continue
+    printf '%s\t%s\n' "${NODE_ID,,}" "${NAME:-peer-${NODE_ID:0:8}}"
+  done
+  shopt -u nullglob
+}
+
+local_has() {
+  "$DOCKER_BIN" image inspect "$1" >/dev/null 2>&1
+}
+
+find_peer() {
+  local image=$1 peer name out path image_id
+  path="/docker/images?image=$(form_encode "$image")"
+  while IFS=$'\t' read -r peer name; do
+    [[ -n $peer ]] || continue
+    if out=$("$PEERCTL" proxy "$peer" GET "$path" 2>/dev/null); then
+      # docker image inspect returns a JSON array. Preserve the content ID so a
+      # tag split across peers cannot be chosen arbitrarily.
+      [[ $out != '[]' ]] || continue
+      image_id=$(printf '%s' "$out" | sed -n 's/.*"Id":"\([^"]*\)".*/\1/p' | head -n1)
+      printf '%s\t%s\t%s\n' "$peer" "$name" "$image_id"
+    fi
+  done < <(peer_objects)
+}
+
+resolve() {
+  local image=${1:?image required} peer name image_id
+  validate_ref "$image"
+  if local_has "$image"; then
+    printf '{"image":"%s","source":"local"}\n' "$(json_escape "$image")"
+    return
+  fi
+  if [[ $FEDERATION_ENABLED == true ]]; then
+    if IFS=$'\t' read -r peer name image_id < <(find_peer "$image"); then
+      if [[ -n $peer ]]; then
+        printf '{"image":"%s","source":"peer","peer_id":"%s","peer_name":"%s","image_id":"%s"}\n' \
+          "$(json_escape "$image")" "$(json_escape "$peer")" "$(json_escape "$name")" "$(json_escape "$image_id")"
+        return
+      fi
+    fi
+  fi
+  printf '{"image":"%s","source":"external"}\n' "$(json_escape "$image")"
+}
+
+declare -A C_REPO=() C_TAG=() C_ID=() C_SIZE=() C_CREATED=() C_SOURCES=() C_IDS=() C_LOCAL=()
+
+add_catalog_record() {
+  local repo=$1 tag=$2 image_id=$3 size=$4 created=$5 source=$6 key idlist
+  [[ -n $repo && -n $tag && $repo != '<none>' && $tag != '<none>' ]] || return 0
+  key="$repo:$tag"
+  if [[ -z ${C_REPO[$key]+x} ]]; then
+    C_REPO[$key]=$repo; C_TAG[$key]=$tag; C_ID[$key]=$image_id; C_SIZE[$key]=$size; C_CREATED[$key]=$created
+    C_SOURCES[$key]=$source; C_IDS[$key]=$image_id; C_LOCAL[$key]=false
+  else
+    case ",${C_SOURCES[$key]}," in *",$source,"*) ;; *) C_SOURCES[$key]+=",$source";; esac
+    idlist=",${C_IDS[$key]},"
+    [[ -z $image_id || $idlist == *",$image_id,"* ]] || C_IDS[$key]+=",$image_id"
+  fi
+  [[ $source != local ]] || C_LOCAL[$key]=true
+}
+
+consume_image_object() {
+  local object=$1 source=$2 repo tag image_id size created
+  repo=$(json_value "$object" Repository)
+  tag=$(json_value "$object" Tag)
+  image_id=$(json_value "$object" ID)
+  size=$(json_value "$object" Size)
+  created=$(json_value "$object" CreatedSince)
+  add_catalog_record "$repo" "$tag" "$image_id" "$size" "$created" "$source"
+}
+
+collect_catalog() {
+  local object peer name out
+  C_REPO=(); C_TAG=(); C_ID=(); C_SIZE=(); C_CREATED=(); C_SOURCES=(); C_IDS=(); C_LOCAL=()
+
+  while IFS= read -r object; do
+    [[ -n $object ]] || continue
+    consume_image_object "$object" local
+  done < <("$DOCKER_BIN" image ls --no-trunc --format '{{json .}}' 2>/dev/null || true)
+
+  [[ $FEDERATION_ENABLED == true && -x $PEERCTL ]] || return 0
+  while IFS=$'\t' read -r peer name; do
+    [[ -n $peer ]] || continue
+    out=$("$PEERCTL" proxy "$peer" GET /docker/images 2>/dev/null) || continue
+    # /docker/images is an array of flat Docker CLI JSON objects.
+    while IFS= read -r object; do
+      [[ -n $object ]] || continue
+      consume_image_object "$object" "$name"
+    done < <(printf '%s\n' "$out" | sed 's/},{/}\n{/g; s/^\[//; s/\]$//')
+  done < <(peer_objects)
+}
+
+emit_sources_json() {
+  local csv=$1 first=true value
+  printf '['
+  IFS=',' read -ra values <<< "$csv"
+  for value in "${values[@]}"; do
+    $first || printf ','
+    first=false
+    printf '"%s"' "$(json_escape "$value")"
+  done
+  printf ']'
+}
+
+catalog_json() {
+  local key first=true conflict=false
+  collect_catalog
+  printf '['
+  while IFS= read -r key; do
+    [[ -n $key ]] || continue
+    [[ ${C_IDS[$key]} != *,* ]] || conflict=true
+    $first || printf ','
+    first=false
+    printf '{"ref":"%s","repository":"%s","tag":"%s","id":"%s","size":"%s","created":"%s","local":%s,"conflict":%s,"sources":' \
+      "$(json_escape "$key")" "$(json_escape "${C_REPO[$key]}")" "$(json_escape "${C_TAG[$key]}")" \
+      "$(json_escape "${C_ID[$key]}")" "$(json_escape "${C_SIZE[$key]}")" "$(json_escape "${C_CREATED[$key]}")" \
+      "${C_LOCAL[$key]}" "$conflict"
+    emit_sources_json "${C_SOURCES[$key]}"
+    printf '}'
+    conflict=false
+  done < <(printf '%s\n' "${!C_REPO[@]}" | sort)
+  printf ']\n'
+}
+
+images_table() {
+  local key image_id short_id location status
+  collect_catalog
+  printf '%-44s %-16s %-16s %-12s %-24s %s\n' 'REPOSITORY:TAG' 'IMAGE ID' 'SIZE' 'CREATED' 'LITEVMM SOURCE' 'STATE'
+  while IFS= read -r key; do
+    [[ -n $key ]] || continue
+    image_id=${C_ID[$key]}; short_id=${image_id#sha256:}; short_id=${short_id:0:12}
+    location=${C_SOURCES[$key]}
+    status='available'
+    [[ ${C_IDS[$key]} != *,* ]] || status='tag-conflict'
+    printf '%-44.44s %-16.16s %-16.16s %-12.12s %-24.24s %s\n' \
+      "$key" "$short_id" "${C_SIZE[$key]}" "${C_CREATED[$key]}" "$location" "$status"
+  done < <(printf '%s\n' "${!C_REPO[@]}" | sort)
+}
+
+usage() {
+  cat <<'TXT'
+docker-federationctl - LiteVMM federated Docker image catalog
+
+Commands:
+  catalog-json
+  images
+  resolve IMAGE
+  has IMAGE
+
+This tool is metadata-only. A remote image remains in the Docker daemon that
+owns it. docker-rootfsctl prepares zero-copy peer rootfs execution when a
+container actually uses a peer-only image.
+TXT
+}
+
+case ${1:-help} in
+  catalog-json) catalog_json;;
+  images) images_table;;
+  resolve) shift; resolve "$@";;
+  has) shift; validate_ref "${1:?image required}"; local_has "$1";;
+  help|-h|--help) usage;;
+  *) usage >&2; die "Unknown command: ${1:-}";;
+esac

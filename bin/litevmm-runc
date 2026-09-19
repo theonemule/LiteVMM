@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# OCI runtime shim for LiteVMM peer-backed Docker images.
+#
+# Docker prepares a tiny metadata-only stub image. Immediately before runc
+# creates the container, this shim overlays the peer-hosted read-only rootfs with
+# a local writable upper/work layer. Normal local images pass through untouched.
+set -Eeuo pipefail
+
+REAL_RUNC=${LITEVMM_REAL_RUNC:-/usr/bin/runc}
+JQ=${VMAPI_JQ:-/usr/bin/jq}
+ROOTFSCTL=${VMAPI_DOCKER_ROOTFSCTL:-/usr/local/bin/docker-rootfsctl}
+PEER_STORAGE_ROOT=${VMAPI_BACKPLANE_MOUNT_ROOT:-/var/lib/vmapi/peer-storage}
+STATE_ROOT=${VMAPI_DOCKER_REMOTE_LAYER_ROOT:-/var/lib/vmapi/remote-container-layers}
+MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
+UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
+
+die(){ echo "litevmm-runc: $*" >&2; exit 1; }
+[[ -x "$REAL_RUNC" ]] || die "native runc not found: $REAL_RUNC"
+[[ -x "$JQ" ]] || die "jq not found: $JQ"
+
+command_name=''
+bundle=''
+id=''
+prev=''
+for arg in "$@"; do
+  if [[ "$prev" == bundle ]]; then bundle="$arg"; prev=''; continue; fi
+  case "$arg" in
+    -b|--bundle) prev=bundle;;
+    --bundle=*) bundle=${arg#*=};;
+    create|run|delete) [[ -n "$command_name" ]] || command_name="$arg";;
+  esac
+done
+(($#)) && id=${!#}
+
+valid_id(){ [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$ ]] || die 'invalid OCI container id'; }
+state_dir(){ printf '%s/%s\n' "$STATE_ROOT" "$1"; }
+
+unmount_remote(){
+  local cid="$1" dir active=''
+  valid_id "$cid"; dir=$(state_dir "$cid")
+  [[ -r "$dir/active-rootfs" ]] && active=$(cat "$dir/active-rootfs")
+  if [[ -n "$active" ]]; then
+    "$UMOUNT_BIN" "$active" >/dev/null 2>&1 || "$UMOUNT_BIN" -l "$active" >/dev/null 2>&1 || true
+    rm -f -- "$dir/active-rootfs"
+  fi
+}
+
+prepare_mount(){
+  local cid="$1" b="$2" config lower image refreshed root_rel rootfs dir upper work bundle_abs root_abs
+  valid_id "$cid"; [[ -n "$b" ]] || b=.
+  bundle_abs=$(readlink -f "$b") || die "bundle not found: $b"
+  config="$bundle_abs/config.json"; [[ -r "$config" ]] || die "OCI config missing: $config"
+  lower=$("$JQ" -r '.annotations["io.litevmm.remote.lowerdir"] // empty' "$config")
+  [[ -n "$lower" ]] || return 1
+  image=$("$JQ" -r '.annotations["io.litevmm.remote.image"] // empty' "$config")
+  # Refresh the peer export on every container create. This is event-driven by
+  # container startup, not polling, and makes remote containers recover after a
+  # source-host reboot without replicating any image data.
+  if [[ -n "$image" && -x "$ROOTFSCTL" ]]; then
+    refreshed=$("$ROOTFSCTL" prepare-peer "$image") || die "could not refresh remote image rootfs for $image"
+    lower=$(printf '%s' "$refreshed" | "$JQ" -r '.lowerdir // empty')
+    [[ -n "$lower" ]] || die "remote image is no longer available from a paired host: $image"
+  fi
+  case "$lower" in "$PEER_STORAGE_ROOT"/*/shared/docker-rootfs/*/rootfs) ;; *) die "refusing remote lowerdir outside LiteVMM peer storage: $lower";; esac
+  [[ -d "$lower" ]] || die "peer image rootfs is unavailable: $lower"
+
+  root_rel=$("$JQ" -r '.root.path // "rootfs"' "$config")
+  if [[ "$root_rel" == /* ]]; then rootfs="$root_rel"; else rootfs="$bundle_abs/$root_rel"; fi
+  root_abs=$(readlink -m "$rootfs")
+  case "$root_abs" in "$bundle_abs"/*) ;; *) die 'OCI rootfs escapes bundle';; esac
+  [[ -d "$root_abs" ]] || die "OCI rootfs directory missing: $root_abs"
+
+  dir=$(state_dir "$cid"); upper="$dir/upper"; work="$dir/work"
+  install -d -m 0700 "$STATE_ROOT" "$dir" "$upper" "$work"
+  # A stopped Docker container must retain its writable layer. If a prior task
+  # left our overlay mounted, remove only that mount before recreating the task.
+  unmount_remote "$cid"
+  printf '%s\n' "$root_abs" >"$dir/rootfs"
+  printf '%s\n' "$lower" >"$dir/lowerdir"
+  chmod 0600 "$dir/rootfs" "$dir/lowerdir"
+  "$MOUNT_BIN" -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$root_abs"
+  printf '%s\n' "$root_abs" >"$dir/active-rootfs"
+  chmod 0600 "$dir/active-rootfs"
+  return 0
+}
+
+case "$command_name" in
+  create)
+    mounted=false
+    if prepare_mount "$id" "$bundle"; then mounted=true; fi
+    set +e; "$REAL_RUNC" "$@"; rc=$?; set -e
+    if ((rc != 0)) && $mounted; then unmount_remote "$id"; fi
+    exit "$rc"
+    ;;
+  run)
+    mounted=false
+    if prepare_mount "$id" "$bundle"; then mounted=true; fi
+    set +e; "$REAL_RUNC" "$@"; rc=$?; set -e
+    $mounted && unmount_remote "$id"
+    exit "$rc"
+    ;;
+  delete)
+    set +e; "$REAL_RUNC" "$@"; rc=$?; set -e
+    unmount_remote "$id"
+    exit "$rc"
+    ;;
+  *)
+    exec "$REAL_RUNC" "$@"
+    ;;
+esac

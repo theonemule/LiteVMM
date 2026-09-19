@@ -7,6 +7,16 @@ LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 source "$LIB"
 DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
+ROOTFSCTL=${VMAPI_DOCKER_ROOTFSCTL:-/usr/local/bin/docker-rootfsctl}
+JQ=${VMAPI_JQ:-/usr/bin/jq}
+REMOTE_RUNTIME=${VMAPI_DOCKER_REMOTE_RUNTIME:-litevmm-remote}
+
+rootfs_cmd() {
+  if [[ $EUID -eq 0 ]]; then "$ROOTFSCTL" "$@"
+  elif command -v sudo >/dev/null 2>&1; then sudo -n "$ROOTFSCTL" "$@"
+  else "$ROOTFSCTL" "$@"
+  fi
+}
 
 usage() {
 cat <<'TXT'
@@ -117,7 +127,31 @@ cmd_create() {
   if [[ -n $entrypoint ]]; then validate_docker_arg "$entrypoint"; args+=(--entrypoint "$entrypoint"); fi
   $read_only && args+=(--read-only)
 
-  local c; for c in "${cmd[@]}"; do validate_docker_arg "$c"; done
+  local c original_image=$image prepared source stub lower peer
+  for c in "${cmd[@]}"; do validate_docker_arg "$c"; done
+
+  # A peer-only image remains on its owning host. Prepare a tiny metadata stub
+  # plus remote-rootfs runtime annotations instead of copying image layers here.
+  if ! "$DOCKER_BIN" image inspect "$image" >/dev/null 2>&1 && [[ -x $ROOTFSCTL && -x $JQ ]]; then
+    prepared=$(rootfs_cmd prepare "$image") || die "Could not prepare federated image: $image"
+    source=$(printf '%s' "$prepared" | "$JQ" -r '.source // empty')
+    if [[ $source == peer-rootfs ]]; then
+      stub=$(printf '%s' "$prepared" | "$JQ" -r '.stub_ref // empty')
+      lower=$(printf '%s' "$prepared" | "$JQ" -r '.lowerdir // empty')
+      peer=$(printf '%s' "$prepared" | "$JQ" -r '.peer_id // empty')
+      [[ -n $stub && -n $lower && -n $peer ]] || die 'Federated image preparation returned incomplete runtime metadata'
+      args+=(--runtime "$REMOTE_RUNTIME"
+        --annotation "io.litevmm.remote.lowerdir=$lower"
+        --annotation "io.litevmm.remote.image=$original_image"
+        --annotation "io.litevmm.remote.peer=$peer"
+        --label "io.litevmm.remote.image=$original_image"
+        --label "io.litevmm.remote.peer=$peer")
+      image=$stub
+    elif [[ $source == external ]]; then
+      "$DOCKER_BIN" image pull "$original_image" >/dev/null
+    fi
+  fi
+
   args+=("$image")
   ((${#cmd[@]})) && args+=("${cmd[@]}")
   "$DOCKER_BIN" "${args[@]}"
@@ -162,6 +196,9 @@ cmd_logs() {
 }
 cmd_commit() {
   local name=${1:?} image=${2:?}; shift 2; require_docker; require_container "$name"; validate_image_ref "$image"
+  local remote_image=''
+  remote_image=$("$DOCKER_BIN" container inspect --format '{{ index .Config.Labels "io.litevmm.remote.image" }}' "$name" 2>/dev/null || true)
+  [[ -z $remote_image || $remote_image == '<no value>' ]] || die "Cannot snapshot peer-backed container $name with docker commit: its read-only image rootfs is remote"
   local -a args=(container commit); local author='' message='' pause=''
   while (($#)); do case "$1" in
     --author) author=${2:?}; validate_docker_arg "$author"; shift 2;;
