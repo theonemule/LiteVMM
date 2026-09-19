@@ -63,6 +63,37 @@ env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupctl" s
 grep -Eq '^23 4 \* \* 1 .*/vmbackupctl scheduled-run demo weekly >> .*demo-weekly.log 2>&1 # vmapi-backup:demo:weekly$' "$T/crontabs/root"
 ! grep -Eq '^23 4 \* \* 1 root ' "$T/crontabs/root"
 
+# Service state is determined through OpenRC itself, not pgrep. Minimal Alpine
+# installs do not necessarily provide procps/pgrep even though crond is healthy.
+mkdir -p "$T/mockbin"
+cat > "$T/mockbin/rc-service" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $1 == crond ]]
+case "$2" in
+  start|restart) : > "$VMAPI_CRON_STATE";;
+  status) [[ -f $VMAPI_CRON_STATE ]];;
+  *) exit 2;;
+esac
+MOCK
+cat > "$T/mockbin/rc-update" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >> "$VMAPI_CRON_UPDATE_LOG"
+MOCK
+cat > "$T/mockbin/crond" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+chmod +x "$T/mockbin/rc-service" "$T/mockbin/rc-update" "$T/mockbin/crond"
+rm -f "$T/crond.state" "$T/rc-update.log"
+runtime_list=$(env "${common[@]}" VMAPI_BACKUP_SKIP_CRON_SERVICE=false VMAPI_BACKUP_CRON_STYLE=alpine \
+  VMAPI_CRON_STATE="$T/crond.state" VMAPI_CRON_UPDATE_LOG="$T/rc-update.log" PATH="$T/mockbin:$PATH" \
+  bash "$ROOT/bin/vmbackupctl" schedules)
+[[ -f $T/crond.state ]]
+grep -qx 'add crond default' "$T/rc-update.log"
+[[ $runtime_list == *'"scheduler_active":true'* ]]
+
 # Rebuild all runtime entries from saved schedule definitions, then remove one.
 : > "$T/crontabs/root"
 env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupctl" sync-schedules

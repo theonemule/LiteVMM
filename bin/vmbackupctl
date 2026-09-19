@@ -452,27 +452,47 @@ install_schedule_runtime() {
       chmod 0644 "$tmp"; mv -f -- "$tmp" "$(cron_d_file "$name" "$label")";;
   esac
 }
+scheduler_active() {
+  [[ ${VMAPI_BACKUP_SKIP_CRON_SERVICE:-false} == true ]] && { printf 'true\n'; return; }
+  case "$(cron_style)" in
+    alpine)
+      if command -v rc-service >/dev/null 2>&1 && rc-service crond status >/dev/null 2>&1; then printf 'true\n'; return; fi
+      if command -v pidof >/dev/null 2>&1 && pidof crond >/dev/null 2>&1; then printf 'true\n'; return; fi
+      if command -v pgrep >/dev/null 2>&1 && pgrep -x crond >/dev/null 2>&1; then printf 'true\n'; return; fi
+      ;;
+    debian)
+      if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet cron.service >/dev/null 2>&1; then printf 'true\n'; return; fi
+      if command -v service >/dev/null 2>&1 && service cron status >/dev/null 2>&1; then printf 'true\n'; return; fi
+      if command -v pidof >/dev/null 2>&1 && pidof cron >/dev/null 2>&1; then printf 'true\n'; return; fi
+      if command -v pgrep >/dev/null 2>&1 && pgrep -x cron >/dev/null 2>&1; then printf 'true\n'; return; fi
+      ;;
+  esac
+  printf 'false\n'
+}
 ensure_cron_service() {
   [[ ${VMAPI_BACKUP_SKIP_CRON_SERVICE:-false} == true ]] && return 0
   case "$(cron_style)" in
     alpine)
       command -v crond >/dev/null 2>&1 || die 'crond is not installed; rerun the LiteVMM installer'
       if command -v rc-update >/dev/null 2>&1; then rc-update add crond default >/dev/null 2>&1 || true; fi
-      if command -v rc-service >/dev/null 2>&1; then rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1 || die 'Could not start crond'
-      elif ! pgrep -x crond >/dev/null 2>&1; then crond || die 'Could not start crond'; fi;;
+      if command -v rc-service >/dev/null 2>&1; then
+        rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1 || die 'Could not start crond'
+      elif [[ $(scheduler_active) != true ]]; then
+        crond || die 'Could not start crond'
+      fi
+      ;;
     debian)
       command -v cron >/dev/null 2>&1 || die 'cron is not installed; rerun the LiteVMM installer'
-      if command -v systemctl >/dev/null 2>&1; then systemctl enable --now cron.service >/dev/null 2>&1 || die 'Could not start cron.service'
-      elif command -v service >/dev/null 2>&1; then service cron start >/dev/null 2>&1 || die 'Could not start cron'
-      elif ! pgrep -x cron >/dev/null 2>&1; then cron || die 'Could not start cron'; fi;;
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now cron.service >/dev/null 2>&1 || die 'Could not start cron.service'
+      elif command -v service >/dev/null 2>&1; then
+        service cron start >/dev/null 2>&1 || die 'Could not start cron'
+      elif [[ $(scheduler_active) != true ]]; then
+        cron || die 'Could not start cron'
+      fi
+      ;;
   esac
-}
-scheduler_active() {
-  [[ ${VMAPI_BACKUP_SKIP_CRON_SERVICE:-false} == true ]] && { printf 'true\n'; return; }
-  case "$(cron_style)" in
-    alpine) pgrep -x crond >/dev/null 2>&1 && printf 'true\n' || printf 'false\n';;
-    debian) pgrep -x cron >/dev/null 2>&1 && printf 'true\n' || printf 'false\n';;
-  esac
+  [[ $(scheduler_active) == true ]] || die "Backup scheduler failed to start ($(cron_style))"
 }
 load_schedule_file() {
   local file=$1
