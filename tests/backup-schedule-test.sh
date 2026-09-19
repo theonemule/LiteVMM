@@ -103,6 +103,39 @@ env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupctl" u
 ! grep -q '# vmapi-backup:demo:weekly' "$T/crontabs/root"
 [[ ! -e $T/schedules/demo-weekly ]]
 
+# Alpine crontab hygiene (BusyBox crond reloads whenever /etc/crontabs changes).
+# Start from a crontab like a real host's: system entries plus an old-style
+# LiteVMM line that was appended without a trailing newline.
+printf '# min hour day month weekday command\n*/15 * * * * run-parts /etc/periodic/15min\n0 2 * * * /old/vmbackupctl scheduled-run demo nightly >> /x.log 2>&1 # vmapi-backup:demo:nightly' > "$T/crontabs/root"
+alp=(env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupctl")
+"${alp[@]}" sync-schedules
+grep -qx '\*/15 \* \* \* \* run-parts /etc/periodic/15min' "$T/crontabs/root"   # system entries survive
+[[ $(tail -c 1 "$T/crontabs/root" | od -An -c | tr -d ' ') == '\n' ]]                # every line newline-terminated
+[[ $(grep -c '# vmapi-backup:demo:nightly$' "$T/crontabs/root") == 1 ]]              # exactly one entry per schedule
+! grep -q '/old/vmbackupctl' "$T/crontabs/root"                                       # stale entry replaced
+# Listing again must not rewrite an unchanged crontab (no needless crond reloads).
+inode=$(stat -c %i "$T/crontabs/root"); "${alp[@]}" schedules >/dev/null; "${alp[@]}" schedules >/dev/null
+[[ $(stat -c %i "$T/crontabs/root") == "$inode" ]]
+# A line appended later by anything else must stay a separate cron entry.
+echo '5 5 * * * /bin/true # other' >> "$T/crontabs/root"
+"${alp[@]}" schedule demo '1 1 * * *' --label extra --destination "$T/backups"
+grep -qx '5 5 \* \* \* /bin/true # other' "$T/crontabs/root"
+# Unschedule removes only its own entry and does not resurrect it.
+"${alp[@]}" unschedule demo extra
+! grep -q '# vmapi-backup:demo:extra' "$T/crontabs/root"
+grep -q '# vmapi-backup:demo:nightly$' "$T/crontabs/root"
+# A running crond is never "started" again (OpenRC logs a warning each time).
+: > "$T/crond.state"; : > "$T/rc-actions.log"
+cat > "$T/mockbin/rc-service" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$2" >> "$VMAPI_RC_ACTIONS"
+case "$2" in start|restart) : > "$VMAPI_CRON_STATE";; status) [[ -f $VMAPI_CRON_STATE ]];; *) exit 2;; esac
+MOCK
+env "${common[@]}" VMAPI_BACKUP_SKIP_CRON_SERVICE=false VMAPI_BACKUP_CRON_STYLE=alpine VMAPI_CRON_STATE="$T/crond.state" \
+  VMAPI_CRON_UPDATE_LOG="$T/rc-update.log" VMAPI_RC_ACTIONS="$T/rc-actions.log" PATH="$T/mockbin:$PATH" \
+  bash "$ROOT/bin/vmbackupctl" schedules >/dev/null
+! grep -qE '^(start|restart)$' "$T/rc-actions.log"
+
 # Cron input is data, never shell syntax.
 if env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=debian bash "$ROOT/bin/vmbackupctl" schedule demo '0 2 * * *; touch /tmp/nope' --label bad --destination "$T/backups" >/dev/null 2>&1; then
   echo 'unsafe cron expression was accepted' >&2; exit 1

@@ -422,34 +422,56 @@ cron_style() {
 }
 cron_tag() { printf '# vmapi-backup:%s:%s\n' "$1" "$2"; }
 cron_d_file() { printf '%s/vmapi-backup-%s-%s\n' "$CRON_D_ROOT" "$1" "$2"; }
+# Replace TARGET with stdin atomically, and only when the content changes.
+# Cron daemons reload when their directory changes: rewriting identical content
+# on every schedule listing made BusyBox crond reload constantly, and the old
+# delete-then-append edit left a window in which a reload could miss the job.
+replace_if_changed() {
+  local target=$1 mode=$2 tmp
+  tmp=$(mktemp "$(dirname "$target")/.vmapi-tmp.XXXXXX")
+  cat > "$tmp"; chmod "$mode" "$tmp"
+  if [[ -f $target ]] && cmp -s -- "$tmp" "$target"; then rm -f -- "$tmp"; return 0; fi
+  mv -f -- "$tmp" "$target"
+}
+# Alpine/BusyBox: root's crontab is rebuilt as its non-LiteVMM lines plus one
+# newline-terminated entry per saved schedule (the source of truth).
+rebuild_alpine_crontab() {
+  local file
+  install -d -m 0755 "$(dirname "$CRONTAB")" "$LOG_ROOT"
+  {
+    [[ ! -f $CRONTAB ]] || awk '!/# vmapi-backup:[^ ]*$/' "$CRONTAB"
+    shopt -s nullglob
+    for file in "$SCHEDULE_ROOT"/*; do
+      ( load_schedule_file "$file"
+        printf '%s %q scheduled-run %q %q >> %q 2>&1 %s\n' \
+          "$CRON" "$SELF" "$NAME" "$LABEL" "$LOG_ROOT/$NAME-$LABEL.log" "$(cron_tag "$NAME" "$LABEL")" )
+    done
+    shopt -u nullglob
+  } | replace_if_changed "$CRONTAB" 0600
+}
+# Callers delete the saved schedule first; the runtime then follows the files.
 remove_schedule_runtime() {
-  local name=$1 label=$2 tag
-  tag=$(cron_tag "$name" "$label")
-  sed -i "\|${tag%$'\n'}$|d" "$CRONTAB" 2>/dev/null || true
-  rm -f -- "$(cron_d_file "$name" "$label")"
+  local name=$1 label=$2
+  case "$(cron_style)" in
+    alpine) rebuild_alpine_crontab;;
+    debian) rm -f -- "$(cron_d_file "$name" "$label")";;
+  esac
 }
 install_schedule_runtime() {
-  local name=$1 label=$2 cron=$3 log tag tmp style
+  local name=$1 label=$2 cron=$3 log
   validate_vm_name "$name"; [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'
   valid_cron_expr "$cron"
-  log="$LOG_ROOT/$name-$label.log"; tag=$(cron_tag "$name" "$label"); style=$(cron_style)
+  log="$LOG_ROOT/$name-$label.log"
   install -d -m 0755 "$LOG_ROOT"
-  remove_schedule_runtime "$name" "$label"
-  case "$style" in
-    alpine)
-      install -d -m 0755 "$(dirname "$CRONTAB")"
-      touch "$CRONTAB"; chmod 0600 "$CRONTAB"
-      printf '%s %q scheduled-run %q %q >> %q 2>&1 %s' \
-        "$cron" "$SELF" "$name" "$label" "$log" "$tag" >> "$CRONTAB";;
+  case "$(cron_style)" in
+    alpine) rebuild_alpine_crontab;;
     debian)
       install -d -m 0755 "$CRON_D_ROOT"
-      tmp="$(cron_d_file "$name" "$label").tmp.$$"
       {
         printf 'SHELL=/bin/bash\n'
         printf 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
         printf '%s root %q scheduled-run %q %q >> %q 2>&1\n' "$cron" "$SELF" "$name" "$label" "$log"
-      } > "$tmp"
-      chmod 0644 "$tmp"; mv -f -- "$tmp" "$(cron_d_file "$name" "$label")";;
+      } | replace_if_changed "$(cron_d_file "$name" "$label")" 0644;;
   esac
 }
 scheduler_active() {
@@ -476,7 +498,7 @@ ensure_cron_service() {
       command -v crond >/dev/null 2>&1 || die 'crond is not installed; rerun the LiteVMM installer'
       if command -v rc-update >/dev/null 2>&1; then rc-update add crond default >/dev/null 2>&1 || true; fi
       if command -v rc-service >/dev/null 2>&1; then
-        rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1 || die 'Could not start crond'
+        rc-service crond status >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1 || die 'Could not start crond'
       elif [[ $(scheduler_active) != true ]]; then
         crond || die 'Could not start crond'
       fi
@@ -524,18 +546,19 @@ cmd_scheduled_run() {
   cmd_start "${args[@]}"
 }
 cmd_sync_schedules() {
-  local file
-  case "$(cron_style)" in
-    alpine)
-      if [[ -f $CRONTAB ]]; then sed -i '/# vmapi-backup:/d' "$CRONTAB"; fi;;
-    debian)
-      mkdir -p "$CRON_D_ROOT"; rm -f -- "$CRON_D_ROOT"/vmapi-backup-* 2>/dev/null || true;;
-  esac
+  local file wanted=' '
   shopt -s nullglob
-  for file in "$SCHEDULE_ROOT"/*; do
-    load_schedule_file "$file"
-    install_schedule_runtime "$NAME" "$LABEL" "$CRON"
-  done
+  case "$(cron_style)" in
+    alpine) rebuild_alpine_crontab;;
+    debian)
+      mkdir -p "$CRON_D_ROOT"
+      for file in "$SCHEDULE_ROOT"/*; do
+        load_schedule_file "$file"; install_schedule_runtime "$NAME" "$LABEL" "$CRON"
+        wanted+="$(cron_d_file "$NAME" "$LABEL") "
+      done
+      # Remove entries whose schedule no longer exists (after writing the rest).
+      for file in "$CRON_D_ROOT"/vmapi-backup-*; do [[ $wanted == *" $file "* ]] || rm -f -- "$file"; done;;
+  esac
   shopt -u nullglob
   ensure_cron_service
 }
@@ -556,7 +579,7 @@ cmd_schedules() {
       load_schedule_file "$file"
       install_schedule_runtime "$NAME" "$LABEL" "$CRON"
     done
-    ensure_cron_service
+    [[ $(scheduler_active) == true ]] || ensure_cron_service
   fi
 
   active=$(scheduler_active)
@@ -571,12 +594,12 @@ cmd_unschedule() {
   validate_vm_name "$name"
   if [[ -n $label ]]; then
     [[ $label =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die 'Invalid backup policy'
-    remove_schedule_runtime "$name" "$label"
     rm -f -- "$SCHEDULE_ROOT/$name-$label"
+    remove_schedule_runtime "$name" "$label"
   else
     shopt -s nullglob
     for file in "$SCHEDULE_ROOT/$name-"*; do
-      load_schedule_file "$file"; remove_schedule_runtime "$NAME" "$LABEL"; rm -f -- "$file"
+      load_schedule_file "$file"; rm -f -- "$file"; remove_schedule_runtime "$NAME" "$LABEL"
     done
     shopt -u nullglob
   fi
