@@ -79,6 +79,9 @@ grep -Fq 'run_cmd vm_delete_cmd "$name"' "$ROOT/cgi/api.cgi"
 find "$ROOT" -type f \( -name '*.sh' -o -name 'vmctl' -o -name 'imagectl' -o -name 'netctl' -o -name 'overlayctl' -o -name 'dockerctl' -o -name 'dockerexecctl' -o -name 'docker-imagectl' -o -name 'docker-netctl' -o -name 'docker-volumectl' -o -name 'replicationctl' -o -name 'backplanectl' -o -name 'registryctl' -o -name 'metricsctl' -o -name 'certctl' -o -name 'consolectl' -o -name 'vmapi-console-gc' -o -name '*.cgi' \) -print0 |
   while IFS= read -r -d '' f; do bash -n "$f"; done
 if command -v node >/dev/null 2>&1; then node --check "$ROOT/www/app.js"; fi
+grep -Fq 'id="responsiveActionSheet"' "$ROOT/www/index.html"
+grep -Fq 'prepareResponsiveActionRows' "$ROOT/www/app.js"
+grep -Fq 'data-responsive-actions="true"' "$ROOT/www/app.css"
 bash "$ROOT/tests/host-selector-test.sh"
 bash "$ROOT/tests/cgi-error-response-test.sh"
 bash "$ROOT/tests/cgi-daemon-fd-test.sh"

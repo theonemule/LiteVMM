@@ -46,6 +46,102 @@
     return `<span class="badge rounded-pill ${cls} badge-state">${esc(s || 'unknown')}</span>`;
   };
 
+  const MOBILE_ACTION_BREAKPOINT = '(max-width: 767.98px)';
+  let responsiveActionOrigin = null;
+  let responsiveActionItems = [];
+
+  function directActionItems(row) {
+    return [...(row?.children||[])].filter(el=>el.matches?.('button:not(.responsive-actions-trigger), a:not(.responsive-actions-trigger)'));
+  }
+
+  function prepareResponsiveActionRows(root=document) {
+    $$('.action-row',root).forEach(row=>{
+      if(row.dataset.responsiveActions==='true'||row.closest('.modal,.offcanvas'))return;
+      $$(':scope > .action-row',row).forEach(nested=>{
+        [...nested.children].forEach(child=>row.insertBefore(child,nested));
+        nested.remove();
+      });
+      const items=directActionItems(row);
+      if(items.length<3)return;
+      row.dataset.responsiveActions='true';
+      const trigger=document.createElement('button');
+      trigger.type='button';
+      trigger.className='btn btn-sm btn-outline-secondary responsive-actions-trigger';
+      trigger.setAttribute('aria-label','Open actions menu');
+      trigger.innerHTML='Actions <span aria-hidden="true">▾</span>';
+      row.appendChild(trigger);
+    });
+  }
+
+  function restoreResponsiveActionItems() {
+    if(!responsiveActionOrigin)return;
+    const trigger=$('.responsive-actions-trigger',responsiveActionOrigin);
+    responsiveActionItems.forEach(item=>{
+      const original=item.dataset.responsiveActionClass;
+      if(original!==undefined){
+        item.className=original;
+        delete item.dataset.responsiveActionClass;
+      }
+      if(trigger&&responsiveActionOrigin.isConnected)responsiveActionOrigin.insertBefore(item,trigger);
+    });
+    responsiveActionItems=[];
+    responsiveActionOrigin=null;
+  }
+
+  function openResponsiveActionMenu(row) {
+    if(!row||!window.matchMedia(MOBILE_ACTION_BREAKPOINT).matches)return;
+    const body=$('#responsiveActionSheetBody');
+    const title=$('#responsiveActionSheetTitle');
+    const sheet=$('#responsiveActionSheet');
+    if(!body||!sheet)return;
+    restoreResponsiveActionItems();
+    const items=directActionItems(row);
+    if(items.length<3)return;
+    responsiveActionOrigin=row;
+    responsiveActionItems=items;
+    body.replaceChildren();
+    const resource=row.closest('tr')?.querySelector('.resource-name')?.textContent?.trim();
+    title.textContent=resource ? 'Actions · '+resource : 'Actions';
+    items.forEach(item=>{
+      item.dataset.responsiveActionClass=item.className;
+      item.classList.add('w-100','text-start');
+      body.appendChild(item);
+    });
+    bootstrap.Offcanvas.getOrCreateInstance(sheet).show();
+  }
+
+  if(typeof document!=='undefined'){
+    document.addEventListener('click',event=>{
+      const trigger=event.target.closest?.('.responsive-actions-trigger');
+      if(trigger){
+        event.preventDefault();
+        openResponsiveActionMenu(trigger.closest('.action-row'));
+        return;
+      }
+      const action=event.target.closest?.('#responsiveActionSheetBody > button, #responsiveActionSheetBody > a');
+      if(action){
+        const sheet=$('#responsiveActionSheet');
+        if(sheet)bootstrap.Offcanvas.getOrCreateInstance(sheet).hide();
+      }
+    });
+
+    $('#responsiveActionSheet')?.addEventListener('hidden.bs.offcanvas',restoreResponsiveActionItems);
+
+    if(typeof MutationObserver!=='undefined'){
+      const responsiveActionObserver=new MutationObserver(records=>{
+        for(const record of records){
+          for(const node of record.addedNodes){
+            if(node.nodeType!==Node.ELEMENT_NODE)continue;
+            if(node.matches?.('.action-row'))prepareResponsiveActionRows(node.parentElement||node);
+            else if(node.querySelector?.('.action-row'))prepareResponsiveActionRows(node);
+          }
+        }
+      });
+      responsiveActionObserver.observe(document.body,{childList:true,subtree:true});
+    }
+    prepareResponsiveActionRows();
+  }
+
   const validNodeId = id => /^[a-f0-9]{32}$/i.test(String(id || ''));
   const usablePeer = peer => Boolean(peer?.url && peer?.api_auth === 'basic' && validNodeId(peer.node_id));
   const hasCap = cap => Boolean((state.activeService || state.service)?.capabilities?.includes(cap));
@@ -355,7 +451,7 @@ ${commandLine(ci)} < user-data`;
   }
 
   function card(title, body, actions='') {
-    return `<div class="card panel-card rounded-4"><div class="card-header bg-transparent border-0 px-3 px-md-4 pt-3 pt-md-4 pb-2 d-flex align-items-center gap-3"><div><h2 class="h5 section-title mb-1">${esc(title)}</h2></div><div class="ms-auto">${actions}</div></div><div class="card-body pt-1 px-3 px-md-4 pb-3 pb-md-4">${body}</div></div>`;
+    return `<div class="card panel-card rounded-4"><div class="card-header bg-transparent border-0 px-3 px-md-4 pt-3 pt-md-4 pb-2 d-flex align-items-center gap-3"><div><h2 class="h5 section-title mb-1">${esc(title)}</h2></div><div class="ms-auto action-row card-actions">${actions}</div></div><div class="card-body pt-1 px-3 px-md-4 pb-3 pb-md-4">${body}</div></div>`;
   }
 
 
@@ -517,7 +613,7 @@ ${commandLine(ci)} < user-data`;
         <div class="col-xl-7">${card('Compute', computeSummary())}</div>
         <div class="col-xl-5">${card('Platform', platformSummary())}</div>
       </div>
-      <div class="mt-4">${card('Host diagnostics', `<div class="d-flex flex-column flex-sm-row align-items-sm-center justify-content-between gap-3"><div><div class="fw-semibold">Administrative tools</div><div class="small text-secondary">Review the tools enabled by this installation profile.</div></div><div class="d-flex flex-wrap gap-2"><button class="btn btn-outline-primary" id="overviewSystemInfoBtn">System information</button><button class="btn btn-outline-primary" id="overviewCertificatesBtn">Certificate management</button>${hasCap('host-terminal')?'<button class="btn btn-primary" id="overviewHostTerminalBtn">Launch host terminal</button>':''}${hasCap('files')?'<button class="btn btn-outline-primary" id="overviewFileBrowserBtn">File browser</button>':''}<button class="btn btn-outline-secondary" id="overviewLogsBtn">View service logs</button></div></div>`)}</div>`;
+      <div class="mt-4">${card('Host diagnostics', `<div class="d-flex flex-column flex-sm-row align-items-sm-center justify-content-between gap-3"><div><div class="fw-semibold">Administrative tools</div><div class="small text-secondary">Review the tools enabled by this installation profile.</div></div><div class="action-row justify-content-start"><button class="btn btn-outline-primary" id="overviewSystemInfoBtn">System information</button><button class="btn btn-outline-primary" id="overviewCertificatesBtn">Certificate management</button>${hasCap('host-terminal')?'<button class="btn btn-primary" id="overviewHostTerminalBtn">Launch host terminal</button>':''}${hasCap('files')?'<button class="btn btn-outline-primary" id="overviewFileBrowserBtn">File browser</button>':''}<button class="btn btn-outline-secondary" id="overviewLogsBtn">View service logs</button></div></div>`)}</div>`;
     if (state.cache.hostMetrics) renderHostMetrics(state.cache.hostMetrics);
     startDashboardMetrics();
     $('#overviewSystemInfoBtn')?.addEventListener('click',()=>{ location.hash='#system'; });
@@ -1590,7 +1686,7 @@ ${commandLine(ci)} < user-data`;
     const tls=status.tls_enabled===true;
     const mode=status.mode||'none';
     const certbotButton='<button id="configureCertBtn" class="btn btn-primary">Let’s Encrypt</button>';
-    const actions=`<div class="d-flex flex-wrap gap-2">${certbotButton}<button id="generateCsrBtn" class="btn btn-outline-primary">Generate CSR</button><button id="importPairBtn" class="btn btn-outline-primary">Import certificate + key</button>${status.csr_available?'<button id="importSignedBtn" class="btn btn-outline-primary">Import signed CSR certificate</button>':''}${tls&&mode==='certbot'?'<button id="renewCertBtn" class="btn btn-outline-primary">Renew Let’s Encrypt</button>':''}${tls?'<button id="disableTlsBtn" class="btn btn-outline-danger">Disable HTTPS</button>':''}</div>`;
+    const actions=`<div class="action-row justify-content-start">${certbotButton}<button id="generateCsrBtn" class="btn btn-outline-primary">Generate CSR</button><button id="importPairBtn" class="btn btn-outline-primary">Import certificate + key</button>${status.csr_available?'<button id="importSignedBtn" class="btn btn-outline-primary">Import signed CSR certificate</button>':''}${tls&&mode==='certbot'?'<button id="renewCertBtn" class="btn btn-outline-primary">Renew Let’s Encrypt</button>':''}${tls?'<button id="disableTlsBtn" class="btn btn-outline-danger">Disable HTTPS</button>':''}</div>`;
     const pending=status.csr_available?systemDl([['CSR domain',status.csr_domain||''],['CSR subject',status.csr_subject||''],['CSR file',status.csr||'',true]]):'<div class="small text-secondary">No pending CSR.</div>';
     $('#view').innerHTML=`<div class="row g-3 mb-3"><div class="col-xl-6">${card('Installation',systemDl([['Profile',svc.profile||status.profile],['API version',svc.version],['Management port',svc.port||status.port],['Transport',tls?'HTTPS':'HTTP'],['Capabilities',(svc.capabilities||[]).join(', ')]]))}</div><div class="col-xl-6">${card('TLS certificate',systemDl([['Enabled',tls?'Yes':'No'],['Management',mode],['Domain',status.domain||''],['Valid from',status.not_before||''],['Expires',status.expires||''],['Subject',status.subject||''],['Issuer',status.issuer||''],['SANs',status.sans||''],['SHA-256 fingerprint',status.fingerprint_sha256||'',true],['Certificate',status.certificate||'',true]]))}</div></div><div class="row g-3"><div class="col-xl-7">${card('Certificate management',`<div class="small text-secondary mb-3">Use Let’s Encrypt, generate a CSR for an external CA, or import an existing PEM certificate/private-key pair. Imported material is validated before LiteVMM changes the web endpoint.</div>${actions}`)}</div><div class="col-xl-5">${card('Pending CSR',pending)}</div></div>`;
 
