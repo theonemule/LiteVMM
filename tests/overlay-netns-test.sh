@@ -115,6 +115,19 @@ ip -n "$H" addr add 198.18.0.1/24 dev br-demo
 ip -n "$S" addr add 198.18.0.2/24 dev br-demo
 sleep 2
 ip netns exec "$S" ping -c 3 -W 2 198.18.0.1
+# Full-size frames must cross the overlay: guests default to a 1500-byte MTU,
+# and a smaller overlay silently dropped their full-size (e.g. routed TCP) packets.
+[[ $(ip netns exec "$H" cat /sys/class/net/br-demo/mtu) == 1500 && $(ip netns exec "$S" cat /sys/class/net/br-demo/mtu) == 1500 ]]
+ip netns exec "$S" ping -c 2 -s 1472 -M do -W 3 198.18.0.1
+# set-mtu changes an existing overlay on each member host, bridge ports included.
+node hub "$ROOT/bin/overlayctl" set-mtu demo 1400 >/dev/null; node spoke "$ROOT/bin/overlayctl" set-mtu demo 1400 >/dev/null
+for _ in {1..30}; do ip netns exec "$S" ping -c 1 -W 1 198.18.0.1 >/dev/null 2>&1 && break; sleep .5; done
+[[ $(ip netns exec "$H" cat /sys/class/net/br-demo/mtu) == 1400 && $(ip netns exec "$S" cat /sys/class/net/vmo-demo/mtu) == 1400 ]]
+grep -q '^MTU=1400$' "$T/hub/overlays/demo.conf"
+ip netns exec "$S" ping -c 2 -s 1372 -M do -W 3 198.18.0.1
+node hub "$ROOT/bin/overlayctl" set-mtu demo 1500 >/dev/null; node spoke "$ROOT/bin/overlayctl" set-mtu demo 1500 >/dev/null
+for _ in {1..30}; do ip netns exec "$S" ping -c 1 -W 1 198.18.0.1 >/dev/null 2>&1 && break; sleep .5; done
+ip netns exec "$S" ping -c 2 -s 1472 -M do -W 3 198.18.0.1
 node hub "$ROOT/bin/overlayctl" list | python3 -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==1 and x[0]["tap_bridged"]'
 # Killing GOST must take down the supervisor, allowing OpenRC to respawn it.
 gpid=$(cat "$T/spoke/run/demo.pid"); kill "$gpid"; sleep 1
@@ -125,6 +138,9 @@ ip netns exec "$S" ping -c 1 -W 2 198.18.0.1
 # Revocation closes established transport and removes the API credential.
 node hub "$ROOT/bin/peerctl" revoke "$sid"
 [[ ! -s $T/hub/passwd && ! -f $T/hub/overlays/demo.conf && ! -f $T/hub/run/demo.pid ]]
-[[ $(curl_spoke --user "$RELAY_USER:$RELAY_PASSWORD" -o /dev/null -w '%{http_code}' http://192.0.2.1:8080/peer-api) == 401 ]]
+# The fake service manager starts Lighttpd in the background without waiting
+# for it to bind, so give the restart triggered by revocation a moment.
+code=000; for _ in {1..50}; do code=$(curl_spoke --user "$RELAY_USER:$RELAY_PASSWORD" -o /dev/null -w '%{http_code}' http://192.0.2.1:8080/peer-api 2>/dev/null || true); [[ $code == 000 ]] || break; sleep .1; done
+[[ $code == 401 ]]
 ! ip -n "$H" link show vmo-demo >/dev/null 2>&1
-echo 'overlay netns: PASS (Basic auth, TAP ARP/ICMP, activation, child cleanup, revocation, no spoke Lighttpd)'
+echo 'overlay netns: PASS (Basic auth, TAP ARP/ICMP, 1500-byte frames, set-mtu, activation, child cleanup, revocation, no spoke Lighttpd)'

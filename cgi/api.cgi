@@ -1102,11 +1102,11 @@ case "${P[0]-}" in
       GET)
         if [[ -n ${P[1]-} ]]; then raw_json_reply '200 OK' overlay_cmd show "${P[1]}"; else raw_json_reply '200 OK' overlay_cmd list; fi;;
       POST)
-        name=$(param name); bridge=$(param bridge); role=$(param role); mtu=$(param mtu 1400); staged=$(param staged false)
+        name=$(param name); bridge=$(param bridge); role=$(param role); mtu=$(param mtu 1500); staged=$(param staged false)
         [[ $name =~ ^[a-z][a-z0-9-]{0,10}$ ]] || error_reply '400 Bad Request' 'invalid overlay name'
         [[ $bridge =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] || error_reply '400 Bad Request' 'invalid Linux bridge name'
         [[ $role == hub || $role == spoke ]] || error_reply '400 Bad Request' 'role must be hub or spoke'
-        [[ $mtu =~ ^[0-9]{4}$ && $mtu -ge 1200 && $mtu -le 1499 ]] || error_reply '400 Bad Request' 'MTU must be 1200-1499'
+        [[ $mtu =~ ^[0-9]{4}$ && $mtu -ge 1200 && $mtu -le 1500 ]] || error_reply '400 Bad Request' 'MTU must be 1200-1500'
         [[ $staged == true || $staged == false ]] || error_reply '400 Bad Request' 'staged must be true or false'
 
         if [[ $PEER_API_REQUEST == true ]]; then

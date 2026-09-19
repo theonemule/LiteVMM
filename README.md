@@ -651,6 +651,18 @@ A hub may select up to 16 paired spokes; each spoke selects exactly one hub. Sta
 
 The overlay service supervises GOST children, cleans them up on stop, and restarts after a child exits. `overlayctl list` and `show NAME` report actual process, TAP and bridge state. It does not create Docker networks or assign workload addresses.
 
+### Overlay MTU
+
+Overlays default to a 1500-byte MTU, the same as a guest's NIC. GOST carries each Ethernet frame as bytes inside the TCP/WebSocket stream, so no headroom is needed for encapsulation. A smaller overlay MTU is a trap: guests keep sending 1500-byte frames, and anything that does not fit is silently dropped. Pings and DNS still work, but routed TCP stalls; for example, downloads fail through a router VM such as pfSense serving the overlay.
+
+Overlays created before this default keep their stored MTU (formerly 1400). To change an existing overlay, run on **every** member host:
+
+```sh
+sudo overlayctl set-mtu backend 1500
+```
+
+On a bridge the overlay created, this moves every port, including running VM taps, to the new MTU and restarts the overlay transport (a brief reconnect). On a pre-existing bridge only the overlay TAP changes; set the other ports yourself. If you choose an MTU below 1500, configure the same MTU inside each guest.
+
 ### Replacing previous overlay attempts
 
 Stop attached workloads before replacing a segment. Run `overlayctl reset` on each endpoint to stop and remove VMAPI's named TAP transports and generated hub routes, preserving paired hosts, bridges and workload configuration. Pull the current source and rerun `sudo ./install.sh`, then recreate the hub and spoke as above. Upgrade both peers together: peer API authentication has changed from request signatures to HTTP Basic.

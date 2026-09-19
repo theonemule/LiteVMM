@@ -43,7 +43,7 @@ load() {
   read -ra MEMBERS <<< "$PEERS_LIST"
   [[ $ROLE == hub || $ROLE == spoke ]] || die 'Old routed overlay must be reset and recreated as hub/spoke'
   [[ $BRIDGE =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && $BRIDGE != "$(tap_name "$NAME")" ]] || die 'Invalid Linux bridge name'
-  [[ $MTU =~ ^[0-9]{4}$ && $MTU -ge 1200 && $MTU -le 1499 ]] || die 'MTU must be 1200-1499'
+  [[ $MTU =~ ^[0-9]{4}$ && $MTU -ge 1200 && $MTU -le 1500 ]] || die 'MTU must be 1200-1500'
   [[ $STAGED == true || $STAGED == false ]] || die 'Invalid staged flag'
   [[ $TAP_BRIDGE_LEARNING == off ]] || die 'TAP bridge learning must remain disabled for GOST overlays'
   [[ $OWN_BRIDGE == true || $OWN_BRIDGE == false || $OWN_BRIDGE == legacy ]] || die 'Invalid bridge ownership flag'
@@ -169,14 +169,17 @@ render_web() (
 }
 LIGHTY
   done
-  chmod 0644 "$tmp"; mv -f -- "$tmp" "$out"
+  chmod 0644 "$tmp"
+  # Put the route file in its final state before validating and reloading, so
+  # Lighttpd checks and loads exactly what remains on disk. (Removing it after
+  # the reload raced with Lighttpd reading its configuration.)
+  if ((hubs > 0)); then mv -f -- "$tmp" "$out"; else rm -f -- "$tmp" "$out"; fi
   if ! lighttpd -tt -f "$WEB_ROOT/lighttpd.conf" >&2; then
     if [[ -s $backup ]]; then cp -p -- "$backup" "$out"; else rm -f -- "$out"; fi
     die 'Lighttpd rejected new overlay routes; restored previous routes'
   fi
   web_reload || die 'Lighttpd reload failed'
-  # No route remains on a former hub, and the separate old password file is retired.
-  ((hubs > 0)) || rm -f -- "$out"
+  # The separate old password file is retired.
   rm -f -- "$WEB_ROOT/gost.passwd" "$WEB_ROOT/conf.d/vmapi-overlay.conf"
 )
 
@@ -241,6 +244,27 @@ run() {
     while :; do sleep 60 & wait $!; done
   fi
 }
+# Change an existing overlay's MTU on this host (run it on every member host).
+# An overlay-owned bridge has all ports moved to the new MTU, including VM
+# taps, because the bridge runs at the smallest MTU of its ports. Ports of a
+# pre-existing bridge (e.g. one containing a physical NIC) are left alone.
+set_mtu() {
+  local name=${1:?overlay name required} mtu=${2:?MTU required} port
+  [[ $mtu =~ ^[0-9]{4}$ && $mtu -ge 1200 && $mtu -le 1500 ]] || die 'MTU must be 1200-1500'
+  load "$name"; MTU=$mtu; write_config
+  if [[ $OWN_BRIDGE == true ]] && [[ -d /sys/class/net/$BRIDGE/brif ]]; then
+    for port in /sys/class/net/"$BRIDGE"/brif/*; do
+      [[ -e $port ]] || continue; port=${port##*/}
+      [[ $port == "$(tap_name "$NAME")" ]] && continue
+      ip link set "$port" mtu "$MTU"
+    done
+  else
+    echo "Bridge $BRIDGE is not owned by this overlay; only the overlay TAP changes. Set other ports to $MTU yourself." >&2
+  fi
+  restart_service >/dev/null
+  [[ ! -d /sys/class/net/$BRIDGE ]] || ip link set "$BRIDGE" mtu "$MTU" 2>/dev/null || true
+  show "$NAME"
+}
 restart_service() {
   if [[ -n ${VMAPI_RC_SERVICE:-} ]]; then "$SERVICE" vmapi-overlay restart 8>&- >&2
   elif command -v rc-service >/dev/null 2>&1; then rc-service vmapi-overlay restart 8>&- >&2
@@ -286,7 +310,11 @@ validate() {
 }
 create() {
   NAME=${1:?overlay name required}; shift; valid_name "$NAME"
-  BRIDGE='' ROLE='' MTU=1400 STAGED=false TAP_BRIDGE_LEARNING=off; MEMBERS=()
+  # 1500 by default: GOST carries each Ethernet frame as bytes in a TCP/WebSocket
+  # stream, so there is no encapsulation overhead to reserve. A smaller overlay
+  # MTU silently dropped full-size packets from guests whose NICs default to
+  # 1500, e.g. TCP forwarded by a router VM such as pfSense.
+  BRIDGE='' ROLE='' MTU=1500 STAGED=false TAP_BRIDGE_LEARNING=off; MEMBERS=()
   while (($#)); do
     case $1 in
       --bridge) BRIDGE=${2:?}; shift 2;; --role) ROLE=${2:?}; shift 2;;
@@ -380,7 +408,7 @@ migrate_config() {
 
 case ${1:-} in
   run) run; exit;;
-  help|-h|--help|'') echo 'overlayctl create NAME --bridge BRIDGE --role hub|spoke --peer NODE_ID [--peer NODE_ID ...] [--mtu 1400] [--staged]'; echo 'overlayctl list|show NAME|peer-list NAME|health NAME|stage NAME|validate NAME|activate NAME|delete NAME|reset|render|migrate-config|restart-service'; exit;;
+  help|-h|--help|'') echo 'overlayctl create NAME --bridge BRIDGE --role hub|spoke --peer NODE_ID [--peer NODE_ID ...] [--mtu 1500] [--staged]'; echo 'overlayctl set-mtu NAME MTU'; echo 'overlayctl list|show NAME|peer-list NAME|health NAME|stage NAME|validate NAME|activate NAME|delete NAME|reset|render|migrate-config|restart-service'; exit;;
 esac
 access
 # The supervisor never takes this mutation lock, so service restarts cannot deadlock.
@@ -390,6 +418,6 @@ case $cmd in
   create) create "$@";; list) list;; show) show "$@";; peer-list) peer_list "$@";; health) health "$@";; validate) validate "$@";;
   stage) set_stage "$1" true;; activate) set_stage "$1" false;; delete) delete "$@";; reset) reset;;
   render) for f in "$ROOT"/*.conf; do [[ -f $f ]] && render_config "$(basename "$f" .conf)"; done; render_web;;
-  render-config) render_config "$@";; restart-service) restart_service;; revoke-peer) revoke_peer "$@";; migrate-config) migrate_config;;
+  render-config) render_config "$@";; restart-service) restart_service;; set-mtu) set_mtu "$@";; revoke-peer) revoke_peer "$@";; migrate-config) migrate_config;;
   *) die "Unknown command: $cmd";;
 esac

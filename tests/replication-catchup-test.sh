@@ -10,7 +10,10 @@ for c in qemu-system-x86_64 qemu-img qemu-io socat; do
 done
 T=$(mktemp -d "${VMAPI_TEST_TMP:-/var/tmp}/vmapi-catchup.XXXXXX")
 QPID=''; LISTENER=''; HOLDER=''
-cleanup(){ local p; for p in "$QPID" "$LISTENER" "$HOLDER"; do [[ -z $p ]] || kill "$p" 2>/dev/null || true; done; rm -rf "$T"; }
+# LISTENER leads its own process group (see below); kill the whole group so the
+# `sleep` feeding socat does not outlive the test and hold its output pipe open.
+cleanup(){ local p; [[ -z $LISTENER ]] || kill -- -"$LISTENER" 2>/dev/null || kill "$LISTENER" 2>/dev/null || true
+  for p in "$QPID" "$HOLDER"; do [[ -z $p ]] || kill "$p" 2>/dev/null || true; done; rm -rf "$T"; }
 trap cleanup EXIT
 
 OWNER=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; PEER=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -34,7 +37,7 @@ qemu-system-x86_64 -machine q35 -accel tcg -cpu max -smp 1 -m 64 -display none -
     -pidfile "$RUNTIME/qemu.pid" -daemonize 2>"$T/qemu.err" \
   || { echo "replication catch-up: SKIP (QEMU could not start: $(head -n1 "$T/qemu.err"))"; exit 0; }
 QPID=$(cat "$RUNTIME/qemu.pid")
-{ printf '%s\n' '{"execute":"qmp_capabilities"}'; sleep 3600; } | socat - "UNIX-CONNECT:$T/events.sock" > "$T/events.log" & LISTENER=$!
+setsid bash -c '{ printf "%s\n" "{\"execute\":\"qmp_capabilities\"}"; sleep 3600; } | socat - "UNIX-CONNECT:$1" > "$2"' _ "$T/events.sock" "$T/events.log" & LISTENER=$!
 
 source "$ROOT/lib/common.sh"
 repl(){ bash "$ROOT/bin/replicationctl" "$@"; }
