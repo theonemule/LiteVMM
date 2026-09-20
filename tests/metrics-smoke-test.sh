@@ -103,6 +103,15 @@ h = json.load(open(sys.argv[1])); s = json.load(open(sys.argv[2]))
 d = h['disk']; expect = round(d['used_bytes'] * 100 / (d['used_bytes'] + d['available_bytes']), 2)
 assert abs(d['utilization_percent'] - expect) < 0.011, (d, expect)
 assert h['memory']['balloon'] in ('hyperv', 'virtio', 'none'), h['memory']
+# Memory: total is physical RAM (zoneinfo "present"), never below the kernel's
+# MemTotal; used is MemTotal - MemAvailable; the percentage is used / physical.
+m = h['memory']
+assert m['total_bytes'] >= m['assigned_bytes'] > 0, m
+assert m['used_bytes'] == m['assigned_bytes'] - m['available_bytes'], m
+assert abs(m['utilization_percent'] - round(m['used_bytes'] * 100 / m['total_bytes'], 2)) < 0.011, m
+assert s['hardware']['memory_total_bytes'] >= m['assigned_bytes'], s['hardware']
+# Disk: when a single backing disk is found it is at least the filesystem size.
+if d['device_bytes'] is not None: assert d['device'] and d['device_bytes'] >= d['total_bytes'], d
 assert s['host']['virtualization_type'], s['host']
 PY2
 

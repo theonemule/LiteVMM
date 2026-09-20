@@ -613,11 +613,9 @@ ${commandLine(ci)} < user-data`;
     const rxRate = counterRate('host.net.rx', m.network?.rx_bytes);
     const txRate = counterRate('host.net.tx', m.network?.tx_bytes);
     updateMeter('host','cpu',{value:percent(m.cpu?.utilization_percent),meta:`${m.cpu?.logical_cpus || 0} logical CPUs · load ${Number(m.cpu?.load1||0).toFixed(2)}`,percentValue:m.cpu?.utilization_percent,historyValue:m.cpu?.utilization_percent,fixedMax:100});
-    // Under Hyper-V Dynamic Memory (or a virtio balloon) the total is what the
-    // hypervisor currently assigns, not the configured maximum, so say so.
-    const balloon = {hyperv:'assigned by Hyper-V Dynamic Memory', virtio:'currently assigned (memory balloon)'}[m.memory?.balloon] || 'total';
-    updateMeter('host','memory',{value:percent(m.memory?.utilization_percent),meta:`${bytes(m.memory?.used_bytes)} used of ${bytes(m.memory?.total_bytes)} ${balloon}`,corner:m.memory?.balloon && m.memory.balloon !== 'none' ? 'dynamic' : '',percentValue:m.memory?.utilization_percent,historyValue:m.memory?.utilization_percent,fixedMax:100});
-    updateMeter('host','disk',{value:percent(m.disk?.utilization_percent),meta:`${bytes(m.disk?.used_bytes)} used · ${bytes(m.disk?.available_bytes)} free of ${bytes(m.disk?.total_bytes)}`,corner:m.disk?.path || '',percentValue:m.disk?.utilization_percent,historyValue:m.disk?.utilization_percent,fixedMax:100});
+    // Total is the machine's physical RAM; used is what the OS is actually using.
+    updateMeter('host','memory',{value:percent(m.memory?.utilization_percent),meta:`${bytes(m.memory?.used_bytes)} used of ${bytes(m.memory?.total_bytes)}`,percentValue:m.memory?.utilization_percent,historyValue:m.memory?.utilization_percent,fixedMax:100});
+    updateMeter('host','disk',{value:percent(m.disk?.utilization_percent),meta:`${bytes(m.disk?.used_bytes)} used · ${bytes(m.disk?.available_bytes)} free of ${bytes(m.disk?.total_bytes)}`,corner:m.disk?.device_bytes ? `${bytes(m.disk.device_bytes)} disk` : (m.disk?.path || ''),percentValue:m.disk?.utilization_percent,historyValue:m.disk?.utilization_percent,fixedMax:100});
     const diskBar = $('#host-disk-bar'), diskPct = Number(m.disk?.utilization_percent || 0);
     if (diskBar) { diskBar.classList.toggle('bg-danger', diskPct >= 90); diskBar.classList.toggle('bg-warning', diskPct >= 80 && diskPct < 90); }
     updateMeter('host','network',{value:`↓ ${rateBytes(rxRate)}`,meta:`↑ ${rateBytes(txRate)} · cumulative ${bytes((m.network?.rx_bytes||0)+(m.network?.tx_bytes||0))}`,corner:'RX / TX',historyValue:rxRate,history2:txRate});

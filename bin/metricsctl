@@ -70,12 +70,19 @@ host_cpu_count() {
   printf '%s\n' "$n"
 }
 
+# Prints: physical used available assigned (bytes).
+# Physical is the RAM present in the machine (/proc/zoneinfo "present" pages).
+# MemTotal ("assigned") understates it: it excludes kernel reservations and,
+# under Hyper-V Dynamic Memory or a virtio balloon, memory the hypervisor has
+# taken back. Used is what the OS is actually using (MemTotal - MemAvailable).
 memory_values() {
-  awk '
-    /^MemTotal:/ {t=$2*1024}
-    /^MemAvailable:/ {a=$2*1024}
-    END { if(a=="") a=0; u=t-a; if(u<0)u=0; printf "%.0f %.0f %.0f\n", t,u,a }
-  ' /proc/meminfo
+  awk -v page="$(getconf PAGESIZE 2>/dev/null || echo 4096)" '
+    FILENAME == "/proc/meminfo" && /^MemTotal:/ {t=$2*1024}
+    FILENAME == "/proc/meminfo" && /^MemAvailable:/ {a=$2*1024}
+    FILENAME == "/proc/zoneinfo" && $1 == "present" {p+=$2}
+    END { if(a=="") a=0; u=t-a; if(u<0)u=0; phys=p*page; if(phys<t) phys=t
+          printf "%.0f %.0f %.0f %.0f\n", phys,u,a,t }
+  ' /proc/meminfo /proc/zoneinfo 2>/dev/null
 }
 
 # Hypervisor memory ballooning (Hyper-V Dynamic Memory, virtio-balloon) changes
@@ -94,6 +101,18 @@ metric_fs_path() {
   else printf '/\n'; fi
 }
 
+# The whole disk behind a filesystem (e.g. sda for /dev/sda3) and its size.
+# Prints nothing for LVM/device-mapper, network or virtual filesystems, where
+# there is no single backing disk.
+backing_disk() {
+  local src dev node disk
+  src=$(df -P "$1" 2>/dev/null | awk 'NR==2 {print $1}'); dev=${src#/dev/}
+  [[ $src == /dev/* && $dev != dm-* && $dev != mapper/* && -e /sys/class/block/$dev ]] || return 0
+  node=$(readlink -f "/sys/class/block/$dev")
+  if [[ -e $node/partition ]]; then disk=$(basename "$(dirname "$node")"); else disk=$dev; fi
+  [[ -r /sys/class/block/$disk/size ]] && printf '%s %s\n' "$disk" "$(( $(cat "/sys/class/block/$disk/size") * 512 ))"
+}
+
 filesystem_values() {
   local p=${1:-/} kb used avail
   read -r kb used avail < <(df -Pk "$p" | awk 'NR>1 {t=$2;u=$3;a=$4} END{print t,u,a}')
@@ -107,10 +126,11 @@ network_totals() {
 uptime_seconds() { awk '{printf "%.0f\n", $1}' /proc/uptime; }
 
 cmd_host() {
-  local cpu cpus mt mu ma dt du da rx tx up load1 load5 load15 disk_path kvm_available=false
+  local cpu cpus mt mu ma mas dt du da rx tx up load1 load5 load15 disk_path disk_dev='' disk_dev_bytes='' kvm_available=false
   cpu=$(host_cpu_percent); cpus=$(host_cpu_count)
-  read -r mt mu ma < <(memory_values)
+  read -r mt mu ma mas < <(memory_values)
   disk_path=$(metric_fs_path); read -r dt du da < <(filesystem_values "$disk_path")
+  read -r disk_dev disk_dev_bytes < <(backing_disk "$disk_path") || true
   read -r rx tx < <(network_totals)
   up=$(uptime_seconds); read -r load1 load5 load15 _ < /proc/loadavg
   [[ -r "$KVM_DEVICE" && -w "$KVM_DEVICE" ]] && kvm_available=true
@@ -118,10 +138,10 @@ cmd_host() {
   printf '"scope":"host","timestamp":%s,' "$(date +%s)"
   printf '"cpu":{"utilization_percent":%s,"logical_cpus":%s,"load1":%s,"load5":%s,"load15":%s},' "$cpu" "$cpus" "$load1" "$load5" "$load15"
   printf '"virtualization":{"kvm_available":%s,"note":"%s"},' "$kvm_available" "$(json_escape "$([[ $kvm_available == true ]] && printf 'KVM acceleration available' || printf 'KVM unavailable: VM starts require explicit software emulation and will be slow')")"
-  printf '"memory":{"used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s,"balloon":"%s"},' "$mu" "$mt" "$ma" "$(num_pct "$mu" "$mt")" "$(memory_balloon)"
+  printf '"memory":{"used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"assigned_bytes":%s,"utilization_percent":%s,"balloon":"%s"},' "$mu" "$mt" "$ma" "$mas" "$(num_pct "$mu" "$mt")" "$(memory_balloon)"
   # Same as df's Use%: used / (used + available). Dividing by the filesystem
   # size under-reported fullness by the root-reserved blocks (5% on ext4).
-  printf '"disk":{"path":"%s","used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s},' "$(json_escape "$disk_path")" "$du" "$dt" "$da" "$(num_pct "$du" "$((du+da))")"
+  printf '"disk":{"path":"%s","used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s,"device":"%s","device_bytes":%s},' "$(json_escape "$disk_path")" "$du" "$dt" "$da" "$(num_pct "$du" "$((du+da))")" "$(json_escape "$disk_dev")" "${disk_dev_bytes:-null}"
   printf '"network":{"rx_bytes":%s,"tx_bytes":%s},' "$rx" "$tx"
   printf '"uptime_seconds":%s' "$up"
   printf '}\n'
@@ -172,7 +192,7 @@ cmd_system() {
   sockets=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\):/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' || true)
   cores=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' || true)
   threads=$(lscpu 2>/dev/null | awk -F: '/^Thread\(s\) per core:/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' || true)
-  read -r mt mu ma < <(memory_values)
+  read -r mt mu ma _ < <(memory_values)
   read -r swap_total swap_free < <(awk '/^SwapTotal:/ {t=$2*1024} /^SwapFree:/ {f=$2*1024} END{printf "%.0f %.0f\n",t+0,f+0}' /proc/meminfo)
   primary_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
   gateway=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3; exit}' || true)
