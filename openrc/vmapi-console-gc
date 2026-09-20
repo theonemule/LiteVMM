@@ -3,7 +3,7 @@
 # The web server provides public access; this service owns only the local runtime process.
 supervisor=supervise-daemon
 name="VMAPI console groomer"
-description="Clean stale VMAPI noVNC/websockify console sessions"
+description="Clean stale VMAPI noVNC/GOST console sessions"
 command=/usr/local/bin/vmapi-console-gc
 command_user=root:root
 pidfile=/run/vmapi-console-gc.pid

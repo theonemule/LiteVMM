@@ -9,7 +9,7 @@ flowchart TD
     P["Paired host"] -->|"pair credential"| W
     W["lighttpd (Alpine) / nginx (Debian)<br/>single management port"]
     W -->|"FastCGI /api/, /peer-api/"| F["fcgiwrap → api.cgi<br/>runs as vmapi"]
-    W -->|"WebSocket proxy, loopback"| D["Helper daemons<br/>websockify · ttyd · GOST · NFS bridge"]
+    W -->|"WebSocket proxy, loopback"| D["Helper daemons<br/>GOST · ttyd · NFS"]
     F -->|"direct or sudo -n"| T["*ctl shell tools<br/>vmctl, dockerctl, peerctl, …"]
     T --> Q["QEMU / KVM"]
     T --> K["Docker daemon"]
@@ -154,12 +154,11 @@ test suite runs the tools against temporary directories.
 | `fcgiwrap-vmapi` | `fcgiwrap` (via `spawn-fcgi` on Alpine) | Runs `api.cgi` |
 | `vmapi-network` | one-shot | Restores persisted bridges at boot |
 | `vmapi-autostart` | one-shot | Starts VMs with `AUTOSTART=true` |
-| `vmapi-backplane-server` | `backplanectl server-daemon` | Runs and verifies loopback NFS and the `websockify` bridge |
+| `vmapi-backplane-server` | `backplanectl server-daemon` | Runs and verifies loopback NFS and its GOST WebSocket bridge |
 | `vmapi-backplane` | `backplanectl daemon` | Mounts every peer's backplane; reconciles every 10 s |
 | `vmapi-replication` | `replicationctl daemon` | Keeps replication mirrors running |
 | `vmapi-overlay` | `overlayctl run` | Supervises GOST overlay processes |
-| `websockify-vmapi` | `websockify` token broker | VM consoles (Alpine) |
-| `vmapi-console-gc` | loop | Expires stale console sessions |
+| `vmapi-console-gc` | loop | Expires stale console sessions and stops their GOST forwarders |
 | `ttyd-vmapi`, `ttyd-host-vmapi` | `ttyd` | Container and host terminals |
 
 On Alpine each runs under `supervise-daemon`, and logs go to
@@ -173,12 +172,12 @@ Nothing but the management port is reachable from the network.
 |---|---|---|
 | `0.0.0.0:5186` (Alpine) / `127.0.0.1:5186` (Debian default) | web server | directly |
 | `127.0.0.1:2049` | kernel NFS server | `/backplane/storage` → `127.0.0.1:6091` |
-| `127.0.0.1:6091` | `websockify` (NFS bridge) | `/backplane/storage` |
-| `127.0.0.1:6080` | `websockify` (console broker) | `/console/ws/` |
+| `127.0.0.1:6091` | GOST (NFS WS→TCP bridge) | `/backplane/storage` |
+| `127.0.0.1:39000–41999` | GOST (one per active noVNC session) | `/console/ws/TOKEN` |
 | `127.0.0.1:7681` / `:7682` | `ttyd` container / host | `/docker/terminal/`, `/host/terminal/` |
 | `127.0.0.1:<computed>` | GOST relay (hub) | `/overlay/NAME` |
-| `127.0.0.1:32000–38999` | `websocat` (one per mounted peer) | local NFS client |
-| `127.0.0.1:59xx` | QEMU VNC | console broker |
+| `127.0.0.1:32000–38999` | GOST (one per mounted peer) | local NFS client |
+| `127.0.0.1:59xx` | QEMU VNC | session GOST forwarder |
 | `127.0.0.1:5000` | `registry:3` | `/v2/` |
 
 ## Web server routing
@@ -190,11 +189,11 @@ Nothing but the management port is reachable from the network.
 | `/peer-api/` | `/etc/vmapi-peer.htpasswd` | FastCGI `peer-api.cgi` → `api.cgi` with `VMAPI_PEER_API=true` |
 | `/backplane/storage` | `/etc/vmapi-peer.htpasswd` | WebSocket → `127.0.0.1:6091` |
 | `/overlay/NAME` | peer htpasswd, **restricted to that overlay's member users** | WebSocket → GOST relay (generated per hub) |
-| `/console/ws/` | console users | WebSocket → `127.0.0.1:6080` |
+| `/console/ws/TOKEN` | console users | WebSocket → that session GOST loopback port |
 | `/docker/terminal/`, `/host/terminal/` | console users | WebSocket → `ttyd` |
 | `/v2/` | `/etc/vmapi-registry.htpasswd` | proxy → `127.0.0.1:5000` (when enabled) |
 
-Generated fragments (`zz-vmapi-overlay.conf`, `zz-vmapi-registry.conf`) are
+Generated fragments (`zz-vmapi-overlay.conf`, `zz-vmapi-console.conf`, `zz-vmapi-registry.conf`) are
 written, checked with `lighttpd -tt`, restored on failure, and applied by
 `vmapi-web-reload` gracefully *after* the current API response. A plain restart
 would cut the very request that asked for the change.

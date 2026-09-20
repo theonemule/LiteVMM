@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# Purpose: VMAPI privileged command-line component.
-# Called by the CGI API or service units; environment variables may override paths for tests.
-# Validate externally supplied values before passing them to host virtualization or container tools.
+# Purpose: short-lived noVNC console sessions backed by GOST WebSocket-to-VNC forwarders.
 set -Eeuo pipefail
 LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 source "$LIB"
 
 VMCTL=${VMCTL:-/usr/local/bin/vmctl}
+GOST=${VMAPI_GOST:-$(command -v gost 2>/dev/null || printf '%s' /usr/local/bin/gost)}
 STATE_DIR=${VMAPI_CONSOLE_STATE_DIR:-/run/vmapi/consoles}
-TOKEN_FILE=${VMAPI_CONSOLE_TOKEN_FILE:-/run/vmapi/console.tokens}
+WEB_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
+WEB_RELOAD=${VMAPI_CONSOLE_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}
 TTL=${VMAPI_CONSOLE_TTL:-120}
+PORT_MIN=${VMAPI_CONSOLE_PORT_MIN:-39000}
+PORT_MAX=${VMAPI_CONSOLE_PORT_MAX:-41999}
+SS=${VMAPI_SS:-$(command -v ss 2>/dev/null || printf '%s' /sbin/ss)}
 
 usage() {
 cat <<'TXT'
-consolectl - noVNC/websockify token console sessions
+consolectl - noVNC/GOST console sessions
 
 Commands:
   start VM
@@ -27,18 +30,23 @@ TXT
 
 validate_console_vm() { validate_vm_name "$1"; }
 session_file() { printf '%s/%s.env\n' "$STATE_DIR" "$1"; }
+pid_file() { printf '%s/%s.gost.pid\n' "$STATE_DIR" "$1"; }
+gost_config() { printf '%s/%s.gost.yaml\n' "$STATE_DIR" "$1"; }
+log_file() { printf '%s/%s.gost.log\n' "$STATE_DIR" "$1"; }
 now() { date +%s; }
 
 init_state() {
-  install -d -m 0755 /run/vmapi "$STATE_DIR"
-  touch "$TOKEN_FILE"
-  chmod 0640 "$TOKEN_FILE"
-  chown vmapi:vmapi /run/vmapi "$STATE_DIR" "$TOKEN_FILE" 2>/dev/null || true
+  local parent
+  parent=$(dirname "$STATE_DIR")
+  install -d -m 0755 "$parent" "$STATE_DIR"
+  chown vmapi:vmapi "$parent" "$STATE_DIR" 2>/dev/null || true
 }
 
 load_session() {
-  local name=$1 file; file=$(session_file "$name")
+  local name=$1 file
+  file=$(session_file "$name")
   [[ -r $file ]] || return 1
+  NAME='' TOKEN='' VNC_HOST='' VNC_PORT='' WS_PORT='' UPDATED=''
   # shellcheck disable=SC1090
   source "$file"
 }
@@ -55,112 +63,198 @@ new_token() {
   fi
 }
 
+port_in_use() { "$SS" -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$1$"; }
+free_port() {
+  local p
+  for _ in {1..1000}; do
+    p=$((PORT_MIN + RANDOM % (PORT_MAX-PORT_MIN+1)))
+    port_in_use "$p" || { printf '%s\n' "$p"; return; }
+  done
+  die 'Could not allocate a loopback port for the console'
+}
+
+pid_from_file() { local f=$1 p=''; [[ -r $f ]] && read -r p < "$f" || true; [[ $p =~ ^[0-9]+$ ]] && printf '%s\n' "$p"; }
+forwarder_running() {
+  local name=$1 p cfg
+  p=$(pid_from_file "$(pid_file "$name")" || true)
+  cfg=$(gost_config "$name")
+  [[ -n $p && -r /proc/$p/cmdline ]] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  tr '\0' '\n' < "/proc/$p/cmdline" | grep -Fxq "$cfg"
+}
+stop_forwarder() {
+  local name=$1 p
+  p=$(pid_from_file "$(pid_file "$name")" || true)
+  if [[ -n $p ]] && kill -0 "$p" 2>/dev/null; then
+    kill "$p" 2>/dev/null || true
+    for _ in {1..30}; do kill -0 "$p" 2>/dev/null || break; sleep .05; done
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  fi
+  rm -f -- "$(pid_file "$name")" "$(gost_config "$name")"
+}
+
 write_session() {
-  local name=$1 token=$2 vnc_host=$3 vnc_port=$4 updated tmp file
+  local name=$1 token=$2 vnc_host=$3 vnc_port=$4 ws_port=$5 updated tmp file
   updated=$(now); file=$(session_file "$name"); tmp="$file.$$"
-  cat > "$tmp" <<EOF
+  cat > "$tmp" <<STATE
 NAME=$(printf '%q' "$name")
 TOKEN=$(printf '%q' "$token")
 VNC_HOST=$(printf '%q' "$vnc_host")
 VNC_PORT=$(printf '%q' "$vnc_port")
+WS_PORT=$(printf '%q' "$ws_port")
 UPDATED=$(printf '%q' "$updated")
-EOF
+STATE
   chmod 0640 "$tmp"
-  chown vmapi:vmapi "$tmp" 2>/dev/null || true
+  chown root:vmapi "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$file"
 }
 
 touch_session() {
-  local name=$1 file tmp NAME='' TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+  local name=$1 file tmp
   load_session "$name" || die "Console session not found: $name"
   file=$(session_file "$name"); tmp="$file.$$"; UPDATED=$(now)
-  cat > "$tmp" <<EOF
+  cat > "$tmp" <<STATE
 NAME=$(printf '%q' "$NAME")
 TOKEN=$(printf '%q' "$TOKEN")
 VNC_HOST=$(printf '%q' "$VNC_HOST")
 VNC_PORT=$(printf '%q' "$VNC_PORT")
+WS_PORT=$(printf '%q' "$WS_PORT")
 UPDATED=$(printf '%q' "$UPDATED")
-EOF
+STATE
   chmod 0640 "$tmp"
-  chown vmapi:vmapi "$tmp" 2>/dev/null || true
+  chown root:vmapi "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$file"
 }
 
-render_tokens() {
-  local tmp file name TOKEN VNC_HOST VNC_PORT UPDATED
-  init_state
-  tmp="$TOKEN_FILE.$$"
+render_web_routes() {
+  local out="$WEB_ROOT/conf.d/zz-vmapi-console.conf" tmp backup file count=0
+  install -d -m 0755 "$WEB_ROOT/conf.d"
+  tmp=$(mktemp "$WEB_ROOT/conf.d/.console.XXXXXX")
+  backup=$(mktemp "$STATE_DIR/.web-backup.XXXXXX")
+  trap 'rm -f -- "$tmp" "$backup"' RETURN
+  [[ ! -f $out ]] || cp -p -- "$out" "$backup"
+  printf '# Generated by consolectl. Each token maps to one loopback GOST WebSocket forwarder.\n' > "$tmp"
   shopt -s nullglob
   for file in "$STATE_DIR"/*.env; do
-    name=$(basename "$file" .env); TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+    NAME='' TOKEN='' VNC_HOST='' VNC_PORT='' WS_PORT='' UPDATED=''
     # shellcheck disable=SC1090
     source "$file" || continue
-    [[ -n ${TOKEN:-} && -n ${VNC_HOST:-} && ${VNC_PORT:-} =~ ^[0-9]+$ ]] || continue
-    [[ $("$VMCTL" status "$name" 2>/dev/null || true) == running ]] || continue
-    printf '%s: %s:%s\n' "$TOKEN" "$VNC_HOST" "$VNC_PORT"
-  done > "$tmp"
+    [[ $TOKEN =~ ^[A-Fa-f0-9]{32}$ && $WS_PORT =~ ^[0-9]+$ ]] || continue
+    cat >> "$tmp" <<LIGHTY
+\$HTTP["url"] == "/console/ws/$TOKEN" {
+  proxy.server = ( "" => (( "host" => "127.0.0.1", "port" => $WS_PORT )) )
+  proxy.header = ( "upgrade" => "enable" )
+}
+LIGHTY
+    count=$((count+1))
+  done
   shopt -u nullglob
-  chmod 0640 "$tmp"
-  chown vmapi:vmapi "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$TOKEN_FILE"
+  chmod 0644 "$tmp"
+  if ((count)); then mv -f -- "$tmp" "$out"; else rm -f -- "$tmp" "$out"; fi
+  if [[ -x $WEB_RELOAD ]]; then
+    if ! "$WEB_RELOAD"; then
+      if [[ -s $backup ]]; then cp -p -- "$backup" "$out"; else rm -f -- "$out"; fi
+      die 'Lighttpd rejected console routes; restored previous routes'
+    fi
+  fi
+  trap - RETURN
+  rm -f -- "$tmp" "$backup"
+}
+
+start_forwarder() {
+  local name=$1 token=$2 vnc_host=$3 vnc_port=$4 ws_port=$5 cfg lf pf
+  need_cmd "$GOST"; need_cmd "$SS"
+  cfg=$(gost_config "$name"); lf=$(log_file "$name"); pf=$(pid_file "$name")
+  stop_forwarder "$name"
+  cat > "$cfg" <<YAML
+services:
+- name: "console-$name"
+  addr: "127.0.0.1:$ws_port"
+  handler:
+    type: forward
+  listener:
+    type: ws
+    metadata:
+      path: "/console/ws/$token"
+  forwarder:
+    nodes:
+    - name: vnc
+      addr: "$vnc_host:$vnc_port"
+YAML
+  chmod 0600 "$cfg"
+  : > "$lf"; chmod 0600 "$lf"
+  setsid "$GOST" -C "$cfg" </dev/null >>"$lf" 2>&1 &
+  echo $! > "$pf"
+  for _ in {1..100}; do
+    port_in_use "$ws_port" && forwarder_running "$name" && return
+    forwarder_running "$name" || break
+    sleep .05
+  done
+  tail -40 "$lf" >&2 2>/dev/null || true
+  stop_forwarder "$name"
+  die 'Console GOST WebSocket forwarder failed to start'
 }
 
 session_valid() {
-  local name=$1 TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+  local name=$1
   load_session "$name" || return 1
-  [[ -n ${TOKEN:-} && -n ${VNC_HOST:-} && ${VNC_PORT:-} =~ ^[0-9]+$ ]] || return 1
+  [[ -n ${TOKEN:-} && ${VNC_PORT:-} =~ ^[0-9]+$ && ${WS_PORT:-} =~ ^[0-9]+$ ]] || return 1
   [[ $("$VMCTL" status "$name" 2>/dev/null || true) == running ]] || return 1
+  forwarder_running "$name"
 }
 
 stop_session() {
   local name=$1
   validate_console_vm "$name"
+  stop_forwarder "$name"
   rm -f -- "$(session_file "$name")"
-  render_tokens
+  render_web_routes
 }
 
 gc_sessions() {
-  local file name TOKEN VNC_HOST VNC_PORT UPDATED cutoff changed=false
-  init_state
-  cutoff=$(( $(now) - TTL ))
+  local file name cutoff changed=false
+  init_state; cutoff=$(( $(now) - TTL ))
   shopt -s nullglob
   for file in "$STATE_DIR"/*.env; do
-    name=$(basename "$file" .env); TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
-    # shellcheck disable=SC1090
-    source "$file" || { rm -f -- "$file"; changed=true; continue; }
-    if [[ ! ${UPDATED:-0} =~ ^[0-9]+$ ]] || (( UPDATED < cutoff )) || [[ $("$VMCTL" status "$name" 2>/dev/null || true) != running ]]; then
+    name=$(basename "$file" .env)
+    if ! load_session "$name" || [[ ! ${UPDATED:-0} =~ ^[0-9]+$ ]] || (( UPDATED < cutoff )) || [[ $("$VMCTL" status "$name" 2>/dev/null || true) != running ]] || ! forwarder_running "$name"; then
+      stop_forwarder "$name"
       rm -f -- "$file"
       changed=true
     fi
   done
   shopt -u nullglob
-  $changed && render_tokens || true
+  $changed && render_web_routes || true
 }
 
 json_session() {
-  local name=$1 TOKEN='' VNC_HOST='' VNC_PORT='' UPDATED=''
+  local name=$1 path
   load_session "$name" || die "Console session not found: $name"
-  printf '{"name":"%s","token":"%s","vnc_host":"%s","vnc_port":%s,"path":"console/ws/","url":"/console.html?vm=%s&path=%s&token=%s","ttl_seconds":%s,"updated":%s}\n' \
-    "$(json_escape "$name")" "$(json_escape "$TOKEN")" "$(json_escape "$VNC_HOST")" "$VNC_PORT" "$(json_escape "$name")" "$(json_escape 'console/ws/')" "$(json_escape "$TOKEN")" "$TTL" "$UPDATED"
+  path="console/ws/$TOKEN"
+  printf '{"name":"%s","token":"%s","vnc_host":"%s","vnc_port":%s,"path":"%s","url":"/console.html?vm=%s&path=%s&token=%s","ttl_seconds":%s,"updated":%s}\n' \
+    "$(json_escape "$name")" "$(json_escape "$TOKEN")" "$(json_escape "$VNC_HOST")" "$VNC_PORT" "$(json_escape "$path")" \
+    "$(json_escape "$name")" "$(json_escape "$path")" "$(json_escape "$TOKEN")" "$TTL" "$UPDATED"
 }
 
 cmd_start() {
-  local name=${1:?VM name required} token vnc_host vnc_port
+  local name=${1:?VM name required} token vnc_host vnc_port ws_port
   validate_console_vm "$name"; require_vm "$name"; init_state; gc_sessions
-  if session_valid "$name"; then touch_session "$name"; render_tokens; json_session "$name"; return; fi
+  if session_valid "$name"; then touch_session "$name"; json_session "$name"; return; fi
+  stop_forwarder "$name"; rm -f -- "$(session_file "$name")"
   [[ $("$VMCTL" status "$name") == running ]] || die "VM is not running: $name"
   console_info "$name"
   [[ ${INFO[display]:-} == vnc ]] || die "VM display is not VNC: $name"
   vnc_host=${INFO[vnc_bind]:-127.0.0.1}; vnc_port=${INFO[vnc_port]:-}
   [[ $vnc_port =~ ^[0-9]+$ ]] || die "VM has no VNC port: $name"
-  token=$(new_token)
-  write_session "$name" "$token" "$vnc_host" "$vnc_port"
-  render_tokens
+  token=$(new_token); ws_port=$(free_port)
+  start_forwarder "$name" "$token" "$vnc_host" "$vnc_port" "$ws_port"
+  write_session "$name" "$token" "$vnc_host" "$vnc_port" "$ws_port"
+  if ! render_web_routes; then stop_forwarder "$name"; rm -f -- "$(session_file "$name")"; return 1; fi
   json_session "$name"
 }
 
 cmd_info() { local name=${1:?VM name required}; validate_console_vm "$name"; session_valid "$name" || die "Console session not running: $name"; json_session "$name"; }
-cmd_touch() { local name=${1:?VM name required}; validate_console_vm "$name"; touch_session "$name"; render_tokens; json_session "$name"; }
+cmd_touch() { local name=${1:?VM name required}; validate_console_vm "$name"; session_valid "$name" || die "Console session not running: $name"; touch_session "$name"; json_session "$name"; }
 
 case "${1:-help}" in
   start) shift; cmd_start "$@";;

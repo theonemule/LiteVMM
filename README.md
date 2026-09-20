@@ -178,13 +178,13 @@ peer NFS mount
         |
 127.0.0.1:dynamic-port
         |
-     websocat
+       GOST
         |
  WSS /backplane/storage
         |
  existing LiteVMM HTTP(S) port
         |
-    websockify
+       GOST
         |
 127.0.0.1:2049
         |
@@ -193,7 +193,7 @@ peer NFS mount
 /var/lib/vmapi/backplane
 ```
 
-The client runs `websocat` as a loopback TCP bridge and mounts it with the normal Linux NFS client. The storage host runs `websockify` on loopback behind Nginx or Lighttpd. One peer-wide mount is reused by backups, VM replicas, Docker volumes, read-only Docker image-rootfs exports, registry data, and future filesystem-backed storage features.
+The client runs GOST as a loopback TCP-to-WebSocket bridge and mounts it with the normal Linux NFS client. The storage host runs GOST as the matching WebSocket-to-TCP bridge behind Nginx or Lighttpd. One peer-wide mount is reused by backups, VM replicas, Docker volumes, read-only Docker image-rootfs exports, registry data, and future filesystem-backed storage features.
 
 Each source node receives a namespace under `peers/NODE_ID/` with storage classes including `backups`, `replicas`, `docker-volumes`, `registry`, and `artifacts`. Shared read-only resources such as ISO media and Docker image-rootfs exports live under the backplane `shared/` tree.
 
@@ -278,7 +278,7 @@ sudo ./install.sh --profile virtualization-docker --port 5186
 
 Running `sudo ./install.sh` interactively presents the four profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`.
 
-Debian uses Nginx on `127.0.0.1:5186` by default. Alpine uses Lighttpd on the configured management port. Both web servers proxy `/backplane/storage` to a loopback-only websockify listener; NFS itself remains bound to loopback.
+Debian uses Nginx on `127.0.0.1:5186` by default. Alpine uses Lighttpd on the configured management port. Both web servers proxy `/backplane/storage` to a loopback-only GOST WebSocket listener; NFS itself remains bound to loopback.
 
 ### Containerized backup storage node
 
@@ -701,9 +701,9 @@ Each running graphical VM gets a VNC display bound to `127.0.0.1` by default, pl
 vm-console-info debian01
 ```
 
-On Alpine/lighttpd installs, the web console can open a same-origin noVNC tab. A single localhost-only `websockify` token broker listens on `127.0.0.1:6080`, and lighttpd permanently proxies `/console/ws/` to it with WebSocket upgrade enabled. `consolectl` creates short-lived token mappings from a VM console session to that VM's QEMU VNC listener, so multiple VM consoles can be active at the same time without restarting the web server.
+On Alpine/lighttpd installs, the web console opens a same-origin noVNC tab. `consolectl` creates a short-lived token, allocates a loopback-only GOST WebSocket forwarder for that VM's QEMU VNC listener, and writes an exact `/console/ws/TOKEN` Lighttpd route. Multiple VM consoles can be active at the same time without exposing VNC ports.
 
-The browser opens `/console.html`, imports the packaged noVNC RFB module from `/novnc/core/rfb.js`, and connects to `/console/ws/?token=...`. It heartbeats the session every 30 seconds.
+The browser opens `/console.html`, imports the packaged noVNC RFB module from `/novnc/core/rfb.js`, and connects to the session-specific `/console/ws/TOKEN` path. It heartbeats the session every 30 seconds.
 
 Stale sessions are groomed by `vmapi-console-gc`, an OpenRC service that runs `consolectl gc` periodically. Sessions also stop when the console tab closes cleanly.
 

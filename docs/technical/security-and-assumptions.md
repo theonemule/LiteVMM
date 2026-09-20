@@ -42,8 +42,8 @@ Peer routes refused with `403` (local administration only):
 - **Secrets on disk** are root-only (`0600`): identity key, node ID, peer
   records, TLS keys, registry state. Web server credential files are
   `root:<web group> 0640` and hold APR1 hashes.
-- **Pinned downloads.** Binaries not taken from the distribution (GOST,
-  websocat on Debian) are fetched over HTTPS at pinned versions and checked
+- **Pinned downloads.** GOST is fetched over HTTPS at a pinned version and checked
+  against the SHA-256 value in `install.sh`.
   against SHA-256 values in `install.sh`.
 
 ## Assumptions baked into the design

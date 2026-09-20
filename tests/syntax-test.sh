@@ -55,7 +55,7 @@ grep -Fq 'type=cifs' "$ROOT/www/app.js"
 grep -Fq 'LiteVMM peer NFS backplane volume' "$ROOT/www/app.js"
 grep -Fq '/backplane/storage' "$ROOT/lighttpd/vmapi.conf"
 grep -Fq 'VMAPI_BACKPLANE_NFS_BIND=127.0.0.1' "$ROOT/etc/vmapi.conf"
-grep -Fq 'websocat' "$ROOT/install.sh"
+grep -Fq 'install_gost' "$ROOT/install.sh"
 grep -Fq '1) backup                 Backup only' "$ROOT/install.sh"
 grep -Fq "Docker profile verification failed: docker is not installed" "$ROOT/install.sh"
 grep -Fq 'verify_profile_install' "$ROOT/install.sh"
@@ -63,8 +63,8 @@ grep -Fq 'verify_active_profile_config()' "$ROOT/install.sh"
 grep -Fq 'activate_requested_profile()' "$ROOT/install.sh"
 grep -Fq 'openssh-client-default' "$ROOT/install.sh"
 grep -Fq 'docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service' "$ROOT/install.sh"
-grep -Fq 'docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server websockify' "$ROOT/install.sh"
-grep -Fq 'docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websockify websocat' "$ROOT/install.sh"
+grep -Fq 'docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server' "$ROOT/install.sh"
+grep -Fq 'docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils' "$ROOT/install.sh"
 grep -Fq 'VMAPI_TLS_CSR_KEY_FILE=' "$ROOT/etc/vmapi.conf"
 grep -Fq '/admin/certificates/import' "$ROOT/www/app.js"
 grep -Fq "admin: {title:'Certificate management'" "$ROOT/www/app.js"
@@ -126,11 +126,7 @@ bash -n "$ROOT/tests/overlay-pair-curl.sh"
 [[ -s "$ROOT/www/index.html" && -s "$ROOT/www/app.css" && -s "$ROOT/www/vendor/bootstrap/bootstrap.min.css" && -s "$ROOT/www/vendor/bootstrap/bootstrap.bundle.min.js" ]]
 echo 'syntax: PASS'
 
-python3 - "$ROOT/install.sh" <<'PY'
-from pathlib import Path
-import sys
-s=Path(sys.argv[1]).read_text()
-a=s.index('install_packages\nactivate_requested_profile\nverify_active_profile_config\ndisable_native_nfs')
-b=s.index('if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then install_gost; fi')
-assert a < b
-PY
+install_packages_line=$(grep -n '^install_packages$' "$ROOT/install.sh" | tail -n1 | cut -d: -f1)
+install_gost_line=$(grep -n '^install_gost$' "$ROOT/install.sh" | tail -n1 | cut -d: -f1)
+[[ $install_packages_line =~ ^[0-9]+$ && $install_gost_line =~ ^[0-9]+$ ]]
+(( install_packages_line < install_gost_line ))

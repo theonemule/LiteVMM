@@ -24,7 +24,7 @@ Contents: [Host](#host-and-diagnostics) · [Files](#files) ·
 | GET | `/` | none | Service description and capabilities ([example](README.md#service-discovery-and-capabilities)) |
 | GET | `/metrics` | none | Host CPU, memory, disk, network and uptime snapshot |
 | GET | `/system` | none | OS, kernel, hardware, interfaces, routes, filesystems, block devices, component versions, service state |
-| GET | `/logs` | `source`: `all` (default), `system`, `overlay`, `docker`, `fcgi`, `ttyd`, `websockify`; `limit` (default `300` per source) | Array of log entries, newest first |
+| GET | `/logs` | `source`: `all` (default), `system`, `overlay`, `docker`, `fcgi`, `ttyd`, `gost`; `limit` (default `300` per source) | Array of log entries, newest first |
 | POST | `/host/terminal/session` | none | `201`; starts a host shell session for `/host/terminal/` (cap `host-terminal`) |
 | DELETE | `/host/terminal/session` | none | `{"stopped":true}` |
 
@@ -145,7 +145,7 @@ devices use `DISK_n_*`, `NIC_n_*` and `PCI_n_*` keys.
 | DELETE | `/vms/{name}/cloud-init` | none | Seed status (removed) |
 | GET | `/vms/{name}/console` | none | VNC details: bind, `vnc_port`, socket paths |
 | GET | `/vms/{name}/console/session` | none | Session info |
-| POST | `/vms/{name}/console/session` | none | `201`, token for `/console.html` / `/console/ws/?token=…` |
+| POST | `/vms/{name}/console/session` | none | `201`, token for `/console.html` / `/console/ws/TOKEN` |
 | PATCH | `/vms/{name}/console/session` | none | Heartbeat (send every 30 s) |
 | DELETE | `/vms/{name}/console/session` | none | `{"stopped":true}` |
 | GET | `/vms/{name}/metrics` | none | QEMU CPU, RSS vs configured RAM, per-disk allocation, NIC counters |
@@ -386,7 +386,7 @@ exists so that a person verifies the fingerprints.
 |---|---|---|
 | `/` | Console (static files) | User login |
 | `/files.html`, `/console.html` | File browser, VM console page | User login |
-| `/console/ws/?token=…` | noVNC WebSocket → `websockify` (Alpine) | User login + token |
+| `/console/ws/TOKEN` | noVNC WebSocket → session GOST forwarder (Alpine) | User login + token |
 | `/docker/terminal/`, `/host/terminal/` | `ttyd` terminals | User login + session |
 | `/peer-api/…` | Peer API | Pair credential |
 | `/backplane/storage` | Storage backplane WebSocket (NFSv4) | Pair credential |

@@ -94,10 +94,10 @@ install_packages() {
       apk update
       apk add --no-cache bash coreutils findutils gawk grep sed shadow util-linux iproute2 iputils curl openssl ca-certificates sudo tar gzip zip jq fcgiwrap spawn-fcgi lighttpd lighttpd-openrc lighttpd-mod_auth apache2-utils openssh-client-default
       case $PROFILE in
-        virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso nfs-utils websocat;;
-        docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils websockify websocat;;
-        virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc websockify ttyd xorriso docker docker-openrc docker-cli-compose nfs-utils websocat;;
-        backup) apk add --no-cache iproute2 nfs-utils websockify;;
+        virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc ttyd xorriso nfs-utils;;
+        docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils;;
+        virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc ttyd xorriso docker docker-openrc docker-cli-compose nfs-utils;;
+        backup) apk add --no-cache iproute2 nfs-utils;;
       esac
       apk add --no-cache certbot
       ;;
@@ -106,10 +106,10 @@ install_packages() {
       apt-get update
       apt-get install -y --no-install-recommends bash coreutils findutils gawk grep sed passwd util-linux iproute2 iputils-ping curl openssl ca-certificates sudo tar gzip zip jq nginx fcgiwrap libnginx-mod-http-auth-pam openssh-client apache2-utils cron
       case $PROFILE in
-        virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso nfs-common nfs-kernel-server websockify;;
-        docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server websockify;;
-        virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso nfs-common nfs-kernel-server websockify;;
-        backup) apt-get install -y --no-install-recommends iproute2 nfs-common nfs-kernel-server websockify;;
+        virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso nfs-common nfs-kernel-server;;
+        docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server;;
+        virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso nfs-common nfs-kernel-server;;
+        backup) apt-get install -y --no-install-recommends iproute2 nfs-common nfs-kernel-server;;
       esac
       apt-get install -y --no-install-recommends certbot
       ;;
@@ -117,20 +117,6 @@ install_packages() {
   update-ca-certificates 2>/dev/null || true
 }
 
-install_websocat() {
-  command -v websocat >/dev/null 2>&1 && return
-  local asset sha work
-  case $(uname -m) in
-    x86_64|amd64) asset=websocat.x86_64-unknown-linux-musl; sha=66f8dd3a0394761556339117f8bb5123bddefd44e087af2a72ec22b0bd08d514 ;;
-    aarch64|arm64) asset=websocat.aarch64-unknown-linux-musl; sha=711a69576a2ff473fb01a90ffafb571c2ed019e55479d7ae71b12c2eadeb7011 ;;
-    *) die "Unsupported CPU for bundled Websocat v1.14.1: $(uname -m)" ;;
-  esac
-  work=$(mktemp -d); trap 'rm -rf -- "$work"' RETURN
-  curl --fail --location --proto '=https' --tlsv1.2 --retry 3     -o "$work/websocat" "https://github.com/vi/websocat/releases/download/v1.14.1/$asset"
-  echo "$sha  $work/websocat" | sha256sum -c -
-  install -m 0755 "$work/websocat" /usr/local/bin/websocat
-  trap - RETURN; rm -rf -- "$work"
-}
 
 install_gost() {
   local arch asset sha archive work binary
@@ -299,10 +285,11 @@ write_sudoers() {
 configure_alpine() {
   local novnc_root=/usr/share/vmapi/empty p hash
   install -d -m 0755 "$novnc_root"
+  if [[ -e /etc/init.d/websockify-vmapi ]]; then rc-service websockify-vmapi stop >/dev/null 2>&1 || true; rc-update del websockify-vmapi default >/dev/null 2>&1 || true; rm -f /etc/init.d/websockify-vmapi; fi
+  rm -f /run/vmapi/console.tokens
   install -m 0755 "$BASE/openrc/fcgiwrap-vmapi" /etc/init.d/fcgiwrap-vmapi
   install -m 0755 "$BASE/openrc/vmapi-autostart" /etc/init.d/vmapi-autostart
   install -m 0755 "$BASE/openrc/vmapi-console-gc" /etc/init.d/vmapi-console-gc
-  install -m 0755 "$BASE/openrc/websockify-vmapi" /etc/init.d/websockify-vmapi
   install -m 0755 "$BASE/openrc/ttyd-vmapi" /etc/init.d/ttyd-vmapi
   install -m 0755 "$BASE/openrc/ttyd-host-vmapi" /etc/init.d/ttyd-host-vmapi
   install -m 0755 "$BASE/openrc/vmapi-overlay" /etc/init.d/vmapi-overlay
@@ -310,10 +297,9 @@ configure_alpine() {
   install -m 0755 "$BASE/openrc/vmapi-replication" /etc/init.d/vmapi-replication
   install -m 0755 "$BASE/openrc/vmapi-backplane" /etc/init.d/vmapi-backplane
   install -m 0755 "$BASE/openrc/vmapi-backplane-server" /etc/init.d/vmapi-backplane-server
-  sed -i 's/\r$//' /etc/init.d/fcgiwrap-vmapi /etc/init.d/vmapi-autostart /etc/init.d/vmapi-console-gc /etc/init.d/websockify-vmapi /etc/init.d/ttyd-vmapi /etc/init.d/ttyd-host-vmapi /etc/init.d/vmapi-overlay /etc/init.d/vmapi-network /etc/init.d/vmapi-replication /etc/init.d/vmapi-backplane /etc/init.d/vmapi-backplane-server
+  sed -i 's/\r$//' /etc/init.d/fcgiwrap-vmapi /etc/init.d/vmapi-autostart /etc/init.d/vmapi-console-gc /etc/init.d/ttyd-vmapi /etc/init.d/ttyd-host-vmapi /etc/init.d/vmapi-overlay /etc/init.d/vmapi-network /etc/init.d/vmapi-replication /etc/init.d/vmapi-backplane /etc/init.d/vmapi-backplane-server
   install -d -m 0755 /etc/lighttpd/conf.d /run/vmapi/consoles /run/vmapi/docker-exec
   chown vmapi:vmapi /run/vmapi /run/vmapi/consoles /run/vmapi/docker-exec
-  : > /run/vmapi/console.tokens; chmod 0640 /run/vmapi/console.tokens; chown vmapi:vmapi /run/vmapi/console.tokens
   if [[ -n ${VMAPI_HTTP_USER:-} || -n ${VMAPI_HTTP_PASSWORD:-} ]]; then
     [[ -n ${VMAPI_HTTP_USER:-} && -n ${VMAPI_HTTP_PASSWORD:-} ]] || die 'Set both VMAPI_HTTP_USER and VMAPI_HTTP_PASSWORD together'
     hash=$(openssl passwd -apr1 "$VMAPI_HTTP_PASSWORD"); printf '%s:%s\n' "$VMAPI_HTTP_USER" "$hash" > /etc/lighttpd/vmapi.htpasswd
@@ -334,15 +320,15 @@ configure_alpine() {
   sed -i -E 's|^[#[:space:]]*server\.document-root[[:space:]]*=.*|server.document-root = "/usr/share/vmapi/www"|' /etc/lighttpd/lighttpd.conf
   sed -i -E "s|^[#[:space:]]*server\\.port[[:space:]]*=.*|server.port = $HTTP_PORT|" /etc/lighttpd/lighttpd.conf
   grep -Eq '^[[:space:]]*include_shell[[:space:]]+"cat /etc/lighttpd/conf.d/\*\.conf"' /etc/lighttpd/lighttpd.conf || printf '\ninclude_shell "cat /etc/lighttpd/conf.d/*.conf"\n' >> /etc/lighttpd/lighttpd.conf
-  for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update del "$svc" default >/dev/null 2>&1 || true; done
-  for svc in websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-service "$svc" stop >/dev/null 2>&1 || true; done
+  for svc in vmapi-network vmapi-autostart ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update del "$svc" default >/dev/null 2>&1 || true; done
+  for svc in ttyd-vmapi ttyd-host-vmapi vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-service "$svc" stop >/dev/null 2>&1 || true; done
   for svc in fcgiwrap-vmapi lighttpd crond; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
   rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1 || true
   rc-service fcgiwrap-vmapi restart
   case $PROFILE in
     virtualization)
-      for svc in vmapi-backplane-server vmapi-backplane vmapi-network vmapi-autostart websockify-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
-      rc-service vmapi-backplane-server restart; rc-service vmapi-backplane restart; rc-service websockify-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
+      for svc in vmapi-backplane-server vmapi-backplane vmapi-network vmapi-autostart ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+      rc-service vmapi-backplane-server restart; rc-service vmapi-backplane restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
     docker)
       rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true
       rc-service vmapi-backplane-server start || true
@@ -357,8 +343,8 @@ configure_alpine() {
       rc-update add vmapi-backplane default >/dev/null 2>&1 || true
       rc-service vmapi-backplane start || true
       rc-update add docker default >/dev/null 2>&1 || true; rc-service docker restart || rc-service docker start || true
-      for svc in vmapi-network vmapi-autostart websockify-vmapi ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
-      rc-service websockify-vmapi restart; rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
+      for svc in vmapi-network vmapi-autostart ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
+      rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
     backup) rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true; rc-service vmapi-backplane-server restart || true;;
   esac
 }
@@ -503,8 +489,7 @@ case $PROFILE in
 esac
 [[ -z $ADMIN_USER ]] || usermod -aG vmapi-admin "$ADMIN_USER"
 if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then ensure_tun; fi
-if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then install_gost; fi
-if [[ $PLATFORM == debian && ( $PROFILE == virtualization || $PROFILE == docker || $PROFILE == virtualization-docker ) ]]; then install_websocat; fi
+install_gost
 install_common_files
 write_sudoers
 configure_docker_runtime

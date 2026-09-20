@@ -6,8 +6,7 @@ LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 source "$LIB"
 
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
-WEBSOCAT=${VMAPI_WEBSOCAT:-$(command -v websocat 2>/dev/null || printf %s /usr/local/bin/websocat)}
-WEBSOCKIFY=${VMAPI_WEBSOCKIFY:-/usr/bin/websockify}
+GOST=${VMAPI_GOST:-$(command -v gost 2>/dev/null || printf %s /usr/local/bin/gost)}
 MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
 UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
 EXPORTFS=${VMAPI_EXPORTFS:-$(command -v exportfs 2>/dev/null || printf %s /usr/sbin/exportfs)}
@@ -47,8 +46,8 @@ valid_name(){ [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || die "Invalid
 valid_port(){ validate_positive_int "$1"; ((10#$1 <= 65535)) || die 'Invalid port'; }
 valid_ipv4_bind(){ [[ ${1:-} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die 'Backplane NFS bind must be an IPv4 address'; }
 state_file(){ valid_peer "$1"; printf '%s/%s.conf\n' "$STATE_ROOT" "${1,,}"; }
-pid_file(){ valid_peer "$1"; printf '%s/%s.websocat.pid\n' "$RUN_ROOT" "${1,,}"; }
-log_file(){ valid_peer "$1"; printf '%s/%s.websocat.log\n' "$RUN_ROOT" "${1,,}"; }
+pid_file(){ valid_peer "$1"; printf '%s/%s.gost.pid\n' "$RUN_ROOT" "${1,,}"; }
+log_file(){ valid_peer "$1"; printf '%s/%s.gost.log\n' "$RUN_ROOT" "${1,,}"; }
 mountpoint(){ valid_peer "$1"; printf '%s/%s\n' "$MOUNT_ROOT" "${1,,}"; }
 
 ensure_dirs(){
@@ -140,19 +139,39 @@ ws_url(){
 }
 
 start_tunnel(){
-  local peer=$1 port=$2 profile user pass auth url pf lf
-  need_cmd "$WEBSOCAT"; need_cmd "$SS"
-  profile=$(peer_profile "$peer")
-  user=$(json_field "$profile" username); pass=$(json_field "$profile" password)
+  local peer=$1 port=$2 profile endpoint user pass header scheme host remote_port pf lf cfg tls_block=''
+  need_cmd "$GOST"; need_cmd "$SS"
+  profile=$(peer_profile "$peer"); endpoint=$(json_field "$profile" endpoint); user=$(json_field "$profile" username); pass=$(json_field "$profile" password)
   [[ -n $user && -n $pass ]] || die 'Peer backplane credentials are unavailable'
-  auth="$user:$pass"
-  url=$(ws_url "$peer"); pf=$(pid_file "$peer"); lf=$(log_file "$peer")
-  kill_pidfile "$pf"
-  port_in_use "$port" && die "Backplane loopback port is already in use: $port"
-  : > "$lf"; chmod 0600 "$lf"
-  WEBSOCAT_BASIC_AUTH="$auth" "$WEBSOCAT" --binary --ping-interval 20 --ping-timeout 60 "tcp-l:127.0.0.1:$port" "$url" </dev/null >>"$lf" 2>&1 &
-  echo $! > "$pf"
-  wait_port "$port" && pid_alive "$pf" || { tail -40 "$lf" >&2 2>/dev/null || true; die 'Peer backplane WebSocket tunnel failed to start'; }
+  [[ $endpoint =~ ^(wss?)://([A-Za-z0-9.-]+)(:([0-9]{1,5}))?(/.*)?$ ]] || die 'Peer has no WebSocket-capable endpoint'
+  scheme=${BASH_REMATCH[1]}; host=${BASH_REMATCH[2]}; remote_port=${BASH_REMATCH[4]}; [[ -n $remote_port ]] || { [[ $scheme == wss ]] && remote_port=443 || remote_port=80; }
+  header=$(printf '%s:%s' "$user" "$pass"|base64|tr -d '\n'); [[ $scheme != wss ]] || tls_block="        tls: {secure: true, serverName: \"$host\"}"
+  pf=$(pid_file "$peer"); lf=$(log_file "$peer"); cfg="$RUN_ROOT/${peer,,}.gost.yaml"; kill_pidfile "$pf"; rm -f "$cfg"; port_in_use "$port" && die "Backplane loopback port is already in use: $port"
+  cat >"$cfg" <<YAML
+services:
+- name: storage-client
+  addr: "127.0.0.1:$port"
+  handler: {type: tcp, chain: storage-chain}
+  listener: {type: tcp}
+chains:
+- name: storage-chain
+  hops:
+  - name: peer
+    nodes:
+    - name: peer
+      addr: "$host:$remote_port"
+      connector: {type: forward}
+      dialer:
+        type: $scheme
+$tls_block
+        metadata:
+          path: "/backplane/storage"
+          keepalive: true
+          ttl: 20s
+          header: {Authorization: "Basic $header"}
+YAML
+  chmod 0600 "$cfg"; : >"$lf"; chmod 0600 "$lf"; setsid "$GOST" -C "$cfg" </dev/null >>"$lf" 2>&1 & echo $! >"$pf"
+  wait_port "$port" && pid_alive "$pf" || { tail -40 "$lf" >&2 2>/dev/null || true; die 'Peer backplane GOST tunnel failed to start'; }
 }
 
 repair_mount_traversal(){
@@ -360,7 +379,8 @@ server_verify(){
 }
 
 server_cleanup(){
-  [[ -r "$RUN_ROOT/websockify.pid" ]] && kill_pidfile "$RUN_ROOT/websockify.pid" || true
+  [[ -r "$RUN_ROOT/gost-server.pid" ]] && kill_pidfile "$RUN_ROOT/gost-server.pid" || true
+  rm -f -- "$RUN_ROOT/gost-server.yaml"
   [[ -r "$RUN_ROOT/exportd.pid" ]] && kill_pidfile "$RUN_ROOT/exportd.pid" || true
   "$RPC_NFSD" 0 >/dev/null 2>&1 || true
   "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
@@ -371,7 +391,7 @@ server_daemon(){
   [[ $SERVER_ENABLED == true ]] || die 'Storage backplane server is disabled'
   ensure_dirs
   publish_shared_storage
-  need_cmd "$EXPORTFS"; need_cmd "$RPC_NFSD"; need_cmd "$WEBSOCKIFY"; need_cmd "$SS"
+  need_cmd "$EXPORTFS"; need_cmd "$RPC_NFSD"; need_cmd "$GOST"; need_cmd "$SS"
   local -a export_daemon
   if [[ -x $NFS_EXPORTD ]]; then export_daemon=("$NFS_EXPORTD" -F)
   elif [[ -x $RPC_MOUNTD ]]; then export_daemon=("$RPC_MOUNTD" -F -N 2 -N 3 -u)
@@ -390,13 +410,22 @@ server_daemon(){
   "$EXPORTFS" -i -o rw,sync,no_subtree_check,no_root_squash,insecure,crossmnt,fsid=0 "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT"
   "${export_daemon[@]}" </dev/null >>"$RUN_ROOT/exportd.log" 2>&1 & echo $! > "$RUN_ROOT/exportd.pid"
   "$RPC_NFSD" --host "$NFS_BIND" --port "$NFS_PORT" --no-udp --no-nfs-version 3 --no-nfs-version 4.0 --nfs-version 4.1 --nfs-version 4.2 "$NFS_THREADS"
-  "$WEBSOCKIFY" "$WS_BIND:$WS_PORT" "$NFS_BIND:$NFS_PORT" </dev/null >>"$RUN_ROOT/websockify.log" 2>&1 & echo $! > "$RUN_ROOT/websockify.pid"
+  cat > "$RUN_ROOT/gost-server.yaml" <<YAML
+services:
+- name: storage-server
+  addr: "$WS_BIND:$WS_PORT"
+  handler: {type: forward}
+  listener: {type: ws, metadata: {path: "/backplane/storage"}}
+  forwarder: {nodes: [{name: nfs, addr: "$NFS_BIND:$NFS_PORT"}]}
+YAML
+  chmod 0600 "$RUN_ROOT/gost-server.yaml"
+  setsid "$GOST" -C "$RUN_ROOT/gost-server.yaml" </dev/null >>"$RUN_ROOT/gost-server.log" 2>&1 & echo $! > "$RUN_ROOT/gost-server.pid"
   trap 'server_cleanup; exit 0' TERM INT EXIT
   for _ in {1..100}; do server_verify >/dev/null 2>&1 && break; sleep .05; done
   server_verify >/dev/null || die 'Storage backplane did not bind to the configured loopback endpoints'
   while :; do
     pid_alive "$RUN_ROOT/exportd.pid" || die 'NFSv4 export daemon exited'
-    pid_alive "$RUN_ROOT/websockify.pid" || die 'Backplane websockify process exited'
+    pid_alive "$RUN_ROOT/gost-server.pid" || die 'Backplane GOST WebSocket bridge exited'
     sleep "$DAEMON_INTERVAL" & wait $!
   done
 }

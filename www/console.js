@@ -57,7 +57,6 @@
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
       const wsPath = path.startsWith('/') ? path.slice(1) : path;
       const wsUrl = new URL(`${scheme}://${location.host}/${wsPath}`);
-      wsUrl.searchParams.set('token', token);
       rfb = new RFB(screen, wsUrl.href, { credentials: {} });
       rfb.scaleViewport = true;
       rfb.resizeSession = false;

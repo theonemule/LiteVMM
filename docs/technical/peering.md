@@ -147,7 +147,7 @@ Other tools derive their connection details from the peer record:
 
 | Command | Returns | Used by |
 |---|---|---|
-| `peerctl transport-profile ID` | `ws(s)://host:port` + credential | Storage backplane (`websocat`) |
+| `peerctl transport-profile ID` | `ws(s)://host:port` + credential | Storage backplane (GOST) |
 | `peerctl overlay-profile ID` | `ws(s)://host:port/overlay` + credential | Overlays (GOST) |
 
 The scheme follows the peer URL: an `https://` endpoint yields `wss://` with

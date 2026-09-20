@@ -120,8 +120,8 @@ fails loudly instead of running VMs slowly.
 ![noVNC console](../images/vm-console.png)
 
 The console opens in a new tab and shows the VM's VNC screen. Each session gets
-a short-lived token. A single loopback-only `websockify` broker maps the token
-to that VM's VNC port, and the web server proxies it at `/console/ws/`, so
+a short-lived token. A loopback-only GOST forwarder maps the tokenized WebSocket route
+to that VM's VNC port, and the web server proxies the exact `/console/ws/TOKEN` path, so
 several consoles can be open at once without opening ports. The tab sends a
 heartbeat every 30 seconds; stale sessions are cleaned up by `vmapi-console-gc`.
 

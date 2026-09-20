@@ -16,11 +16,11 @@ flowchart LR
     subgraph Client host
       A["QEMU / Docker / vmbackupctl"] --> M["NFS mount<br/>/var/lib/vmapi/peer-storage/NODE_ID"]
       M --> N["kernel NFS client<br/>127.0.0.1:dynamic port"]
-      N --> WC["websocat<br/>tcp-l → ws(s)://peer/backplane/storage"]
+      N --> WC["GOST<br/>tcp-l → ws(s)://peer/backplane/storage"]
     end
     WC -->|"HTTP(S) management port<br/>pair credential"| WS
     subgraph Storage host
-      WS["lighttpd / nginx<br/>/backplane/storage"] --> WY["websockify<br/>127.0.0.1:6091"]
+      WS["lighttpd / nginx<br/>/backplane/storage"] --> WY["GOST<br/>127.0.0.1:6091"]
       WY --> NFSD["kernel nfsd<br/>127.0.0.1:2049, NFSv4.1/4.2, TCP only"]
       NFSD --> FS["/var/lib/vmapi/backplane"]
     end
@@ -39,7 +39,7 @@ profile). `backplanectl server-daemon`:
    where it is missing (Alpine).
 4. Starts `rpc.nfsd` on `127.0.0.1:2049`, NFS **4.1 and 4.2 only**, no UDP, no
    NFSv3 (so no portmapper or lock daemons), with 8 threads.
-5. Starts `websockify 127.0.0.1:6091 127.0.0.1:2049`.
+5. Starts a loopback GOST `forward` + `ws` service on `127.0.0.1:6091` targeting `127.0.0.1:2049`.
 6. Verifies the real listeners with `ss`, and every 10 s checks that the helper
    processes are alive. It exits (and is restarted by the supervisor) if not.
 
@@ -63,9 +63,7 @@ Connecting to a peer (`backplanectl connect NODE_ID`):
 
 1. Picks a free loopback port in `32000–38999` (remembered in
    `/var/lib/vmapi/backplane-peers/NODE_ID.conf`).
-2. Starts `websocat --binary --ping-interval 20 --ping-timeout 60
-   tcp-l:127.0.0.1:PORT wss://PEER/backplane/storage`, with the pair credential
-   passed in `WEBSOCAT_BASIC_AUTH`, never on the command line.
+2. Starts a GOST loopback TCP listener chained through `ws` or `wss` to the peer `/backplane/storage` endpoint. The pair credential is sent as an HTTP Basic `Authorization` header from the generated root-only GOST configuration.
 3. Mounts it:
 
    ```
@@ -144,7 +142,7 @@ host's namespace on a peer; `shared-path` resolves `shared/` items.
   WebSocket proxy CPU cost on both ends. It suits backups, replication and
   modest disk I/O; it is not a SAN.
 - `sync` exports favour safety over write latency.
-- Idle cost is near zero: a sleeping `websocat` per peer and `nfsd` threads.
+- Idle cost is near zero: a sleeping GOST bridge per peer and `nfsd` threads.
 
 ## Security properties and assumptions
 

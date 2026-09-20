@@ -1,26 +1,30 @@
 # Consoles and terminals
 
-Interactive sessions reuse the management port. Each is a loopback-only
-daemon behind the web server, unlocked by a short-lived token that the API
-issues to an authenticated user.
+Interactive sessions reuse the management port. Each is loopback-only behind
+the web server and is created only after an authenticated API request.
 
 ## VM console (noVNC)
 
 | Piece | Detail |
 |---|---|
 | QEMU | `-vnc 127.0.0.1:N` per VM (port `5900+N`), plus QMP and serial Unix sockets in `vms/NAME/runtime/` |
-| Broker | One `websockify` on `127.0.0.1:6080` with the `TokenFile` plugin reading `/run/vmapi/console.tokens` |
-| Web route | `/console/ws/` → `127.0.0.1:6080` (lighttpd only) |
+| Bridge | One short-lived GOST `forward` + `ws` service per active console, bound to an allocated loopback port |
+| Web route | Exact `/console/ws/TOKEN` route → that session's loopback GOST port (lighttpd only) |
 | Client | `/console.html` loads the packaged noVNC `RFB` module from `/novnc/` |
 
-Flow: `POST /api/vms/NAME/console/session` → `consolectl start` writes a random
-token mapping to that VM's VNC host and port → the page connects to
-`/console/ws/?token=…` → websockify looks up the token and bridges to QEMU's VNC.
+Flow: `POST /api/vms/NAME/console/session` → `consolectl start` creates a
+random token and starts a GOST WebSocket-to-TCP forwarder targeting that VM's
+VNC host and port → `consolectl` generates the exact Lighttpd token route →
+the page connects to `/console/ws/TOKEN` → GOST emits the WebSocket payload
+as ordinary TCP to QEMU VNC.
+
+The GOST listener, QEMU VNC listener and generated proxy target are all
+loopback-only. The normal console authentication still protects the WebSocket
+route at Lighttpd.
 
 Sessions expire after **120 s** without a heartbeat. The page sends
 `PATCH …/console/session` every 30 s and `DELETE` when closed cleanly;
-`vmapi-console-gc` prunes stale tokens. Because one broker serves every token,
-any number of consoles can be open without web server changes.
+`vmapi-console-gc` stops stale GOST forwarders and removes their routes.
 
 ## Terminals (ttyd)
 
