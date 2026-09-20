@@ -1,9 +1,10 @@
 # LiteVMM 0.12
 
-> **Documentation:** see [`docs/`](docs/README.md): the
-> [user guide](docs/user-guide/README.md) (console, page by page), the
-> [API reference](docs/api/README.md), and the
-> [technical guide](docs/technical/README.md) (daemons, peering, storage
+> **Documentation** lives in its own repository,
+> [theonemule/LiteVMM-Docs](https://github.com/theonemule/LiteVMM-Docs): the
+> [user guide](https://github.com/theonemule/LiteVMM-Docs/blob/main/user-guide/README.md) (console, page by page), the
+> [API reference](https://github.com/theonemule/LiteVMM-Docs/blob/main/api/README.md), and the
+> [technical guide](https://github.com/theonemule/LiteVMM-Docs/blob/main/technical/README.md) (daemons, peering, storage
 > backplane, overlays, replication, security assumptions).
 
 LiteVMM is a deliberately minimalist infrastructure API and console with selectable backup-only, VM + backup, Docker + backup, or VM + Docker + backup profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses the Linux NFSv4 client/server stack carried through the existing LiteVMM WebSocket endpoint.
