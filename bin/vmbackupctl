@@ -16,7 +16,6 @@ LOG_ROOT=${VMAPI_BACKUP_LOG_ROOT:-/var/log/vmapi/backups}
 JOB_ROOT=${VMAPI_BACKUP_JOB_ROOT:-/var/lib/vmapi/backup-jobs}
 VMCTL=${VMCTL:-/usr/local/bin/vmctl}
 SELF=${VMAPI_BACKUPCTL:-/usr/local/bin/vmbackupctl}
-PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
 BACKPLANECTL=${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}
 BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
 REPLICATIONCTL=${VMAPI_REPLICATIONCTL:-/usr/local/bin/replicationctl}
@@ -60,7 +59,6 @@ backup_progress() {
   mv -f -- "$tmp" "$BACKUP_PROGRESS_FILE"
 }
 backup_dir() { local root=${2:-$BACKUP_ROOT}; validate_vm_name "$1"; valid_destination "$root"; printf '%s/%s\n' "$root" "$1"; }
-archive_path() { printf '%s/%s\n' "$(backup_dir "$1")" "$2"; }
 require_stopped_vm() { require_vm "$1"; [[ $($VMCTL status "$1") == stopped ]] || die "VM must be stopped for a consistent backup; use --live for QMP disk copies: $1"; }
 # Send one QMP command and print only its reply. QEMU interleaves asynchronous
 # events (JOB_STATUS_CHANGE, BLOCK_JOB_*) with command replies, so the reply is

@@ -131,13 +131,6 @@ free_port(){
 wait_port(){ local p=$1; for _ in {1..100}; do port_in_use "$p" && return 0; sleep .05; done; return 1; }
 is_mounted(){ local mp=$1; awk -v p="$mp" '$2==p && $3 ~ /^nfs/ {found=1} END{exit !found}' /proc/mounts; }
 
-ws_url(){
-  local peer=$1 profile endpoint
-  profile=$(peer_profile "$peer"); endpoint=$(json_field "$profile" endpoint)
-  [[ $endpoint =~ ^wss?:// ]] || die 'Peer has no WebSocket-capable endpoint'
-  printf '%s/backplane/storage\n' "${endpoint%/}"
-}
-
 start_tunnel(){
   local peer=$1 port=$2 profile endpoint user pass header scheme host remote_port pf lf cfg tls_block=''
   need_cmd "$GOST"; need_cmd "$SS"

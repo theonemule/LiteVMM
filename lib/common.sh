@@ -12,8 +12,6 @@ VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
 VMAPI_BACKPLANE_SERVER=${VMAPI_BACKPLANE_SERVER:-false}
 DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
 
-valid_vmapi_profile() { [[ $1 == virtualization || $1 == docker || $1 == virtualization-docker || $1 == backup ]]; }
-
 vmapi_qemu_available() {
   [[ -x "$QEMU_BIN" ]]
 }
@@ -60,8 +58,6 @@ vmapi_has_capability() {
 VM_ROOT=${VM_ROOT:-/var/lib/vmapi/vms}
 DISK_ROOT=${DISK_ROOT:-/var/lib/vmapi/disks}
 BACKPLANE_ROOT=${VMAPI_BACKPLANE_ROOT:-/var/lib/vmapi/backplane}
-BACKPLANE_MOUNT_ROOT=${VMAPI_BACKPLANE_MOUNT_ROOT:-/var/lib/vmapi/peer-storage}
-NODE_ID_FILE=${VMAPI_NODE_ID_FILE:-/etc/vmapi/node-id}
 BACKPLANECTL=${BACKPLANECTL:-${VMAPI_BACKPLANECTL:-/usr/local/bin/backplanectl}}
 PEERCTL=${PEERCTL:-${VMAPI_PEERCTL:-/usr/local/bin/peerctl}}
 # IMAGE_ROOT was the original public setting.  Keep it as a fallback so an
@@ -106,18 +102,6 @@ vm_conf() { printf '%s/vm.conf\n' "$(vm_dir "$1")"; }
 disk_dir() { validate_vm_name "$1"; printf '%s/%s\n' "$DISK_ROOT" "$1"; }
 disk_file() { validate_vm_name "$1"; validate_filename "$2"; printf '%s/%s\n' "$(disk_dir "$1")" "$2"; }
 valid_peer_node_id() { [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die "Invalid peer node id: ${1:-}"; }
-vmapi_node_id() {
-  local id=''
-  if [[ -r $NODE_ID_FILE ]]; then
-    id=$(cat "$NODE_ID_FILE" 2>/dev/null || true)
-  elif command -v sudo >/dev/null 2>&1 && sudo -n "$PEERCTL" node-id >/dev/null 2>&1; then
-    id=$(sudo -n "$PEERCTL" node-id)
-  elif [[ -x $PEERCTL ]]; then
-    id=$("$PEERCTL" node-id 2>/dev/null || true)
-  fi
-  valid_peer_node_id "$id"
-  printf '%s\n' "${id,,}"
-}
 peer_storage_dir() {
   local peer=${1:?peer required} kind=${2:?storage class required} name=${3:-} out
   valid_peer_node_id "$peer"; peer=${peer,,}
