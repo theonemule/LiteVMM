@@ -708,6 +708,41 @@ The browser opens `/console.html`, imports the packaged noVNC RFB module from `/
 
 Stale sessions are groomed by `vmapi-console-gc`, an OpenRC service that runs `consolectl gc` periodically. Sessions also stop when the console tab closes cleanly.
 
+## API command-line client
+
+The installed `vmapi` command is a generic client for the HTTP management API. It does not duplicate the API as a second implementation. Every command is translated into an authenticated request to `/api`, so new API routes are usable without adding a new CLI subcommand.
+
+```bash
+export VMAPI_URL=http://127.0.0.1:5186
+export VMAPI_USER=alice
+
+vmapi get system
+vmapi get vms
+vmapi post docker/images/pull image=alpine:latest
+vmapi post docker/containers name=web image=nginx:latest publish_0=8080:80
+vmapi patch docker/containers/web field=memory value=2g
+vmapi delete docker/images image=old:test force=true
+```
+
+If `VMAPI_PASSWORD` is not set, the client prompts for it without echoing it. `--password-stdin` is available for automation. Credentials are passed to `curl` through a temporary mode-0600 config file rather than on the curl process command line.
+
+Raw upload and download endpoints use the same client:
+
+```bash
+vmapi put images/debian.iso --file ./debian.iso --content-type application/octet-stream
+vmapi put compose/projects/demo --file ./compose.yaml --content-type application/yaml
+vmapi get files/content --query path=/tmp/report.txt --output report.txt
+```
+
+A paired host can be addressed through the existing authenticated peer proxy without exposing or copying its peer credential:
+
+```bash
+vmapi --peer PEER_NODE_ID get docker/images
+vmapi --peer PEER_NODE_ID post docker/images/expose image=alpine:latest
+```
+
+`--peer` uses LiteVMM's paired-host proxy, so the remote host's normal peer-API security restrictions still apply. Use `vmapi --help` for URL, TLS, query/form, raw-body, streaming, and output options.
+
 ## HTTP CGI API
 
 The HTTP server passes `/api/` to one Bash CGI router through the dedicated fcgiwrap service. Forms use `application/x-www-form-urlencoded`. VM installation-media upload uses the raw request body.

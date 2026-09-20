@@ -12,11 +12,12 @@ grep -Fq 'GOST_VERSION=3.2.6' "$ROOT/install.sh"
 grep -Fq 'PROFILE=${VMAPI_INSTALL_PROFILE:-}' "$ROOT/install.sh"
 grep -Fq 'HTTP_PORT=${VMAPI_HTTP_PORT:-5186}' "$ROOT/install.sh"
 grep -Fq 'FROM alpine:3.24' "$ROOT/Dockerfile"
+grep -Fq 'COPY bin/vmapi bin/peerctl' "$ROOT/Dockerfile"
 grep -Fq 'VMAPI_PROFILE=backup' "$ROOT/docker/backup/vmapi.conf"
 grep -Fq 'lighttpd -tt -f /etc/lighttpd/lighttpd.conf' "$ROOT/install.sh"
 # Lighttpd changes made from inside an API request must be applied gracefully
 # after that request is answered (see tests/web-reload-test.sh).
-grep -Fq 'for tool in vmapi-web-reload ' "$ROOT/install.sh"
+grep -Fq 'for tool in vmapi vmapi-web-reload ' "$ROOT/install.sh"
 grep -Fq 'web_reload || die' "$ROOT/bin/overlayctl"
 grep -Fq 'vmapi-network.service' "$ROOT/install.sh"
 grep -Fq 'report_nested_hyperv_requirement' "$ROOT/install.sh"
@@ -43,6 +44,7 @@ grep -Fq 'cloud-init-set' "$ROOT/bin/vmctl"
 grep -Fq 'vmapi-replication.service' "$ROOT/install.sh"
 grep -Fq 'replication-source' "$ROOT/cgi/api.cgi"
 grep -Fq 'docker-federationctl' "$ROOT/install.sh"
+bash "$ROOT/tests/vmapi-cli-test.sh"
 grep -Fq 'docker-rootfsctl' "$ROOT/install.sh"
 grep -Fq 'litevmm-runc' "$ROOT/install.sh"
 grep -Fq 'VMAPI_DOCKER_REMOTE_RUNTIME=litevmm-remote' "$ROOT/etc/vmapi.conf"
@@ -83,7 +85,7 @@ grep -Fq '"$METRICSCTL" system' "$ROOT/cgi/api.cgi"
 grep -Fq 'BRIDGE_CONFIG_ROOT' "$ROOT/bin/netctl"
 grep -Fq 'restore)' "$ROOT/bin/netctl"
 grep -Fq 'run_cmd vm_delete_cmd "$name"' "$ROOT/cgi/api.cgi"
-find "$ROOT" -type f \( -name '*.sh' -o -name 'vmctl' -o -name 'imagectl' -o -name 'netctl' -o -name 'overlayctl' -o -name 'dockerctl' -o -name 'dockerexecctl' -o -name 'docker-imagectl' -o -name 'docker-netctl' -o -name 'docker-volumectl' -o -name 'docker-federationctl' -o -name 'docker-rootfsctl' -o -name 'litevmm-docker' -o -name 'litevmm-runc' -o -name 'replicationctl' -o -name 'backplanectl' -o -name 'registryctl' -o -name 'metricsctl' -o -name 'certctl' -o -name 'consolectl' -o -name 'vmapi-console-gc' -o -name '*.cgi' \) -print0 |
+find "$ROOT" -type f \( -name '*.sh' -o -name 'vmapi' -o -name 'vmctl' -o -name 'imagectl' -o -name 'netctl' -o -name 'overlayctl' -o -name 'dockerctl' -o -name 'dockerexecctl' -o -name 'docker-imagectl' -o -name 'docker-netctl' -o -name 'docker-volumectl' -o -name 'docker-federationctl' -o -name 'docker-rootfsctl' -o -name 'litevmm-docker' -o -name 'litevmm-runc' -o -name 'replicationctl' -o -name 'backplanectl' -o -name 'registryctl' -o -name 'metricsctl' -o -name 'certctl' -o -name 'consolectl' -o -name 'vmapi-console-gc' -o -name '*.cgi' \) -print0 |
   while IFS= read -r -d '' f; do bash -n "$f"; done
 if command -v node >/dev/null 2>&1; then node --check "$ROOT/www/app.js"; fi
 grep -Fq 'id="responsiveActionSheet"' "$ROOT/www/index.html"

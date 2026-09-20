@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CURL=${VMAPI_CURL:-curl}
+JQ=${VMAPI_JQ:-jq}
+DEFAULT_PORT=${VMAPI_HTTP_PORT:-5186}
+BASE_URL=${VMAPI_URL:-http://127.0.0.1:${DEFAULT_PORT}}
+API_USER=${VMAPI_USER:-${USER:-}}
+API_PASSWORD=${VMAPI_PASSWORD:-}
+INSECURE=${VMAPI_INSECURE:-false}
+NO_AUTH=${VMAPI_NO_AUTH:-false}
+PEER_ID=''
+CONTENT_TYPE=''
+INPUT_FILE=''
+OUTPUT_FILE=''
+RAW=false
+STREAM=false
+SHOW_HEADERS=false
+declare -a QUERY=()
+declare -a BODY=()
+
+die() { echo "vmapi: $*" >&2; exit 2; }
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  vmapi [options] METHOD PATH [key=value ...]
+  vmapi [options] request METHOD PATH [key=value ...]
+  vmapi [options] peer PEER_ID METHOD PATH [key=value ...]
+  vmapi [options] get|post|put|patch|delete PATH [key=value ...]
+
+Generic API client for every LiteVMM /api endpoint.
+
+Methods are case-insensitive. For GET/HEAD, positional key=value arguments are
+query parameters. For POST/PUT/PATCH/DELETE, they are form fields unless
+--file is used.
+
+Options:
+  --url URL              LiteVMM base URL
+  -u, --user USER        HTTP Basic user
+  --password-stdin       Read HTTP Basic password from stdin
+  --no-auth              Do not send HTTP Basic credentials
+  -k, --insecure         Allow self-signed/untrusted TLS
+  --peer PEER_ID         Invoke PATH through the paired-host API proxy
+  -q, --query KEY=VALUE  Add URL query parameter
+  -d, --data KEY=VALUE   Add form field
+  -f, --file FILE        Send FILE as raw body; "-" means stdin
+  -H, --content-type CT  Content-Type for raw body
+  -o, --output FILE      Write response body to FILE
+  --raw                  Do not pretty-print JSON
+  --stream               Stream response directly
+  -i, --include          Include response headers
+  -h, --help             Show help
+USAGE
+}
+
+is_true() {
+  case ${1,,} in 1|true|yes|on) return 0;; *) return 1;; esac
+}
+
+urlencode() {
+  local value=$1
+  if command -v "$JQ" >/dev/null 2>&1; then
+    printf '%s' "$value" | "$JQ" -sRr @uri
+    return
+  fi
+  local out='' i c hex
+  LC_ALL=C
+  for ((i=0; i<${#value}; i++)); do
+    c=${value:i:1}
+    case $c in
+      [a-zA-Z0-9.~_-]) out+=$c;;
+      *) printf -v hex '%%%02X' "'$c"; out+=$hex;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+append_query() {
+  local url=$1 pair key value sep
+  shift
+  sep='?'
+  [[ $url == *\?* ]] && sep='&'
+  for pair in "$@"; do
+    [[ $pair == *=* ]] || die "query parameter must be KEY=VALUE: $pair"
+    key=${pair%%=*}; value=${pair#*=}
+    [[ -n $key ]] || die 'query parameter name cannot be empty'
+    url+="${sep}$(urlencode "$key")=$(urlencode "$value")"
+    sep='&'
+  done
+  printf '%s' "$url"
+}
+
+normalize_base() {
+  local b=${1%/}
+  b=${b%/api}
+  printf '%s' "$b"
+}
+
+normalize_api_path() {
+  local p=$1
+  [[ -n $p ]] || p='/'
+  [[ $p == /* ]] || p="/$p"
+  if [[ $p == /api ]]; then p='/'
+  elif [[ $p == /api/* ]]; then p=${p#/api}
+  fi
+  printf '%s' "$p"
+}
+
+declare -a POSITIONAL=()
+while (($#)); do
+  case $1 in
+    --url) (($# >= 2)) || die '--url requires a value'; BASE_URL=$2; shift 2;;
+    -u|--user) (($# >= 2)) || die '--user requires a value'; API_USER=$2; shift 2;;
+    --password-stdin) IFS= read -r API_PASSWORD || true; shift;;
+    --no-auth) NO_AUTH=true; shift;;
+    -k|--insecure) INSECURE=true; shift;;
+    --peer) (($# >= 2)) || die '--peer requires an ID'; PEER_ID=$2; shift 2;;
+    -q|--query) (($# >= 2)) || die '--query requires KEY=VALUE'; QUERY+=("$2"); shift 2;;
+    -d|--data) (($# >= 2)) || die '--data requires KEY=VALUE'; BODY+=("$2"); shift 2;;
+    -f|--file) (($# >= 2)) || die '--file requires a path'; INPUT_FILE=$2; shift 2;;
+    -H|--content-type) (($# >= 2)) || die '--content-type requires a value'; CONTENT_TYPE=$2; shift 2;;
+    -o|--output) (($# >= 2)) || die '--output requires a path'; OUTPUT_FILE=$2; shift 2;;
+    --raw) RAW=true; shift;;
+    --stream) STREAM=true; shift;;
+    -i|--include) SHOW_HEADERS=true; shift;;
+    -h|--help) usage; exit 0;;
+    --) shift; POSITIONAL+=("$@"); break;;
+    -*) die "unknown option: $1";;
+    *) POSITIONAL+=("$1"); shift;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+
+(($#)) || { usage >&2; exit 2; }
+
+if [[ ${1,,} == peer ]]; then
+  (($# >= 4)) || die 'peer requires PEER_ID METHOD PATH'
+  PEER_ID=$2
+  shift 2
+fi
+
+if [[ ${1,,} == request ]]; then
+  (($# >= 3)) || die 'request requires METHOD PATH'
+  METHOD=${2^^}
+  PATH_ARG=$3
+  shift 3
+else
+  (($# >= 2)) || die 'METHOD requires PATH'
+  METHOD=${1^^}
+  PATH_ARG=$2
+  shift 2
+fi
+
+case $METHOD in GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) :;; *) die "unsupported HTTP method: $METHOD";; esac
+
+for pair in "$@"; do
+  case $pair in
+    *=*)
+      if [[ $METHOD == GET || $METHOD == HEAD ]]; then QUERY+=("$pair"); else BODY+=("$pair"); fi
+      ;;
+    *) die "parameter must be KEY=VALUE: $pair";;
+  esac
+done
+
+[[ -z $INPUT_FILE || ${#BODY[@]} -eq 0 ]] || die '--file cannot be combined with form body fields'
+command -v "$CURL" >/dev/null 2>&1 || die "curl is required: $CURL"
+
+BASE_URL=$(normalize_base "$BASE_URL")
+TARGET_PATH=$(normalize_api_path "$PATH_ARG")
+
+if [[ -n $PEER_ID ]]; then
+  [[ $PEER_ID =~ ^[A-Za-z0-9._:-]+$ ]] || die 'invalid peer ID'
+  remote_path=$TARGET_PATH
+  if ((${#QUERY[@]})); then remote_path=$(append_query "$remote_path" "${QUERY[@]}"); fi
+  URL="$BASE_URL/api/cluster/peers/$PEER_ID/proxy"
+  URL=$(append_query "$URL" "path=$remote_path")
+else
+  URL="$BASE_URL/api$TARGET_PATH"
+  if ((${#QUERY[@]})); then URL=$(append_query "$URL" "${QUERY[@]}"); fi
+fi
+
+declare -a CURL_ARGS=(-sS --connect-timeout 10 -X "$METHOD")
+is_true "$INSECURE" && CURL_ARGS+=(-k)
+$SHOW_HEADERS && CURL_ARGS+=(-i)
+
+auth_cfg=''
+cleanup() {
+  [[ -z $auth_cfg ]] || rm -f -- "$auth_cfg"
+}
+trap cleanup EXIT INT TERM
+
+if ! is_true "$NO_AUTH"; then
+  [[ -n $API_USER ]] || die 'no HTTP user; set VMAPI_USER, --user, or --no-auth'
+  if [[ -z $API_PASSWORD ]]; then
+    if [[ -t 0 ]]; then
+      read -r -s -p "Password for $API_USER: " API_PASSWORD
+      echo >&2
+    else
+      die 'no password; set VMAPI_PASSWORD or use --password-stdin'
+    fi
+  fi
+  auth_cfg=$(mktemp)
+  chmod 0600 "$auth_cfg"
+  escaped_user=${API_USER//\\/\\\\}; escaped_user=${escaped_user//\"/\\\"}
+  escaped_pass=${API_PASSWORD//\\/\\\\}; escaped_pass=${escaped_pass//\"/\\\"}
+  printf 'user = "%s:%s"\n' "$escaped_user" "$escaped_pass" >"$auth_cfg"
+  CURL_ARGS+=(--config "$auth_cfg")
+fi
+
+if [[ -n $INPUT_FILE ]]; then
+  [[ $INPUT_FILE == '-' || -r $INPUT_FILE ]] || die "cannot read input file: $INPUT_FILE"
+  [[ -n $CONTENT_TYPE ]] || CONTENT_TYPE='application/octet-stream'
+  CURL_ARGS+=(-H "Content-Type: $CONTENT_TYPE")
+  if [[ $INPUT_FILE == '-' ]]; then CURL_ARGS+=(--data-binary @-); else CURL_ARGS+=(--data-binary "@$INPUT_FILE"); fi
+elif ((${#BODY[@]})); then
+  CURL_ARGS+=(-H 'Content-Type: application/x-www-form-urlencoded')
+  for pair in "${BODY[@]}"; do
+    [[ $pair == *=* ]] || die "form field must be KEY=VALUE: $pair"
+    CURL_ARGS+=(--data-urlencode "$pair")
+  done
+elif [[ $METHOD == POST || $METHOD == PUT || $METHOD == PATCH ]]; then
+  CURL_ARGS+=(--data '')
+fi
+
+if $STREAM; then
+  [[ -z $OUTPUT_FILE ]] || CURL_ARGS+=(-o "$OUTPUT_FILE")
+  "$CURL" "${CURL_ARGS[@]}" --fail-with-body "$URL"
+  exit $?
+fi
+
+tmp_body=$(mktemp)
+trap 'cleanup; rm -f -- "$tmp_body"' EXIT INT TERM
+status=$("$CURL" "${CURL_ARGS[@]}" -o "$tmp_body" -w '%{http_code}' "$URL") || {
+  rc=$?
+  [[ -s $tmp_body ]] && cat "$tmp_body" >&2
+  exit "$rc"
+}
+
+if [[ -n $OUTPUT_FILE ]]; then
+  mv -- "$tmp_body" "$OUTPUT_FILE"
+  tmp_body=''
+else
+  if ! $RAW && command -v "$JQ" >/dev/null 2>&1 && "$JQ" -e . "$tmp_body" >/dev/null 2>&1; then
+    "$JQ" . "$tmp_body"
+  else
+    cat "$tmp_body"
+    [[ ! -s $tmp_body || $(tail -c 1 "$tmp_body" 2>/dev/null || true) == $'\n' ]] || printf '\n'
+  fi
+fi
+
+if [[ $status =~ ^[45] ]]; then
+  echo "vmapi: HTTP $status for $METHOD $TARGET_PATH" >&2
+  exit 22
+fi

@@ -189,7 +189,7 @@ install_common_files() {
   set_host_config VMAPI_BACKPLANE_SERVER true
   install -m 0644 "$BASE/lib/common.sh" /usr/local/lib/vmapi/common.sh
   install -m 0644 "$BASE/VERSION" /usr/share/vmapi/VERSION
-  for tool in vmapi-web-reload vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl docker-federationctl docker-rootfsctl litevmm-docker litevmm-runc metricsctl consolectl peerctl vmbackupctl replicationctl registryctl peer-volumectl backplanectl filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
+  for tool in vmapi vmapi-web-reload vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl docker-federationctl docker-rootfsctl litevmm-docker litevmm-runc metricsctl consolectl peerctl vmbackupctl replicationctl registryctl peer-volumectl backplanectl filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
     need_source "bin/$tool"; install -m 0755 "$BASE/bin/$tool" "/usr/local/bin/$tool"
   done
   # Keep /usr/bin/docker as the native CLI used by LiteVMM internals. For
