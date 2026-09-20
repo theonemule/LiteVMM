@@ -93,4 +93,17 @@ grep -q '"scope":"vm"' <<< "$out"
 out=$(REQUEST_METHOD=GET PATH_INFO=/api/docker/containers/web/metrics METRICSCTL="$ROOT/bin/metricsctl" VMCTL="$ROOT/bin/vmctl" IMAGECTL="$ROOT/bin/imagectl" NETCTL="$ROOT/bin/netctl" DOCKERCTL="$ROOT/bin/dockerctl" DOCKER_IMAGECTL="$ROOT/bin/docker-imagectl" DOCKER_NETCTL="$ROOT/bin/docker-netctl" DOCKER_VOLUMECTL="$ROOT/bin/docker-volumectl" "$ROOT/cgi/api.cgi")
 grep -q '"scope":"container"' <<< "$out"
 
+# Host gauges: storage matches df's Use% (used / (used + available)), so the
+# root-reserved blocks cannot hide a nearly full disk; memory says whether a
+# hypervisor balloon sets its total; the platform is never blank.
+"$ROOT/bin/metricsctl" system > "$T/system.json"
+python3 - "$T/host.json" "$T/system.json" <<'PY2'
+import json, sys
+h = json.load(open(sys.argv[1])); s = json.load(open(sys.argv[2]))
+d = h['disk']; expect = round(d['used_bytes'] * 100 / (d['used_bytes'] + d['available_bytes']), 2)
+assert abs(d['utilization_percent'] - expect) < 0.011, (d, expect)
+assert h['memory']['balloon'] in ('hyperv', 'virtio', 'none'), h['memory']
+assert s['host']['virtualization_type'], s['host']
+PY2
+
 echo 'metrics smoke: PASS'

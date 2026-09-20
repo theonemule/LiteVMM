@@ -555,8 +555,8 @@ ${commandLine(ci)} < user-data`;
     return (current - prev.value) / (now - prev.time);
   }
 
-  function meter(prefix, key, label, {progress=true} = {}) {
-    return `<div class="col-sm-6 col-xl-3"><div class="resource-meter h-100 rounded-4 p-3">
+  function meter(prefix, key, label, {progress=true, cols='col-sm-6 col-xl-3'} = {}) {
+    return `<div class="${cols}"><div class="resource-meter h-100 rounded-4 p-3">
       <div class="d-flex align-items-start gap-2"><div><div class="metric-label">${esc(label)}</div><div id="${prefix}-${key}-value" class="resource-value mt-2">—</div></div><div class="ms-auto small text-secondary" id="${prefix}-${key}-corner"></div></div>
       <div id="${prefix}-${key}-meta" class="small text-secondary mt-2 text-truncate">Waiting for sample…</div>
       ${progress ? `<div class="progress resource-progress mt-3" role="progressbar"><div id="${prefix}-${key}-bar" class="progress-bar" style="width:0%"></div></div>` : ''}
@@ -613,8 +613,13 @@ ${commandLine(ci)} < user-data`;
     const rxRate = counterRate('host.net.rx', m.network?.rx_bytes);
     const txRate = counterRate('host.net.tx', m.network?.tx_bytes);
     updateMeter('host','cpu',{value:percent(m.cpu?.utilization_percent),meta:`${m.cpu?.logical_cpus || 0} logical CPUs · load ${Number(m.cpu?.load1||0).toFixed(2)}`,percentValue:m.cpu?.utilization_percent,historyValue:m.cpu?.utilization_percent,fixedMax:100});
-    updateMeter('host','memory',{value:percent(m.memory?.utilization_percent),meta:`${bytes(m.memory?.used_bytes)} of ${bytes(m.memory?.total_bytes)}`,percentValue:m.memory?.utilization_percent,historyValue:m.memory?.utilization_percent,fixedMax:100});
-    updateMeter('host','disk',{value:percent(m.disk?.utilization_percent),meta:`${bytes(m.disk?.used_bytes)} of ${bytes(m.disk?.total_bytes)} · ${m.disk?.path || ''}`,percentValue:m.disk?.utilization_percent,historyValue:m.disk?.utilization_percent,fixedMax:100});
+    // Under Hyper-V Dynamic Memory (or a virtio balloon) the total is what the
+    // hypervisor currently assigns, not the configured maximum, so say so.
+    const balloon = {hyperv:'assigned by Hyper-V Dynamic Memory', virtio:'currently assigned (memory balloon)'}[m.memory?.balloon] || 'total';
+    updateMeter('host','memory',{value:percent(m.memory?.utilization_percent),meta:`${bytes(m.memory?.used_bytes)} used of ${bytes(m.memory?.total_bytes)} ${balloon}`,corner:m.memory?.balloon && m.memory.balloon !== 'none' ? 'dynamic' : '',percentValue:m.memory?.utilization_percent,historyValue:m.memory?.utilization_percent,fixedMax:100});
+    updateMeter('host','disk',{value:percent(m.disk?.utilization_percent),meta:`${bytes(m.disk?.used_bytes)} used · ${bytes(m.disk?.available_bytes)} free of ${bytes(m.disk?.total_bytes)}`,corner:m.disk?.path || '',percentValue:m.disk?.utilization_percent,historyValue:m.disk?.utilization_percent,fixedMax:100});
+    const diskBar = $('#host-disk-bar'), diskPct = Number(m.disk?.utilization_percent || 0);
+    if (diskBar) { diskBar.classList.toggle('bg-danger', diskPct >= 90); diskBar.classList.toggle('bg-warning', diskPct >= 80 && diskPct < 90); }
     updateMeter('host','network',{value:`↓ ${rateBytes(rxRate)}`,meta:`↑ ${rateBytes(txRate)} · cumulative ${bytes((m.network?.rx_bytes||0)+(m.network?.tx_bytes||0))}`,corner:'RX / TX',historyValue:rxRate,history2:txRate});
     const warning=$('#kvmWarning'); if(warning) warning.classList.toggle('d-none', m.virtualization?.kvm_available !== false);
   }
@@ -661,39 +666,87 @@ ${commandLine(ci)} < user-data`;
     return `<div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
   }
 
+  // Overview: workload counts, live memory and storage, a short host summary,
+  // and paired hosts. The full report lives on the System information page.
   async function loadDashboard() {
+    const vmCap = hasCap('qemu-kvm'), dockerCap = hasCap('docker');
     const results = await Promise.allSettled([
-      request('/vms'), request('/docker/containers'), request('/images'), request('/docker/images'), request('/docker/networks'), request('/docker/volumes'), request('/metrics'), request('/system'), request('/backups')
+      vmCap ? request('/vms') : Promise.resolve([]),
+      dockerCap ? request('/docker/containers') : Promise.resolve([]),
+      request('/metrics'), request('/system'), request('/cluster/peers'),
+      !vmCap && !dockerCap ? request('/backups') : Promise.resolve([])
     ]);
-    const val = i => results[i].status === 'fulfilled' ? results[i].value : [];
-    state.cache.vms = val(0); state.cache.containers = val(1); state.cache.vmImages = val(2); state.cache.dockerImages = val(3); state.cache.dockerNetworks = val(4); state.cache.volumes = val(5);
-    state.cache.hostMetrics = results[6].status === 'fulfilled' ? results[6].value : null;
-    state.cache.systemInfo = results[7].status === 'fulfilled' ? results[7].value : null;
-    state.cache.backups = results[8].status === 'fulfilled' ? results[8].value : [];
+    const val = (i, fallback) => results[i].status === 'fulfilled' ? results[i].value : fallback;
+    state.cache.vms = val(0, []); state.cache.containers = val(1, []);
+    state.cache.hostMetrics = val(2, null); state.cache.systemInfo = val(3, null);
+    const peers = val(4, []), backups = val(5, []);
     const runningVMs = state.cache.vms.filter(v => v.state === 'running').length;
     const runningContainers = state.cache.containers.filter(c => String(c.State || c.state || '').toLowerCase() === 'running').length;
     $('#view').innerHTML = `
+      ${state.cache.hostMetrics?.virtualization?.kvm_available === false ? '<div id="kvmWarning" class="alert alert-warning mb-4"><strong>KVM acceleration is unavailable.</strong> New VMs will not start in slow software emulation unless you explicitly opt in.</div>' : ''}
       <div class="row g-3 mb-4">
-        ${hasCap('qemu-kvm') ? `${metric('Virtual machines', state.cache.vms.length, `${runningVMs} running`)}${metric('VM images', state.cache.vmImages.length, 'shared install media')}${metric('Backups', state.cache.backups.length, 'local archives')}${metric('Profile', 'Virtualization', 'QEMU/KVM + backups')}` : ''}
-        ${hasCap('docker') ? `${metric('Containers', state.cache.containers.length, `${runningContainers} running`)}${metric('Docker images', state.cache.dockerImages.length, 'daemon inventory')}${metric('Docker networks', state.cache.dockerNetworks.length, 'daemon networks')}${metric('Volumes', state.cache.volumes.length, 'persistent volumes')}` : ''}
-        ${hasCap('backup-storage') ? `${metric('Received backups', state.cache.backups.length, 'stored archives')}${metric('Paired hosts', state.hostCatalog.peers.length, 'trusted senders')}${metric('Profile', 'Backup', 'storage-only node')}${metric('API port', (state.activeService||state.service)?.port||'', (state.activeService||state.service)?.tls_enabled?'HTTPS':'HTTP')}` : ''}
+        ${vmCap ? metric('Virtual machines', state.cache.vms.length, `${runningVMs} running`) : ''}
+        ${dockerCap ? metric('Containers', state.cache.containers.length, `${runningContainers} running`) : ''}
+        ${!vmCap && !dockerCap ? metric('Stored backups', backups.length, 'archives on this host') : ''}
       </div>
-      ${state.cache.hostMetrics?.virtualization?.kvm_available === false ? '<div id="kvmWarning" class="alert alert-warning mb-4"><strong>KVM acceleration is unavailable.</strong> New VMs will not start in slow software emulation unless you explicitly opt in. Expose <span class="mono">/dev/kvm</span> to this host for nested VM performance.</div>' : ''}
       <div class="mb-4">${card('Host resources', meterRow('host',[
-        {key:'cpu',label:'CPU'}, {key:'memory',label:'Memory'}, {key:'disk',label:'Storage'}, {key:'network',label:'Network',progress:false}
+        {key:'memory',label:'Memory',cols:'col-md-6'}, {key:'disk',label:'Storage',cols:'col-md-6'}
       ]), '<span class="small text-secondary">5 second refresh</span>')}</div>
       <div class="row g-3">
-        <div class="col-xl-7">${card('Compute', computeSummary())}</div>
-        <div class="col-xl-5">${card('Platform', platformSummary())}</div>
+        <div class="col-xl-6">${card('This host', hostSummary(), '<button class="btn btn-sm btn-outline-primary" id="overviewSystemInfoBtn">Full system information</button>')}</div>
+        <div class="col-xl-6">${card('Paired hosts', pairedHostsSummary(peers), '<a class="btn btn-sm btn-outline-secondary" href="#cluster">Manage</a>')}</div>
       </div>
-      <div class="mt-4">${card('Host diagnostics', `<div class="d-flex flex-column flex-sm-row align-items-sm-center justify-content-between gap-3"><div><div class="fw-semibold">Administrative tools</div><div class="small text-secondary">Review the tools enabled by this installation profile.</div></div><div class="action-row justify-content-start"><button class="btn btn-outline-primary" id="overviewSystemInfoBtn">System information</button><button class="btn btn-outline-primary" id="overviewCertificatesBtn">Certificate management</button>${hasCap('host-terminal')?'<button class="btn btn-primary" id="overviewHostTerminalBtn">Launch host terminal</button>':''}${hasCap('files')?'<button class="btn btn-outline-primary" id="overviewFileBrowserBtn">File browser</button>':''}<button class="btn btn-outline-secondary" id="overviewLogsBtn">View service logs</button></div></div>`)}</div>`;
+      <div class="mt-4">${card('Tools', `<div class="action-row justify-content-start"><button class="btn btn-outline-primary" id="overviewCertificatesBtn">Certificate management</button>${hasCap('host-terminal')?'<button class="btn btn-outline-primary" id="overviewHostTerminalBtn">Host terminal</button>':''}${hasCap('files')?'<button class="btn btn-outline-primary" id="overviewFileBrowserBtn">File browser</button>':''}<button class="btn btn-outline-secondary" id="overviewLogsBtn">Service logs</button></div>`)}</div>`;
     if (state.cache.hostMetrics) renderHostMetrics(state.cache.hostMetrics);
     startDashboardMetrics();
-    $('#overviewSystemInfoBtn')?.addEventListener('click',()=>{ location.hash='#system'; });
+    checkPairedHosts(peers);
+    $('#overviewSystemInfoBtn')?.addEventListener('click',()=>{ location.hash=`#system${state.remotePeerId?`?peer=${encodeURIComponent(state.remotePeerId)}`:''}`; });
     $('#overviewCertificatesBtn')?.addEventListener('click',()=>{ location.hash='#admin'; });
     $('#overviewHostTerminalBtn')?.addEventListener('click',openHostTerminal);
     $('#overviewFileBrowserBtn')?.addEventListener('click',()=>window.open('/files.html','vmapi-file-browser','noopener'));
     $('#overviewLogsBtn').onclick=openHostLogs;
+  }
+
+  // What this host is set up to run, e.g. "Virtual machines + Docker + Backups".
+  function featureSummary(caps = []) {
+    const has = c => caps.includes(c);
+    return [has('qemu-kvm') && 'Virtual machines', has('docker') && 'Docker', (has('backup-storage') || has('backup-create')) && 'Backups'].filter(Boolean).join(' + ') || 'None';
+  }
+
+  function hostSummary() {
+    const svc = state.activeService || state.service || {}; const sys = state.cache.systemInfo || {};
+    const host = sys.host || {}, os = sys.os || {}, net = sys.network || {}, comp = sys.components || {};
+    const platform = {microsoft:'Hyper-V virtual machine', kvm:'KVM virtual machine', vmware:'VMware virtual machine', oracle:'VirtualBox virtual machine', xen:'Xen virtual machine', 'vm-other':'Virtual machine', none:'Physical host'}[host.virtualization_type] || host.virtualization_type || 'Unknown';
+    return systemDl([
+      ['Hostname', host.hostname, true],
+      ['Operating system', os.pretty_name],
+      ['Kernel', host.kernel, true],
+      ['Platform', platform],
+      ['Configured for', `${featureSummary(svc.capabilities || [])} (${svc.configured_profile || svc.profile || 'unknown'} profile)`],
+      ['LiteVMM', `${comp.litevmm || 'unknown'} · API ${svc.version ?? 'unknown'}`, true],
+      ['Primary IP', net.primary_ipv4, true],
+      ['Uptime', duration(host.uptime_seconds)]
+    ]);
+  }
+
+  function pairedHostsSummary(peers) {
+    if (!peers.length) return '<div class="empty-state py-4">No paired hosts. Pair hosts on the Cluster page.</div>';
+    return `<div class="list-group list-group-flush list-compact">${peers.map(p => `<div class="list-group-item d-flex align-items-center gap-3"><div class="flex-grow-1 text-truncate"><div class="resource-name">${esc(p.name || p.node_id)}</div><div class="small text-secondary mono text-truncate">${esc(p.url || '')}</div></div><span class="badge text-bg-light" id="peer-status-${esc(p.node_id)}">${state.remotePeerId ? '' : 'checking…'}</span></div>`).join('')}</div>`;
+  }
+
+  // Ask each paired host for its API root: shows it is reachable and what it runs.
+  // Only possible from the local host (the console cannot proxy peer-to-peer).
+  function checkPairedHosts(peers) {
+    if (state.remotePeerId) return;
+    peers.forEach(async p => {
+      const badge = () => document.getElementById(`peer-status-${p.node_id}`);
+      try {
+        const info = await request('/', {peerId: p.node_id});
+        const el = badge(); if (el) { el.className = 'badge text-bg-success'; el.textContent = featureSummary(info.capabilities || []); }
+      } catch {
+        const el = badge(); if (el) { el.className = 'badge text-bg-danger'; el.textContent = 'unreachable'; }
+      }
+    });
   }
 
   async function openHostTerminal(){
@@ -717,29 +770,7 @@ ${commandLine(ci)} < user-data`;
     return `<div class="col-6 col-xl-3"><div class="card metric-card rounded-4"><div class="card-body p-3 p-md-4 d-flex flex-column justify-content-between"><div class="metric-label">${esc(label)}</div><div><div class="metric-value fw-semibold">${esc(value)}</div><div class="small text-secondary mt-2">${esc(note)}</div></div></div></div></div>`;
   }
 
-  function computeSummary() {
-    const vms = (state.cache.vms || []).slice(0,5);
-    const containers = (state.cache.containers || []).slice(0,5);
-    const lines = [
-      ...vms.map(v => `<div class="list-group-item d-flex align-items-center gap-3"><span class="badge text-bg-dark">VM</span><span class="resource-name flex-grow-1">${esc(v.name)}</span>${stateBadge(v.state)}</div>`),
-      ...containers.map(c => `<div class="list-group-item d-flex align-items-center gap-3"><span class="badge text-bg-light">CTR</span><span class="resource-name flex-grow-1">${esc(c.Names || c.Name || '')}</span>${stateBadge(c.State || '')}</div>`)
-    ];
-    return lines.length ? `<div class="list-group list-group-flush list-compact">${lines.join('')}</div>` : `<div class="empty-state py-5">Create a VM or container to get started.</div>`;
-  }
 
-  function platformSummary() {
-    const svc = state.service || {}; const sys=state.cache.systemInfo||{}; const host=sys.host||{}; const os=sys.os||{}; const net=sys.network||{}; const comp=sys.components||{};
-    return `<dl class="row mb-3 small">
-      <dt class="col-5 text-secondary">Host</dt><dd class="col-7 mono">${esc(host.hostname || '')}</dd>
-      <dt class="col-5 text-secondary">Operating system</dt><dd class="col-7">${esc(os.pretty_name || '')}</dd>
-      <dt class="col-5 text-secondary">Kernel</dt><dd class="col-7 mono">${esc(host.kernel || '')}</dd>
-      <dt class="col-5 text-secondary">Primary IP</dt><dd class="col-7 mono">${esc(net.primary_ipv4 || '')}</dd>
-      <dt class="col-5 text-secondary">LiteVMM</dt><dd class="col-7 mono">${esc(comp.litevmm || svc.version || '')}</dd>
-      <dt class="col-5 text-secondary">QEMU</dt><dd class="col-7 text-truncate" title="${esc(comp.qemu||'')}">${esc(comp.qemu || 'Unavailable')}</dd>
-      <dt class="col-5 text-secondary">Docker</dt><dd class="col-7 text-truncate" title="${esc(comp.docker||'')}">${esc(comp.docker || 'Unavailable')}</dd>
-      <dt class="col-5 text-secondary">Uptime</dt><dd class="col-7 mb-0">${duration(host.uptime_seconds)}</dd>
-    </dl><a class="btn btn-sm btn-outline-primary" href="#system${state.remotePeerId?`?peer=${encodeURIComponent(state.remotePeerId)}`:''}">Full system information</a>`;
-  }
 
   function systemDl(rows) {
     return `<dl class="row small mb-0">${rows.map(([k,v,mono=false])=>`<dt class="col-md-4 text-secondary">${esc(k)}</dt><dd class="col-md-8 ${mono?'mono text-break':''}">${esc(v ?? '')}</dd>`).join('')}</dl>`;

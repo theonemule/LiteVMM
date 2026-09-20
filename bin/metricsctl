@@ -48,6 +48,20 @@ host_cpu_percent() {
   awk -v t="$dt" -v i="$di" 'BEGIN { if (t>0) printf "%.2f", ((t-i)*100)/t; else printf "0.00" }'
 }
 
+# Fallback for systems without systemd-detect-virt (e.g. Alpine), using the
+# same identifiers it reports.
+dmi_virt_type() {
+  local id; id="$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+  case $id in
+    *"Microsoft Corporation"*"Virtual Machine"*) printf 'microsoft\n';;
+    *QEMU*|*KVM*) printf 'kvm\n';;
+    *VMware*) printf 'vmware\n';;
+    *innotek*|*VirtualBox*) printf 'oracle\n';;
+    *Xen*) printf 'xen\n';;
+    *) grep -qw hypervisor /proc/cpuinfo 2>/dev/null && printf 'vm-other\n' || printf 'none\n';;
+  esac
+}
+
 host_cpu_count() {
   local n
   n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
@@ -62,6 +76,16 @@ memory_values() {
     /^MemAvailable:/ {a=$2*1024}
     END { if(a=="") a=0; u=t-a; if(u<0)u=0; printf "%.0f %.0f %.0f\n", t,u,a }
   ' /proc/meminfo
+}
+
+# Hypervisor memory ballooning (Hyper-V Dynamic Memory, virtio-balloon) changes
+# MemTotal at runtime: it is the memory currently assigned to this guest, not
+# its configured maximum. Reported so the UI can label the total accordingly.
+memory_balloon() {
+  local d
+  for d in /sys/bus/vmbus/drivers/hv_balloon/*-*; do [[ -e $d ]] && { printf 'hyperv\n'; return; }; done
+  for d in /sys/bus/virtio/drivers/virtio_balloon/virtio*; do [[ -e $d ]] && { printf 'virtio\n'; return; }; done
+  printf 'none\n'
 }
 
 metric_fs_path() {
@@ -94,8 +118,10 @@ cmd_host() {
   printf '"scope":"host","timestamp":%s,' "$(date +%s)"
   printf '"cpu":{"utilization_percent":%s,"logical_cpus":%s,"load1":%s,"load5":%s,"load15":%s},' "$cpu" "$cpus" "$load1" "$load5" "$load15"
   printf '"virtualization":{"kvm_available":%s,"note":"%s"},' "$kvm_available" "$(json_escape "$([[ $kvm_available == true ]] && printf 'KVM acceleration available' || printf 'KVM unavailable: VM starts require explicit software emulation and will be slow')")"
-  printf '"memory":{"used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s},' "$mu" "$mt" "$ma" "$(num_pct "$mu" "$mt")"
-  printf '"disk":{"path":"%s","used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s},' "$(json_escape "$disk_path")" "$du" "$dt" "$da" "$(num_pct "$du" "$dt")"
+  printf '"memory":{"used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s,"balloon":"%s"},' "$mu" "$mt" "$ma" "$(num_pct "$mu" "$mt")" "$(memory_balloon)"
+  # Same as df's Use%: used / (used + available). Dividing by the filesystem
+  # size under-reported fullness by the root-reserved blocks (5% on ext4).
+  printf '"disk":{"path":"%s","used_bytes":%s,"total_bytes":%s,"available_bytes":%s,"utilization_percent":%s},' "$(json_escape "$disk_path")" "$du" "$dt" "$da" "$(num_pct "$du" "$((du+da))")"
   printf '"network":{"rx_bytes":%s,"tx_bytes":%s},' "$rx" "$tx"
   printf '"uptime_seconds":%s' "$up"
   printf '}\n'
@@ -151,6 +177,7 @@ cmd_system() {
   primary_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
   gateway=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3; exit}' || true)
   if command -v systemd-detect-virt >/dev/null 2>&1; then virt_type=$(systemd-detect-virt 2>/dev/null || true); fi
+  [[ -n $virt_type ]] || virt_type=$(dmi_virt_type)
   if command -v timedatectl >/dev/null 2>&1; then timezone=$(timedatectl show -p Timezone --value 2>/dev/null || true); fi
   [[ -n $timezone ]] || timezone=$(cat /etc/timezone 2>/dev/null || true)
   machine_id=$(cat /etc/machine-id 2>/dev/null || true)
