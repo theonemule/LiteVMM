@@ -1,5 +1,11 @@
 # LiteVMM 0.12
 
+> **Documentation:** see [`docs/`](docs/README.md): the
+> [user guide](docs/user-guide/README.md) (console, page by page), the
+> [API reference](docs/api/README.md), and the
+> [technical guide](docs/technical/README.md) (daemons, peering, storage
+> backplane, overlays, replication, security assumptions).
+
 LiteVMM is a deliberately minimalist infrastructure API and console with selectable backup-only, VM + backup, Docker + backup, or VM + Docker + backup profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses the Linux NFSv4 client/server stack carried through the existing LiteVMM WebSocket endpoint.
 
 There is no application database, no libvirt dependency, no Python/Node backend, no custom userspace filesystem, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. The existing `vmapi` name remains for the core command and filesystem layout. LiteVMM 0.10 intentionally removes the retired custom-filesystem, per-volume share, backup-upload, and per-disk replication transport interfaces.
