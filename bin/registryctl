@@ -72,7 +72,11 @@ CFG
   esac
 }
 enable(){
-  need_cmd "$DOCKER_BIN"; need_cmd openssl; local user=${1:-registry}; valid_user "$user"; install -d -m 0750 "$ROOT" "$(dirname "$CONF")"
+  need_cmd "$DOCKER_BIN"; need_cmd openssl; local user=${1:-registry}; valid_user "$user"; install -d -m 0750 "$ROOT"
+  # Never re-mode an existing config directory: CONF lives in /etc/vmapi, and
+  # `install -d -m 0750` on it locked the vmapi web worker out of vmapi.conf,
+  # silently dropping settings such as VMAPI_BACKPLANE_SERVER (see peerctl).
+  [[ -d $(dirname "$CONF") ]] || install -d -m 0755 "$(dirname "$CONF")"
   load; USERNAME=$user; [[ -n $PASSWORD ]] || PASSWORD=$(openssl rand -hex 24); ENABLED=true
   local hash; hash=$(printf '%s\n' "$PASSWORD" | openssl passwd -apr1 -stdin); printf '%s:%s\n' "$USERNAME" "$hash" > "$PASSWD_FILE"; chmod 0640 "$PASSWD_FILE"; [[ ! -e $PEER_PASSWD ]] || chown --reference="$PEER_PASSWD" "$PASSWD_FILE" 2>/dev/null || true
   "$DOCKER_BIN" image inspect "$IMAGE" >/dev/null 2>&1 || "$DOCKER_BIN" pull "$IMAGE" >/dev/null

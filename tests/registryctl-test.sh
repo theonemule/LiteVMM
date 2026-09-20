@@ -23,7 +23,9 @@ MOCK
 chmod +x "$T/bin/docker"
 
 common=(VMAPI_CONFIG=/dev/null VMAPI_LIB="$ROOT/lib/common.sh" DOCKER_BIN="$T/bin/docker" FAKE_DOCKER_STATE="$T/state" VMAPI_REGISTRY_ROOT="$T/registry" VMAPI_REGISTRY_CONFIG="$T/etc/registry.conf" VMAPI_REGISTRY_PASSWD_FILE="$T/etc/registry.htpasswd" VMAPI_REGISTRY_WEB_MODE=none)
+chmod 0755 "$T/etc"
 out=$(env "${common[@]}" bash "$ROOT/bin/registryctl" enable testregistry)
+[[ $(stat -c %a "$T/etc") == 755 ]] || { echo "registryctl enable re-moded the config directory"; exit 1; }
 [[ $out == *'"enabled":true'* && $out == *'"running":true'* ]]
 env "${common[@]}" bash "$ROOT/bin/registryctl" push alpine:latest team/local:latest >/dev/null
 grep -Fq 'image tag alpine:latest 127.0.0.1:5000/team/local:latest' "$T/state/docker.log"
