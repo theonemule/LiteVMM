@@ -7,7 +7,7 @@
 > [technical guide](https://github.com/theonemule/LiteVMM-Docs/blob/main/technical/README.md) (daemons, peering, storage
 > backplane, overlays, replication, security assumptions).
 
-LiteVMM is a deliberately minimalist infrastructure API and console with selectable backup-only, VM + backup, Docker + backup, or VM + Docker + backup profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses the Linux NFSv4 client/server stack carried through the existing LiteVMM WebSocket endpoint.
+LiteVMM is a deliberately minimalist infrastructure API and console with selectable backup-only, VM + backup, Docker + backup, or VM + Docker + backup profiles. It is built from Bash, the Linux filesystem, native virtualization/container CLIs, fcgiwrap, and a small HTTP server. Debian uses systemd/Nginx, while Alpine uses OpenRC/lighttpd. LiteVMM includes a static Bootstrap console with no Node, PHP, application server, or front-end build runtime. Peer storage uses NFS carried through the existing LiteVMM WebSocket endpoint. Native LiteVMM installs on a VM or physical host use the Linux kernel NFSv4 stack for every workload profile; only the unprivileged LiteVMM storage container image uses a userspace NFSv3 server.
 
 There is no application database, no libvirt dependency, no Python/Node backend, no custom userspace filesystem, and no container-management framework. The intent is a small, inspectable hypervisor: QEMU/KVM configuration and virtual disks are filesystem-backed and kept in separate roots, while Docker remains authoritative for its own objects. The existing `vmapi` name remains for the core command and filesystem layout. LiteVMM 0.10 intentionally removes the retired custom-filesystem, per-volume share, backup-upload, and per-disk replication transport interfaces.
 
@@ -58,7 +58,7 @@ The console covers:
 - Docker network create/list/inspect/remove plus host bridge/interface visibility
 - named GOST TAP-over-WebSocket Layer-2 overlays for paired peers
 - continuous VM disk replication to paired storage-backplane nodes without requiring an overlay network
-- Docker volume create/list/inspect/remove with Docker-local, host bind, NFS, SMB/CIFS, tmpfs, custom-driver, and LiteVMM peer-backed NFSv4/WSS storage
+- Docker volume create/list/inspect/remove with Docker-local, host bind, NFS, SMB/CIFS, tmpfs, custom-driver, and LiteVMM peer-backed NFS/WSS storage
 - five-second host, VM and container resource monitoring with rolling in-browser graphs
 - a System information view with OS, kernel, CPU/RAM, IP addressing, routes, disks, mounts, service state, and installed component versions
 
@@ -167,7 +167,7 @@ Pairing is a manual, three-step public-key exchange. Once two nodes are paired, 
 
 ### Shared peer storage backplane
 
-A storage-capable node runs NFSv4.1/4.2 over TCP only. LiteVMM starts `rpc.nfsd` explicitly on `127.0.0.1:2049`, disables the distribution-managed NFS service, exports only `/var/lib/vmapi/backplane`, and verifies the actual listener before reporting the backplane healthy. NFS is not exposed on a LAN/WAN interface unless an administrator deliberately changes the underlying configuration.
+Native LiteVMM installs on a VM or physical host run NFSv4.1/4.2 over TCP only, regardless of whether the selected workload profile is backup, virtualization, docker, or virtualization-docker. LiteVMM starts `rpc.nfsd` explicitly on `127.0.0.1:2049`, disables the distribution-managed NFS service, exports only `/var/lib/vmapi/backplane`, and verifies the actual listener before reporting the backplane healthy. The containerized storage node instead uses UNFS3 on an unprivileged loopback-only port and advertises NFSv3 to peers. In both cases NFS stays behind the LiteVMM WebSocket transport and is not published on the LAN/WAN.
 
 The storage byte stream is carried through the existing LiteVMM HTTP(S) endpoint:
 
@@ -189,7 +189,7 @@ peer NFS mount
         |
 127.0.0.1:2049
         |
-   kernel NFSv4
+   NFS server
         |
 /var/lib/vmapi/backplane
 ```
@@ -216,7 +216,7 @@ A Docker-capable host allocates a directory under the peer's `docker-volumes/` n
 
 Docker images use a different model. LiteVMM does **not** replicate image archives and does not share or symlink Docker's mutable data root. The Docker daemon that pulled or built an image remains the only owner of those image layers. `docker-federationctl` combines local image metadata with the `/docker/images` inventory of directly paired hosts so every LiteVMM host can present one logical image catalog while the physical layers stay where they were created.
 
-When a container on Host B uses an image that exists only on Host A, Host B asks Host A to expose an immutable merged root filesystem for that image under `shared/docker-rootfs/IMAGE_ID/rootfs`. On legacy `overlay2` stores, LiteVMM creates a read-only overlay mount over Docker's existing image layers. On Docker's containerd image store, LiteVMM asks the embedded containerd daemon to mount the image. That mounted rootfs crosses the existing NFSv4/WSS peer backplane. No `docker save`, tar archive, `docker load`, or layer replication is performed.
+When a container on Host B uses an image that exists only on Host A, Host B asks Host A to expose an immutable merged root filesystem for that image under `shared/docker-rootfs/IMAGE_ID/rootfs`. On legacy `overlay2` stores, LiteVMM creates a read-only overlay mount over Docker's existing image layers. On Docker's containerd image store, LiteVMM asks the embedded containerd daemon to mount the image. That mounted rootfs crosses the existing NFS/WSS peer backplane. No `docker save`, tar archive, `docker load`, or layer replication is performed.
 
 Host B creates only a tiny metadata stub image so Docker has the image configuration it needs for container creation. The `litevmm-remote` OCI runtime then uses the peer rootfs as the OverlayFS lower layer and creates the container's writable upper/work layers locally under `/var/lib/vmapi/remote-container-layers`. Unchanged files continue to come from Host A. Files written or copy-on-written by the container consume storage only on Host B.
 
@@ -263,7 +263,7 @@ The Compose view accepts pasted YAML or uploaded `.yaml`/`.yml` files. VMAPI val
 
 The LiteVMM API and console are always installed. Choose exactly one workload profile:
 
-- `backup` installs backup storage only. It hosts the loopback-only NFSv4/WSS backplane for backups, retained VM replicas, Docker volumes, read-only image-rootfs exports, and other peer storage.
+- `backup` installs backup storage only. It hosts the loopback-only NFS/WSS backplane for backups, retained VM replicas, Docker volumes, read-only image-rootfs exports, and other peer storage.
 - `virtualization` installs VM + backup. It includes QEMU/KVM, VM networking and consoles, cloud-init, overlays, VM backup creation, live disk replication, and the backup storage backplane.
 - `docker` installs Docker + backup. It includes Docker/Compose management, container terminals, peer volumes, federated image discovery, zero-copy peer-backed image rootfs execution, the optional OCI registry, and the backup storage backplane.
 - `virtualization-docker` installs VM + Docker + backup, combining the complete virtualization and Docker feature sets with the backup storage backplane.
@@ -283,14 +283,14 @@ Debian uses Nginx on `127.0.0.1:5186` by default. Alpine uses Lighttpd on the co
 
 ### Containerized backup storage node
 
-The repository root `Dockerfile` builds the backup-storage profile. Because the image starts the kernel NFS server inside the container, it must run with sufficient privileges to mount the `nfsd` pseudo-filesystem:
+`docker/storage/Dockerfile` builds the backup-storage profile for Docker and TrueNAS SCALE. The container uses UNFS3 as a userspace NFSv3 server on an unprivileged loopback-only port, so it does not require privileged mode, added Linux capabilities, host mount access, or the host kernel NFS server.
 
 ```bash
-docker build -t litevmm-backup .
-docker run -d --privileged --name litevmm-backup   -p 5186:5186   -e VMAPI_HTTP_USER=admin   -e VMAPI_HTTP_PASSWORD='choose-a-strong-password'   -v litevmm-backup-data:/var/lib/vmapi   litevmm-backup
+docker build -f docker/storage/Dockerfile -t blaize/litevmm-storage:latest .
+docker run -d --name litevmm-storage -p 5186:5186 -e VMAPI_HTTP_USER=admin -e VMAPI_HTTP_PASSWORD='choose-a-strong-password' -v litevmm-storage-data:/var/lib/vmapi blaize/litevmm-storage:latest
 ```
 
-Only the LiteVMM management port is published. NFS remains on `127.0.0.1:2049` inside the container and is reachable by peers only through `/backplane/storage`.
+Only the LiteVMM management port is published. The userspace NFS endpoint stays inside the container and is reachable by peers only through `/backplane/storage`. Native LiteVMM installs continue to use the kernel NFS backend for every workload profile.
 
 ### HTTPS certificate management
 
@@ -544,7 +544,7 @@ Docker profiles can optionally run a CNCF Distribution `registry:3` container bo
 
 The UI can publish a local image to this registry. A paired Docker-capable LiteVMM host can also pull from or push to the registry directly. Pairing is used to retrieve the registry credential without exposing the peer API credential to the browser; image layers then transfer through the peer's normal HTTPS registry endpoint. Peer registry transfers require HTTPS by default.
 
-This registry is optional and is not the mechanism that makes peer images discoverable. The federated catalog uses the trusted LiteVMM peer API, while peer-backed containers read the source image rootfs through the NFSv4/WSS storage backplane. The OCI registry remains useful when an ordinary Registry v2 endpoint or an intentional copied image is required by software outside LiteVMM.
+This registry is optional and is not the mechanism that makes peer images discoverable. The federated catalog uses the trusted LiteVMM peer API, while peer-backed containers read the source image rootfs through the NFS/WSS storage backplane. The OCI registry remains useful when an ordinary Registry v2 endpoint or an intentional copied image is required by software outside LiteVMM.
 
 ### Docker network management
 
@@ -577,7 +577,7 @@ The console exposes storage as a backend choice rather than requiring the storag
 - SMB/CIFS shares
 - tmpfs memory-backed volumes
 - arbitrary Docker volume drivers and repeated driver options
-- LiteVMM peer volumes backed by the shared NFSv4/WSS storage backplane
+- LiteVMM peer volumes backed by the shared NFS/WSS storage backplane
 
 For example, a host path or network share can be presented to a container as an ordinary named Docker volume. A LiteVMM peer volume follows the same Docker-facing model, but its directory resides on the peer-wide NFSv4 mount whose traffic travels through the existing HTTPS/WSS backplane. SMB credentials entered as local-driver options are visible to Docker administrators through volume inspection, so use a dedicated low-privilege share account.
 
@@ -941,7 +941,7 @@ This intentionally does **not** attempt to become libvirt, Kubernetes or Portain
 
 On the VM side, host DHCP configuration, VFIO/IOMMU binding, snapshots, general storage pools, workload scheduling, automatic HA failover, RAM/CPU state replication, and distributed fencing remain outside this layer. Live replication maintains standby disk copies only. Host bridge creation is intentionally minimal: it creates Linux bridges, optionally attaches member interfaces and writes simple persistence where the host networking stack supports it.
 
-On the Docker side, the project does not duplicate Docker metadata, orchestrate Swarm/Kubernetes, or become a general container platform. LiteVMM peer volumes use the Linux NFSv4 client/server implementation rather than a custom filesystem. The optional local registry is a loopback-bound CNCF Distribution service exposed through LiteVMM's existing HTTP(S) listener; Docker remains authoritative for containers, images, networks, and volumes.
+On the Docker side, the project does not duplicate Docker metadata, orchestrate Swarm/Kubernetes, or become a general container platform. LiteVMM peer volumes use NFS over the existing WebSocket backplane rather than a custom filesystem. Native LiteVMM installs use kernel NFSv4 for every workload profile and the unprivileged storage container uses userspace NFSv3. The optional local registry is a loopback-bound CNCF Distribution service exposed through LiteVMM's existing HTTP(S) listener; Docker remains authoritative for containers, images, networks, and volumes.
 
 The result is one lightweight management plane with two native backends:
 

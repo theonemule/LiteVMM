@@ -23,6 +23,9 @@ BACKUPCTL=${VMAPI_BACKUPCTL:-/usr/local/bin/vmbackupctl}
 VMCTL=${VMAPI_VMCTL:-/usr/local/bin/vmctl}
 OPENSSL_BIN=${OPENSSL_BIN:-openssl}
 CURL_BIN=${CURL_BIN:-curl}
+TLS_MODE=${VMAPI_TLS_MODE:-none}
+TLS_CA_CERT_FILE=${VMAPI_TLS_CA_CERT_FILE:-${VMAPI_TLS_ROOT:-/etc/vmapi/tls}/litevmm-root-ca.crt}
+PEER_CA_ROOT=${VMAPI_PEER_CA_ROOT:-$PEER_ROOT/ca}
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 valid_id() { [[ ${1:-} =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Invalid node id'; }
@@ -33,12 +36,13 @@ now() { date +%s; }
 random_hex() { local bytes=${1:-16}; od -An -N"$bytes" -tx1 /dev/urandom | tr -d ' \n'; }
 peer_file() { printf '%s/%s.conf\n' "$PEER_ROOT" "$1"; }
 peer_public_file() { printf '%s/%s.pub\n' "$PEER_ROOT" "$1"; }
+peer_ca_file() { printf '%s/%s.crt\n' "$PEER_CA_ROOT" "$1"; }
 identity_private_file() { printf '%s/ed25519.pem\n' "$IDENTITY_ROOT"; }
 identity_public_file() { printf '%s/ed25519.pub\n' "$IDENTITY_ROOT"; }
 
 ensure_peer_root() {
   local source target
-  install -d -m 0700 "$PEER_ROOT"
+  install -d -m 0700 "$PEER_ROOT" "$PEER_CA_ROOT"
   # Pairing state is durable host configuration, not web-server configuration.
   # Preserve existing installations when moving the state from the original
   # /etc location to the VMAPI data directory.
@@ -96,6 +100,31 @@ field() { printf '%s\n' "$1" | awk -F= -v k="$2" '$1==k {sub(/^[^=]*=/, ""); pri
 json_field() { printf '%s\n' "$1" | sed -nE "s/.*\"$2\":\"([^\"]*)\".*/\1/p" | head -n1; }
 public_key_b64() { encode_text "$(cat "$(identity_public_file)")"; }
 
+validate_ca_file() {
+  local cert=${1:?certificate required}
+  "$OPENSSL_BIN" x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
+  "$OPENSSL_BIN" x509 -in "$cert" -noout -text 2>/dev/null | grep -q 'CA:TRUE' || return 1
+  "$OPENSSL_BIN" verify -CAfile "$cert" "$cert" >/dev/null 2>&1
+}
+
+local_tls_ca_b64() {
+  if [[ ${VMAPI_TLS_ENABLED:-false} == true && $TLS_MODE == local-ca && -s $TLS_CA_CERT_FILE ]] && validate_ca_file "$TLS_CA_CERT_FILE"; then
+    encode_text "$(cat "$TLS_CA_CERT_FILE")"
+  fi
+}
+
+write_peer_ca() {
+  local encoded=${1-} target=${2:?target required} tmp
+  install -d -m 0700 "$PEER_CA_ROOT"
+  [[ -n $encoded ]] || { rm -f -- "$target"; return 0; }
+  tmp=$(mktemp "$PEER_CA_ROOT/.peer-ca.XXXXXX")
+  decode_text "$encoded" > "$tmp"
+  validate_ca_file "$tmp" || { rm -f -- "$tmp"; die 'Pairing bundle contains an invalid TLS CA certificate'; }
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$target"
+}
+
+
 write_public_key() {
   local encoded=${1:?public key required} target=${2:?target required} tmp
   tmp=$(mktemp "$(dirname "$target")/.peer-public.XXXXXX")
@@ -124,40 +153,45 @@ verify_text() {
 }
 
 request_payload() {
-  local name=$1 id=$2 public_key=$3 fingerprint=$4 relay_user=$5 relay_password=$6 token=$7 expires=$8 endpoint=$9
-  printf 'VMAPI-PAIR-REQUEST-3\nNODE_NAME=%s\nNODE_ID=%s\nPUBLIC_KEY=%s\nPUBLIC_FINGERPRINT=%s\nRELAY_USER=%s\nRELAY_PASSWORD=%s\nPAIR_TOKEN=%s\nEXPIRES=%s\nAPI_ENDPOINT=%s' "$name" "$id" "$public_key" "$fingerprint" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint"
+  local name=$1 id=$2 public_key=$3 fingerprint=$4 relay_user=$5 relay_password=$6 token=$7 expires=$8 endpoint=$9 tls_ca=${10-}
+  printf 'VMAPI-PAIR-REQUEST-4\nNODE_NAME=%s\nNODE_ID=%s\nPUBLIC_KEY=%s\nPUBLIC_FINGERPRINT=%s\nRELAY_USER=%s\nRELAY_PASSWORD=%s\nPAIR_TOKEN=%s\nEXPIRES=%s\nAPI_ENDPOINT=%s\nTLS_CA=%s' "$name" "$id" "$public_key" "$fingerprint" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint" "$tls_ca"
 }
 
 response_payload() {
-  local name=$1 id=$2 public_key=$3 fingerprint=$4 token=$5 expires=$6 endpoint=$7
-  printf 'VMAPI-PAIR-RESPONSE-3\nNODE_NAME=%s\nNODE_ID=%s\nPUBLIC_KEY=%s\nPUBLIC_FINGERPRINT=%s\nPAIR_TOKEN=%s\nEXPIRES=%s\nAPI_ENDPOINT=%s' "$name" "$id" "$public_key" "$fingerprint" "$token" "$expires" "$endpoint"
+  local name=$1 id=$2 public_key=$3 fingerprint=$4 token=$5 expires=$6 endpoint=$7 tls_ca=${8-}
+  printf 'VMAPI-PAIR-RESPONSE-4\nNODE_NAME=%s\nNODE_ID=%s\nPUBLIC_KEY=%s\nPUBLIC_FINGERPRINT=%s\nPAIR_TOKEN=%s\nEXPIRES=%s\nAPI_ENDPOINT=%s\nTLS_CA=%s' "$name" "$id" "$public_key" "$fingerprint" "$token" "$expires" "$endpoint" "$tls_ca"
 }
 
 write_pending() {
-  local name=$1 id=$2 relay_user=$3 relay_password=$4 token=$5 expires=$6 endpoint=$7 tmp
+  local name=$1 id=$2 relay_user=$3 relay_password=$4 token=$5 expires=$6 endpoint=$7 tls_ca=${8-} tmp
   install -d -m 0700 "$PEER_ROOT"
   tmp=$(mktemp "$PEER_ROOT/.pending.XXXXXX")
   {
-    printf 'NAME=%q\n' "$name"; printf 'NODE_ID=%q\n' "$id"; printf 'RELAY_USER=%q\n' "$relay_user"; printf 'RELAY_PASSWORD=%q\n' "$relay_password"; printf 'PAIR_TOKEN=%q\n' "$token"; printf 'EXPIRES=%q\n' "$expires"; printf 'ENDPOINT=%q\n' "$endpoint"
+    printf 'NAME=%q\n' "$name"; printf 'NODE_ID=%q\n' "$id"; printf 'RELAY_USER=%q\n' "$relay_user"; printf 'RELAY_PASSWORD=%q\n' "$relay_password"; printf 'PAIR_TOKEN=%q\n' "$token"; printf 'EXPIRES=%q\n' "$expires"; printf 'ENDPOINT=%q\n' "$endpoint"; printf 'TLS_CA=%q\n' "$tls_ca"
   } > "$tmp"
   chmod 0600 "$tmp"; mv -f "$tmp" "$PEER_ROOT/.pending"
 }
 
 write_peer() {
-  local id=$1 name=$2 public_key=$3 relay_user=$4 relay_password=$5 url=${6-} tmp
+  local id=$1 name=$2 public_key=$3 relay_user=$4 relay_password=$5 url=${6-} tls_ca=${7-} tmp ca_file=''
   valid_id "$id"; valid_name "$name"; valid_relay_user "$relay_user"; valid_relay_password "$relay_password"
   local other RELAY_USER='' RELAY_PASSWORD=''
   for other in "$PEER_ROOT"/*.conf; do
     [[ -f $other && $other != "$(peer_file "$id")" ]] || continue
-    # shellcheck source=/dev/null
     source "$other"
     [[ $RELAY_USER != "$relay_user" ]] || die 'Pairing credential already belongs to another peer; export a new request'
   done
-  install -d -m 0700 "$PEER_ROOT"
+  install -d -m 0700 "$PEER_ROOT" "$PEER_CA_ROOT"
   write_public_key "$public_key" "$(peer_public_file "$id")"
+  if [[ -n $tls_ca ]]; then
+    ca_file=$(peer_ca_file "${id,,}")
+    write_peer_ca "$tls_ca" "$ca_file"
+  else
+    rm -f -- "$(peer_ca_file "${id,,}")"
+  fi
   tmp=$(mktemp "$PEER_ROOT/.${id}.XXXXXX")
   {
-    printf 'NAME=%q\n' "$name"; printf 'NODE_ID=%q\n' "${id,,}"; printf 'PUBLIC_KEY_FILE=%q\n' "$(peer_public_file "$id")"; printf 'PUBLIC_FINGERPRINT=%q\n' "$(key_fingerprint "$(peer_public_file "$id")")"; printf 'RELAY_USER=%q\n' "$relay_user"; printf 'RELAY_PASSWORD=%q\n' "$relay_password"; printf 'URL=%q\n' "$url"; printf 'TRUSTED_AT=%q\n' "$(now)"
+    printf 'NAME=%q\n' "$name"; printf 'NODE_ID=%q\n' "${id,,}"; printf 'PUBLIC_KEY_FILE=%q\n' "$(peer_public_file "$id")"; printf 'PUBLIC_FINGERPRINT=%q\n' "$(key_fingerprint "$(peer_public_file "$id")")"; printf 'RELAY_USER=%q\n' "$relay_user"; printf 'RELAY_PASSWORD=%q\n' "$relay_password"; printf 'URL=%q\n' "$url"; printf 'TLS_CA_FILE=%q\n' "$ca_file"; printf 'TRUSTED_AT=%q\n' "$(now)"
   } > "$tmp"
   chmod 0600 "$tmp"; mv -f "$tmp" "$(peer_file "$id")"
   cmd_sync_auth
@@ -207,13 +241,14 @@ cmd_authorize_user() {
 }
 
 load_peer() {
-  local id=${1:?node id required} NAME='' NODE_ID='' PUBLIC_KEY_FILE='' RELAY_USER='' RELAY_PASSWORD='' URL=''
+  local id=${1:?node id required} NAME='' NODE_ID='' PUBLIC_KEY_FILE='' RELAY_USER='' RELAY_PASSWORD='' URL='' TLS_CA_FILE=''
   valid_id "$id"; [[ -r $(peer_file "$id") ]] || die 'Peer not found'
   # Peer configuration files are written only by this root-owned program.
   # shellcheck source=/dev/null
   source "$(peer_file "$id")"
-  PEER_NODE_ID=${NODE_ID,,}; PEER_PUBLIC_KEY_FILE=$PUBLIC_KEY_FILE; PEER_RELAY_USER=$RELAY_USER; PEER_RELAY_PASSWORD=$RELAY_PASSWORD; PEER_URL=$URL
+  PEER_NODE_ID=${NODE_ID,,}; PEER_PUBLIC_KEY_FILE=$PUBLIC_KEY_FILE; PEER_RELAY_USER=$RELAY_USER; PEER_RELAY_PASSWORD=$RELAY_PASSWORD; PEER_URL=$URL; PEER_TLS_CA_FILE=$TLS_CA_FILE
   valid_id "$PEER_NODE_ID"; [[ -r $PEER_PUBLIC_KEY_FILE ]] || die 'Peer public key is missing'; valid_relay_user "$PEER_RELAY_USER"; valid_relay_password "$PEER_RELAY_PASSWORD"
+  [[ -z $PEER_TLS_CA_FILE || -r $PEER_TLS_CA_FILE ]] || die 'Peer TLS CA certificate is missing; re-pair this host'
 }
 
 valid_url() { [[ ${1:-} =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^[:space:]?#]*)?$ ]] || die 'Peer endpoint must be an HTTP(S) base URL'; }
@@ -250,46 +285,30 @@ cmd_identity() {
 }
 
 cmd_request() {
-  local requested_name=${1-} requested_endpoint=${2-} name endpoint id public_key fingerprint relay_user relay_password token expires payload signature pending_id pending_name pending_relay_user pending_relay_password pending_token pending_expires pending_endpoint
+  local requested_name=${1-} requested_endpoint=${2-} name endpoint id public_key fingerprint relay_user relay_password token expires tls_ca payload signature
   ensure_identity; id=$(node_id); public_key=$(public_key_b64); fingerprint=$(key_fingerprint "$(identity_public_file)")
-
-  # A pairing response is bound to this request's token and expiration.  Export is
-  # intentionally idempotent while a valid request is pending: a second click in
-  # the UI must not invalidate the bundle that was already taken to the other host.
   if [[ -r $PEER_ROOT/.pending ]]; then
-    NAME=''; NODE_ID=''; RELAY_USER=''; RELAY_PASSWORD=''; PAIR_TOKEN=''; EXPIRES=''; ENDPOINT=''
+    NAME=''; NODE_ID=''; RELAY_USER=''; RELAY_PASSWORD=''; PAIR_TOKEN=''; EXPIRES=''; ENDPOINT=''; TLS_CA=''
     source "$PEER_ROOT/.pending"
-    pending_name=$NAME; pending_id=${NODE_ID,,}; pending_relay_user=$RELAY_USER; pending_relay_password=$RELAY_PASSWORD; pending_token=$PAIR_TOKEN; pending_expires=$EXPIRES; pending_endpoint=$ENDPOINT
-    if [[ $pending_id == "$id" && $pending_name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && $pending_relay_user =~ ^[A-Za-z0-9._-]{1,64}$ && $pending_relay_password =~ ^[A-Fa-f0-9]{48,128}$ && $pending_token =~ ^[A-Fa-f0-9]{32}$ && $pending_expires =~ ^[0-9]{10}$ && $pending_expires -ge $(now) && -n $pending_endpoint ]]; then
-      valid_url "$pending_endpoint"
-      payload=$(request_payload "$pending_name" "$id" "$public_key" "$fingerprint" "$pending_relay_user" "$pending_relay_password" "$pending_token" "$pending_expires" "$pending_endpoint")
+    if [[ ${NODE_ID,,} == "$id" && $EXPIRES =~ ^[0-9]{10}$ && $EXPIRES -ge $(now) ]]; then
+      payload=$(request_payload "$NAME" "$id" "$public_key" "$fingerprint" "$RELAY_USER" "$RELAY_PASSWORD" "$PAIR_TOKEN" "$EXPIRES" "$ENDPOINT" "$TLS_CA")
       signature=$(sign_text "$(identity_private_file)" "$payload")
-      encode_text "${payload}"$'\n'"SIGNATURE=${signature}"; printf '\n'
-      return
+      encode_text "${payload}"$'\n'"SIGNATURE=${signature}"; printf '\n'; return
     fi
     rm -f -- "$PEER_ROOT/.pending"
   fi
-
-  name=${requested_name:-$(node_name)}; endpoint=$(normalized_peer_url "${requested_endpoint:?local API endpoint required}"); valid_name "$name"; valid_url "$endpoint"
-  relay_user="relay_$(random_hex 16)"; relay_password=$(random_hex 32); token=$(random_hex 16); expires=$(( $(now) + PAIR_TTL ))
-  write_pending "$name" "$id" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint"
-  payload=$(request_payload "$name" "$id" "$public_key" "$fingerprint" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint")
+  name=${requested_name:-$(node_name)}; endpoint=$(normalized_peer_url "${requested_endpoint:?local API endpoint required}")
+  valid_name "$name"; valid_url "$endpoint"
+  relay_user="relay_$(random_hex 16)"; relay_password=$(random_hex 32); token=$(random_hex 16); expires=$(( $(now) + PAIR_TTL )); tls_ca=$(local_tls_ca_b64)
+  write_pending "$name" "$id" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint" "$tls_ca"
+  payload=$(request_payload "$name" "$id" "$public_key" "$fingerprint" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint" "$tls_ca")
   signature=$(sign_text "$(identity_private_file)" "$payload")
   encode_text "${payload}"$'\n'"SIGNATURE=${signature}"; printf '\n'
 }
 
 cmd_pending() {
-  local id public_key fingerprint pending_id pending_name pending_relay_user pending_relay_password pending_token pending_expires pending_endpoint payload signature
-  ensure_identity; [[ -r $PEER_ROOT/.pending ]] || die 'No pending pairing request'
-  id=$(node_id); public_key=$(public_key_b64); fingerprint=$(key_fingerprint "$(identity_public_file)")
-  NAME=''; NODE_ID=''; RELAY_USER=''; RELAY_PASSWORD=''; PAIR_TOKEN=''; EXPIRES=''; ENDPOINT=''
-  source "$PEER_ROOT/.pending"
-  pending_name=$NAME; pending_id=${NODE_ID,,}; pending_relay_user=$RELAY_USER; pending_relay_password=$RELAY_PASSWORD; pending_token=$PAIR_TOKEN; pending_expires=$EXPIRES; pending_endpoint=$ENDPOINT
-  [[ $pending_id == "$id" && $pending_name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && $pending_relay_user =~ ^[A-Za-z0-9._-]{1,64}$ && $pending_relay_password =~ ^[A-Fa-f0-9]{48,128}$ && $pending_token =~ ^[A-Fa-f0-9]{32}$ && $pending_expires =~ ^[0-9]{10}$ && $pending_expires -ge $(now) && -n $pending_endpoint ]] || die 'The pending pairing request is incomplete; revoke it and export a new request with an API endpoint'
-  valid_url "$pending_endpoint"
-  payload=$(request_payload "$pending_name" "$id" "$public_key" "$fingerprint" "$pending_relay_user" "$pending_relay_password" "$pending_token" "$pending_expires" "$pending_endpoint")
-  signature=$(sign_text "$(identity_private_file)" "$payload")
-  encode_text "${payload}"$'\n'"SIGNATURE=${signature}"; printf '\n'
+  [[ -r $PEER_ROOT/.pending ]] || die 'No pending pairing request'
+  cmd_request
 }
 
 cmd_cancel_pending() {
@@ -299,37 +318,47 @@ cmd_cancel_pending() {
 }
 
 cmd_accept() {
-  local bundle=${1:?request bundle required} requested_name=${2-} requested_endpoint=${3-} data name id public_key fingerprint relay_user relay_password token expires endpoint signature payload incoming_public myid myname myendpoint mypublic myfingerprint response response_signature
+  local bundle=${1:?request bundle required} requested_name=${2-} requested_endpoint=${3-} data name id public_key fingerprint relay_user relay_password token expires endpoint tls_ca signature payload incoming_public
+  local myid myname myendpoint mypublic myfingerprint my_tls_ca response response_signature
   ensure_identity; data=$(decode_text "$bundle")
-  [[ ${data%%$'\n'*} == VMAPI-PAIR-REQUEST-3 ]] || die 'Unsupported pairing request; export a new request that includes an API endpoint'
-  name=$(field "$data" NODE_NAME); id=$(field "$data" NODE_ID); public_key=$(field "$data" PUBLIC_KEY); fingerprint=$(field "$data" PUBLIC_FINGERPRINT); relay_user=$(field "$data" RELAY_USER); relay_password=$(field "$data" RELAY_PASSWORD); token=$(field "$data" PAIR_TOKEN); expires=$(field "$data" EXPIRES); endpoint=$(normalized_peer_url "$(field "$data" API_ENDPOINT)"); signature=$(field "$data" SIGNATURE)
+  [[ ${data%%$'\n'*} == VMAPI-PAIR-REQUEST-4 ]] || die 'Unsupported pairing request; export a new request'
+  name=$(field "$data" NODE_NAME); id=$(field "$data" NODE_ID); public_key=$(field "$data" PUBLIC_KEY); fingerprint=$(field "$data" PUBLIC_FINGERPRINT)
+  relay_user=$(field "$data" RELAY_USER); relay_password=$(field "$data" RELAY_PASSWORD); token=$(field "$data" PAIR_TOKEN); expires=$(field "$data" EXPIRES)
+  endpoint=$(normalized_peer_url "$(field "$data" API_ENDPOINT)"); tls_ca=$(field "$data" TLS_CA); signature=$(field "$data" SIGNATURE)
   valid_name "$name"; valid_id "$id"; valid_relay_user "$relay_user"; valid_relay_password "$relay_password"; valid_url "$endpoint"
   [[ $fingerprint =~ ^[A-Fa-f0-9]{64}$ && $token =~ ^[A-Fa-f0-9]{32}$ && $expires =~ ^[0-9]{10}$ && $expires -ge $(now) && $expires -le $(( $(now) + PAIR_TTL + 60 )) ]] || die 'Invalid or expired pairing request'
   incoming_public=$(mktemp); write_public_key "$public_key" "$incoming_public"
   [[ $(key_fingerprint "$incoming_public") == "${fingerprint,,}" ]] || { rm -f -- "$incoming_public"; die 'Pairing request public-key fingerprint mismatch'; }
-  payload=$(request_payload "$name" "$id" "$public_key" "$fingerprint" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint")
+  payload=$(request_payload "$name" "$id" "$public_key" "$fingerprint" "$relay_user" "$relay_password" "$token" "$expires" "$endpoint" "$tls_ca")
   verify_text "$incoming_public" "$payload" "$signature" || { rm -f -- "$incoming_public"; die 'Pairing request signature is invalid'; }
   rm -f -- "$incoming_public"; myid=$(node_id); [[ ${id,,} != "$myid" ]] || die 'A node cannot pair with itself'; [[ ! -e $(peer_file "$id") ]] || die 'Peer already exists; revoke it before pairing again'
-  write_peer "$id" "$name" "$public_key" "$relay_user" "$relay_password" "$endpoint"
-  myname=${requested_name:-$(node_name)}; myendpoint=$(normalized_peer_url "${requested_endpoint:?local API endpoint required}"); valid_name "$myname"; valid_url "$myendpoint"; mypublic=$(public_key_b64); myfingerprint=$(key_fingerprint "$(identity_public_file)")
-  response=$(response_payload "$myname" "$myid" "$mypublic" "$myfingerprint" "$token" "$expires" "$myendpoint"); response_signature=$(sign_text "$(identity_private_file)" "$response")
+  write_peer "$id" "$name" "$public_key" "$relay_user" "$relay_password" "$endpoint" "$tls_ca"
+  myname=${requested_name:-$(node_name)}; myendpoint=$(normalized_peer_url "${requested_endpoint:?local API endpoint required}"); valid_name "$myname"; valid_url "$myendpoint"
+  mypublic=$(public_key_b64); myfingerprint=$(key_fingerprint "$(identity_public_file)"); my_tls_ca=$(local_tls_ca_b64)
+  response=$(response_payload "$myname" "$myid" "$mypublic" "$myfingerprint" "$token" "$expires" "$myendpoint" "$my_tls_ca")
+  response_signature=$(sign_text "$(identity_private_file)" "$response")
   encode_text "${response}"$'\n'"SIGNATURE=${response_signature}"; printf '\n'
 }
 
 cmd_complete() {
-  local bundle=${1:?response bundle required} data pending_name pending_id pending_relay_user pending_relay_password pending_token pending_expires name id public_key fingerprint token expires endpoint signature payload incoming_public
+  local bundle=${1:?response bundle required} data pending_name pending_id pending_relay_user pending_relay_password pending_token pending_expires
+  local name id public_key fingerprint token expires endpoint tls_ca signature payload incoming_public
   [[ -r $PEER_ROOT/.pending ]] || die 'No pending pairing request'
-  source "$PEER_ROOT/.pending"; pending_name=$NAME; pending_id=$NODE_ID; pending_relay_user=$RELAY_USER; pending_relay_password=$RELAY_PASSWORD; pending_token=$PAIR_TOKEN; pending_expires=$EXPIRES
+  NAME=''; NODE_ID=''; RELAY_USER=''; RELAY_PASSWORD=''; PAIR_TOKEN=''; EXPIRES=''; ENDPOINT=''; TLS_CA=''; source "$PEER_ROOT/.pending"
+  pending_name=$NAME; pending_id=$NODE_ID; pending_relay_user=$RELAY_USER; pending_relay_password=$RELAY_PASSWORD; pending_token=$PAIR_TOKEN; pending_expires=$EXPIRES
   [[ $pending_expires =~ ^[0-9]{10}$ && $pending_expires -ge $(now) ]] || die 'The pending pairing request expired; create a new one'
-  data=$(decode_text "$bundle"); [[ ${data%%$'\n'*} == VMAPI-PAIR-RESPONSE-3 ]] || die 'Unsupported pairing response; create a new request bundle'
-  name=$(field "$data" NODE_NAME); id=$(field "$data" NODE_ID); public_key=$(field "$data" PUBLIC_KEY); fingerprint=$(field "$data" PUBLIC_FINGERPRINT); token=$(field "$data" PAIR_TOKEN); expires=$(field "$data" EXPIRES); endpoint=$(normalized_peer_url "$(field "$data" API_ENDPOINT)"); signature=$(field "$data" SIGNATURE)
-  valid_name "$name"; valid_id "$id"; valid_url "$endpoint"; [[ $fingerprint =~ ^[A-Fa-f0-9]{64}$ && $token == "$pending_token" && $expires == "$pending_expires" ]] || die 'Pairing response does not match the pending request'; [[ ${id,,} != "${pending_id,,}" ]] || die 'A node cannot pair with itself'; [[ ! -e $(peer_file "$id") ]] || die 'Peer already exists; revoke it before pairing again'
+  data=$(decode_text "$bundle"); [[ ${data%%$'\n'*} == VMAPI-PAIR-RESPONSE-4 ]] || die 'Unsupported pairing response; create a new request bundle'
+  name=$(field "$data" NODE_NAME); id=$(field "$data" NODE_ID); public_key=$(field "$data" PUBLIC_KEY); fingerprint=$(field "$data" PUBLIC_FINGERPRINT)
+  token=$(field "$data" PAIR_TOKEN); expires=$(field "$data" EXPIRES); endpoint=$(normalized_peer_url "$(field "$data" API_ENDPOINT)"); tls_ca=$(field "$data" TLS_CA); signature=$(field "$data" SIGNATURE)
+  valid_name "$name"; valid_id "$id"; valid_url "$endpoint"
+  [[ $fingerprint =~ ^[A-Fa-f0-9]{64}$ && $token == "$pending_token" && $expires == "$pending_expires" ]] || die 'Pairing response does not match the pending request'
+  [[ ${id,,} != "${pending_id,,}" ]] || die 'A node cannot pair with itself'; [[ ! -e $(peer_file "$id") ]] || die 'Peer already exists; revoke it before pairing again'
   incoming_public=$(mktemp); write_public_key "$public_key" "$incoming_public"
   [[ $(key_fingerprint "$incoming_public") == "${fingerprint,,}" ]] || { rm -f -- "$incoming_public"; die 'Pairing response public-key fingerprint mismatch'; }
-  payload=$(response_payload "$name" "$id" "$public_key" "$fingerprint" "$token" "$expires" "$endpoint")
+  payload=$(response_payload "$name" "$id" "$public_key" "$fingerprint" "$token" "$expires" "$endpoint" "$tls_ca")
   verify_text "$incoming_public" "$payload" "$signature" || { rm -f -- "$incoming_public"; die 'Pairing response signature is invalid'; }
-  rm -f -- "$incoming_public"; write_peer "$id" "$name" "$public_key" "$pending_relay_user" "$pending_relay_password" "$endpoint"; rm -f -- "$PEER_ROOT/.pending"
-  printf '{"trusted":true,"node_id":"%s","name":"%s","api_auth":"basic","public_key_fingerprint":"%s"}\n' "${id,,}" "$(json_escape "$name")" "${fingerprint,,}"
+  rm -f -- "$incoming_public"; write_peer "$id" "$name" "$public_key" "$pending_relay_user" "$pending_relay_password" "$endpoint" "$tls_ca"; rm -f -- "$PEER_ROOT/.pending"
+  printf '{"trusted":true,"node_id":"%s","name":"%s","api_auth":"basic","public_key_fingerprint":"%s","tls_ca":%s}\n' "${id,,}" "$(json_escape "$name")" "${fingerprint,,}" "$([[ -n $tls_ca ]] && printf true || printf false)"
 }
 
 cmd_list() {
@@ -360,7 +389,8 @@ cmd_transport_profile() {
     *) die 'Peer API endpoint uses an unsupported scheme';;
   esac
   endpoint="${scheme}://$(url_origin "$PEER_URL" | cut -d/ -f3)"
-  printf '{"node_id":"%s","endpoint":"%s","username":"%s","password":"%s"}\n'     "$(json_escape "$PEER_NODE_ID")" "$(json_escape "$endpoint")" "$(json_escape "$PEER_RELAY_USER")" "$(json_escape "$PEER_RELAY_PASSWORD")"
+  printf '{"node_id":"%s","endpoint":"%s","username":"%s","password":"%s","ca_file":"%s"}\n' \
+    "$(json_escape "$PEER_NODE_ID")" "$(json_escape "$endpoint")" "$(json_escape "$PEER_RELAY_USER")" "$(json_escape "$PEER_RELAY_PASSWORD")" "$(json_escape "$PEER_TLS_CA_FILE")"
 }
 
 cmd_overlay_profile() {
@@ -374,8 +404,8 @@ cmd_overlay_profile() {
     *) die 'Peer API endpoint uses an unsupported scheme';;
   esac
   endpoint="${scheme}://$(url_origin "$PEER_URL" | cut -d/ -f3)/overlay"
-  printf '{"node_id":"%s","endpoint":"%s","username":"%s","password":"%s"}\n' \
-    "$(json_escape "$PEER_NODE_ID")" "$(json_escape "$endpoint")" "$(json_escape "$PEER_RELAY_USER")" "$(json_escape "$PEER_RELAY_PASSWORD")"
+  printf '{"node_id":"%s","endpoint":"%s","username":"%s","password":"%s","ca_file":"%s"}\n' \
+    "$(json_escape "$PEER_NODE_ID")" "$(json_escape "$endpoint")" "$(json_escape "$PEER_RELAY_USER")" "$(json_escape "$PEER_RELAY_PASSWORD")" "$(json_escape "$PEER_TLS_CA_FILE")"
 }
 
 cmd_cors_origin() {
@@ -392,6 +422,7 @@ cmd_proxy() {
   [[ $method =~ ^(GET|POST|PUT|PATCH|DELETE|HEAD)$ ]] || die 'Invalid peer request method'; valid_proxy_path "$path"; load_peer "$id"; [[ -n $PEER_URL ]] || die 'Peer has no API URL; set its endpoint first'; [[ -z $content_type || ($content_type != *$'\r'* && $content_type != *$'\n'* && ${#content_type} -le 256) ]] || die 'Invalid content type'
   remote_path=$(peer_api_path "$path"); target_url="$(normalized_peer_url "$PEER_URL")$remote_path"
   local -a args=("$CURL_BIN" --fail-with-body --show-error --silent --request "$method" --connect-timeout 10 --max-time 3600 --basic --user "$PEER_RELAY_USER:$PEER_RELAY_PASSWORD")
+  [[ $PEER_URL != https://* || -z $PEER_TLS_CA_FILE ]] || args+=(--cacert "$PEER_TLS_CA_FILE")
   [[ -n $content_type ]] && args+=(--header "Content-Type: $content_type")
   case "$method" in GET|HEAD) ;; *) args+=(--data-binary @-);; esac
   "${args[@]}" "$target_url"
@@ -435,7 +466,7 @@ cmd_revoke() {
   if [[ -x $REPLICATIONCTL ]]; then "$REPLICATIONCTL" revoke-peer "$id" "$relay_user" || true; fi
   if [[ -x $PEER_VOLUMECTL ]]; then "$PEER_VOLUMECTL" revoke-peer "$id" "$relay_user" || true; fi
   if [[ -x $BACKPLANECTL ]]; then "$BACKPLANECTL" revoke-peer "$id" || true; fi
-  rm -f -- "$(peer_file "$id")" "$(peer_public_file "$id")"
+  rm -f -- "$(peer_file "$id")" "$(peer_public_file "$id")" "$(peer_ca_file "$id")"
   cmd_sync_auth
   # Close existing WebSockets as well as rejecting future upgrades.
   flock -u 9

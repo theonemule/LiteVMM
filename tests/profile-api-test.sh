@@ -42,6 +42,7 @@ import json,sys
 x=json.loads(sys.argv[1])
 assert x['profile']=='backup'
 assert 'backup-storage' in x['capabilities']
+assert 'files' in x['capabilities'] and 'host-terminal' in x['capabilities']
 assert 'storage-backplane' not in x['capabilities']
 assert 'backplane-client' not in x['capabilities']
 assert 'qemu-kvm' not in x['capabilities'] and 'docker' not in x['capabilities']

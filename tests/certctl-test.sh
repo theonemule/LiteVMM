@@ -68,11 +68,26 @@ run_certctl(){
     bash "$ROOT/bin/certctl" "$@"
 }
 
+out=$(run_certctl self-sign local.example.com '127.0.0.1,alt.local.example.com' 30)
+[[ $out == *'"tls_enabled":true'* && $out == *'"mode":"local-ca"'* && $out == *'"local_ca_available":true'* ]]
+ca_cert=$(awk -F= '$1=="VMAPI_TLS_CA_CERT_FILE"{print $2}' "$T/vmapi.conf")
+ca_key=$(awk -F= '$1=="VMAPI_TLS_CA_KEY_FILE"{print $2}' "$T/vmapi.conf")
+local_cert=$(awk -F= '$1=="VMAPI_TLS_CERT_FILE"{print $2}' "$T/vmapi.conf")
+local_key=$(awk -F= '$1=="VMAPI_TLS_KEY_FILE"{print $2}' "$T/vmapi.conf")
+sudo -n test -s "$ca_cert" && sudo -n test -s "$ca_key" && sudo -n test -s "$local_cert" && sudo -n test -s "$local_key"
+[[ $(sudo -n stat -c %a "$ca_key") == 600 ]]
+sudo -n openssl x509 -in "$ca_cert" -noout -text | grep -Fq 'CA:TRUE'
+sudo -n openssl verify -CAfile "$ca_cert" "$local_cert" | grep -Fq ': OK'
+sudo -n openssl x509 -in "$local_cert" -noout -ext subjectAltName | grep -Fq 'DNS:local.example.com'
+sudo -n openssl x509 -in "$local_cert" -noout -ext subjectAltName | grep -Fq 'IP Address:127.0.0.1'
+sudo -n openssl x509 -in "$local_cert" -noout -ext subjectAltName | grep -Fq 'DNS:alt.local.example.com'
+run_certctl ca-show | grep -Fq 'BEGIN CERTIFICATE'
+
 out=$(run_certctl csr-generate demo.example.com alt.example.com 'Example Corp' Infrastructure US NC Charlotte rsa2048)
 [[ $out == *'"generated":true'* ]]
 sudo -n openssl req -in "$T/tls/demo.example.com.csr" -noout -text | grep -Fq 'DNS:demo.example.com, DNS:alt.example.com'
 grep -Fq "VMAPI_TLS_CSR_DOMAIN=demo.example.com" "$T/vmapi.conf"
-grep -Fq "VMAPI_TLS_ENABLED=false" "$T/vmapi.conf"
+grep -Fq "VMAPI_TLS_ENABLED=true" "$T/vmapi.conf"
 
 sudo -n openssl x509 -req -in "$T/tls/demo.example.com.csr" -signkey "$T/tls/demo.example.com.key" \
   -days 30 -copy_extensions copy -out "$T/signed.pem" >/dev/null 2>&1
@@ -148,5 +163,14 @@ sudo -n grep -Fq 'BEGIN PRIVATE KEY' "$T/light/server.pem"
 sudo -n grep -Fq 'BEGIN CERTIFICATE' "$T/light/server.pem"
 run_light_certctl disable >/dev/null
 [[ ! -e "$T/light/10-tls.conf" && ! -e "$T/light/server.pem" ]]
+
+# Container config is a symlink into persistent storage. Certificate updates
+# must write through it without replacing the link.
+mkdir -p "$T/persistent"
+cp "$T/vmapi.conf" "$T/persistent/vmapi.conf"
+ln -s "$T/persistent/vmapi.conf" "$T/vmapi-link.conf"
+sudo -n env PATH="$T/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" VMAPI_CONFIG="$T/vmapi-link.conf" VMAPI_TLS_ROOT="$T/tls" VMAPI_NGINX_SITE="$T/nginx/vmapi" bash "$ROOT/bin/certctl" disable >/dev/null
+[[ -L "$T/vmapi-link.conf" ]]
+grep -Fqx 'VMAPI_TLS_ENABLED=false' "$T/persistent/vmapi.conf"
 
 echo 'certificate lifecycle: PASS'

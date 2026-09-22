@@ -39,11 +39,14 @@ calc=$(printf '%s\n' "$password" | openssl passwd -apr1 -salt "$salt" -stdin)
 MOCK
 chmod +x "$T/bin/htpasswd"
 
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=LiteVMM A Root' -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' -keyout "$T/a-ca.key" -out "$T/a-ca.crt" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=LiteVMM B Root' -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' -keyout "$T/b-ca.key" -out "$T/b-ca.crt" >/dev/null 2>&1
+
 run_a() {
-  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" VMAPI_PEER_PASSWD_FILE="$T/a/passwd" VMAPI_OVERLAYCTL=/nonexistent VMCTL=true BACKUPCTL=true bash "$ROOT/bin/peerctl" "$@"
+  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/a/peers" VMAPI_IDENTITY_ROOT="$T/a/identity" VMAPI_NODE_ID_FILE="$T/a/node-id" VMAPI_PEER_NONCE_ROOT="$T/a/nonces" VMAPI_PEER_PASSWD_FILE="$T/a/passwd" VMAPI_OVERLAYCTL=/nonexistent VMAPI_TLS_ENABLED=true VMAPI_TLS_MODE=local-ca VMAPI_TLS_CA_CERT_FILE="$T/a-ca.crt" VMCTL=true BACKUPCTL=true bash "$ROOT/bin/peerctl" "$@"
 }
 run_b() {
-  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/b/peers" VMAPI_IDENTITY_ROOT="$T/b/identity" VMAPI_NODE_ID_FILE="$T/b/node-id" VMAPI_PEER_NONCE_ROOT="$T/b/nonces" VMAPI_PEER_PASSWD_FILE="$T/b/passwd" VMAPI_OVERLAYCTL=/nonexistent VMCTL=true BACKUPCTL=true bash "$ROOT/bin/peerctl" "$@"
+  PATH="$T/bin:$PATH" VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_PEER_ROOT="$T/b/peers" VMAPI_IDENTITY_ROOT="$T/b/identity" VMAPI_NODE_ID_FILE="$T/b/node-id" VMAPI_PEER_NONCE_ROOT="$T/b/nonces" VMAPI_PEER_PASSWD_FILE="$T/b/passwd" VMAPI_OVERLAYCTL=/nonexistent VMAPI_TLS_ENABLED=true VMAPI_TLS_MODE=local-ca VMAPI_TLS_CA_CERT_FILE="$T/b-ca.crt" VMCTL=true BACKUPCTL=true bash "$ROOT/bin/peerctl" "$@"
 }
 
 request=$(run_a request node-a https://node-a.example)
@@ -53,6 +56,7 @@ request=$(run_a request node-a https://node-a.example)
 response=$(run_b accept "$request" node-b https://node-b.example)
 complete=$(run_a complete "$response")
 grep -q '"trusted":true' <<< "$complete"
+grep -q '"tls_ca":true' <<< "$complete"
 
 a_id=$(run_a identity | sed -nE 's/.*"node_id":"([^"]+)".*/\1/p')
 b_id=$(run_b identity | sed -nE 's/.*"node_id":"([^"]+)".*/\1/p')
@@ -70,6 +74,11 @@ grep -q '"username":"relay_' <<< "$profile"
 transport=$(run_a transport-profile "$b_id")
 grep -q '"endpoint":"wss://node-b.example"' <<< "$transport"
 grep -q '"username":"relay_' <<< "$transport"
+grep -q '"ca_file":"' <<< "$transport"
+source "$T/a/peers/$b_id.conf"
+[[ -r $TLS_CA_FILE ]]
+openssl verify -CAfile "$T/b-ca.crt" "$TLS_CA_FILE" >/dev/null
+[[ $(openssl x509 -in "$T/b-ca.crt" -noout -fingerprint -sha256) == "$(openssl x509 -in "$TLS_CA_FILE" -noout -fingerprint -sha256)" ]]
 
 # Both hosts hash the identical paired HTTP credential; no signature headers.
 source "$T/a/peers/$b_id.conf"
@@ -84,6 +93,7 @@ credential='' target=''
 while (($#)); do
   case "$1" in
     --user) credential=$2; shift 2;;
+    --cacert) [[ -r $2 ]] || exit 1; grep -Fq 'BEGIN CERTIFICATE' "$2" || exit 1; shift 2;;
     --header) [[ $2 != X-VMAPI-* ]] || exit 1; shift 2;;
     --request|--connect-timeout|--max-time|--data-binary) shift 2;;
     --fail-with-body|--show-error|--silent|--basic) shift;;
@@ -132,7 +142,7 @@ method=GET; target=''
 while (($#)); do
   case "$1" in
     --request) method=$2; shift 2;;
-    --user|--connect-timeout|--max-time|--header|--data-binary) shift 2;;
+    --user|--connect-timeout|--max-time|--header|--data-binary|--cacert) shift 2;;
     --fail-with-body|--show-error|--silent|--basic) shift;;
     *) target=$1; shift;;
   esac

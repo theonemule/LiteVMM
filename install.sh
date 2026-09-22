@@ -97,7 +97,7 @@ install_packages() {
         virtualization) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc ttyd xorriso nfs-utils;;
         docker) apk add --no-cache docker docker-openrc docker-cli-compose ttyd nfs-utils;;
         virtualization-docker) apk add --no-cache iptables nftables socat kmod tcpdump qemu-img qemu-system-x86_64 ovmf novnc ttyd xorriso docker docker-openrc docker-cli-compose nfs-utils;;
-        backup) apk add --no-cache iproute2 nfs-utils;;
+        backup) apk add --no-cache iproute2 ttyd nfs-utils;;
       esac
       apk add --no-cache certbot
       ;;
@@ -109,7 +109,7 @@ install_packages() {
         virtualization) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf ttyd xorriso nfs-common nfs-kernel-server;;
         docker) apt-get install -y --no-install-recommends docker.io ttyd nfs-common nfs-kernel-server;;
         virtualization-docker) apt-get install -y --no-install-recommends iptables nftables socat kmod tcpdump qemu-system-x86 qemu-utils ovmf docker.io ttyd xorriso nfs-common nfs-kernel-server;;
-        backup) apt-get install -y --no-install-recommends iproute2 nfs-common nfs-kernel-server;;
+        backup) apt-get install -y --no-install-recommends iproute2 ttyd nfs-common nfs-kernel-server;;
       esac
       apt-get install -y --no-install-recommends certbot
       ;;
@@ -156,12 +156,25 @@ set_host_config() {
   cat "$tmp" > "$file"; rm -f "$tmp"
 }
 
+set_native_backplane_config() {
+  # install.sh always performs a native OS install, whether the host is a VM or
+  # physical machine. Workload profile selection must never change the NFS
+  # implementation: every native install uses the kernel NFSv4 backplane.
+  set_host_config VMAPI_BACKPLANE_NFS_BACKEND kernel
+  set_host_config VMAPI_BACKPLANE_NFS_VERSION 4.2
+  set_host_config VMAPI_BACKPLANE_NFS_EXPORT /
+  set_host_config VMAPI_BACKPLANE_NFS_BIND 127.0.0.1
+  set_host_config VMAPI_BACKPLANE_NFS_PORT 2049
+  set_host_config VMAPI_BACKPLANE_NFS_EXPORT_CLIENT 127.0.0.1
+}
+
 activate_requested_profile() {
   install -d -m 0755 /etc/vmapi
   [[ -f /etc/vmapi/vmapi.conf ]] || install -m 0644 "$BASE/etc/vmapi.conf" /etc/vmapi/vmapi.conf
   set_host_config VMAPI_PROFILE "$PROFILE"
   set_host_config VMAPI_HTTP_PORT "$HTTP_PORT"
   set_host_config VMAPI_BACKPLANE_SERVER true
+  set_native_backplane_config
 }
 
 disable_native_nfs() {
@@ -187,6 +200,7 @@ install_common_files() {
   set_host_config VMAPI_PROFILE "$PROFILE"
   set_host_config VMAPI_HTTP_PORT "$HTTP_PORT"
   set_host_config VMAPI_BACKPLANE_SERVER true
+  set_native_backplane_config
   install -m 0644 "$BASE/lib/common.sh" /usr/local/lib/vmapi/common.sh
   install -m 0644 "$BASE/VERSION" /usr/share/vmapi/VERSION
   for tool in vmapi vmapi-web-reload vmctl imagectl netctl dockerctl dockerexecctl hostexecctl logctl docker-imagectl docker-netctl docker-volumectl dockercompoectl docker-federationctl docker-rootfsctl litevmm-docker litevmm-runc metricsctl consolectl peerctl vmbackupctl replicationctl registryctl peer-volumectl backplanectl filectl storagectl overlayctl certctl vmapi-console-gc vmapi-autostart vmapi-stopall; do
@@ -223,7 +237,7 @@ write_sudoers() {
   install -d -m 0750 /etc/sudoers.d
   {
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/logctl *'
-    echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable'
+    echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl self-sign *, /usr/local/bin/certctl ca-show, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable'
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peerctl identity, /usr/local/bin/peerctl request, /usr/local/bin/peerctl request *, /usr/local/bin/peerctl pending, /usr/local/bin/peerctl cancel-pending, /usr/local/bin/peerctl accept *, /usr/local/bin/peerctl complete *, /usr/local/bin/peerctl list, /usr/local/bin/peerctl set-url *, /usr/local/bin/peerctl authorize-user *, /usr/local/bin/peerctl cors-origin *, /usr/local/bin/peerctl proxy *, /usr/local/bin/peerctl revoke *'
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/backplanectl list, /usr/local/bin/backplanectl show *, /usr/local/bin/backplanectl path *, /usr/local/bin/backplanectl shared-path *, /usr/local/bin/backplanectl server-status'
     echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/peer-volumectl list-hosted, /usr/local/bin/peer-volumectl list-hosted *, /usr/local/bin/peer-volumectl show-hosted *, /usr/local/bin/peer-volumectl delete-hosted *'
@@ -276,6 +290,8 @@ write_sudoers() {
       backup)
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/vmbackupctl list, /usr/local/bin/vmbackupctl list *, /usr/local/bin/vmbackupctl download *, /usr/local/bin/vmbackupctl delete *'
         echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/replicationctl replica-purge *, /usr/local/bin/replicationctl replica-show *, /usr/local/bin/replicationctl replica-list'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop'
+        echo 'vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *'
         ;;
     esac
   } > /etc/sudoers.d/vmapi
@@ -345,7 +361,7 @@ configure_alpine() {
       rc-update add docker default >/dev/null 2>&1 || true; rc-service docker restart || rc-service docker start || true
       for svc in vmapi-network vmapi-autostart ttyd-vmapi ttyd-host-vmapi vmapi-console-gc vmapi-overlay vmapi-replication vmapi-backplane vmapi-backplane-server; do rc-update add "$svc" default >/dev/null 2>&1 || true; done
       rc-service ttyd-vmapi restart; rc-service ttyd-host-vmapi restart; rc-service vmapi-console-gc restart;;
-    backup) rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true; rc-service vmapi-backplane-server restart || true;;
+    backup) rc-update add vmapi-backplane-server default >/dev/null 2>&1 || true; rc-service vmapi-backplane-server restart || true; rc-update add ttyd-host-vmapi default >/dev/null 2>&1 || true; rc-service ttyd-host-vmapi restart;;
   esac
 }
 
@@ -390,7 +406,7 @@ configure_debian() {
     virtualization) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-host-vmapi.service;;
     docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable docker.service; systemctl restart docker.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
     virtualization-docker) systemctl enable --now vmapi-backplane-server.service vmapi-backplane.service; systemctl enable docker.service; systemctl restart docker.service; systemctl enable --now vmapi-network.service; systemctl enable vmapi-autostart.service vmapi-replication.service; systemctl enable --now ttyd-vmapi.service ttyd-host-vmapi.service;;
-    backup) systemctl enable --now vmapi-backplane-server.service;;
+    backup) systemctl enable --now vmapi-backplane-server.service ttyd-host-vmapi.service;;
   esac
   nginx -t && systemctl reload nginx
 }
@@ -425,6 +441,12 @@ verify_profile_install() {
 
   [[ $(awk -F= '$1=="VMAPI_BACKPLANE_SERVER"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == true ]] ||
     die 'Backup-storage verification failed: VMAPI_BACKPLANE_SERVER is not enabled'
+  [[ $(awk -F= '$1=="VMAPI_BACKPLANE_NFS_BACKEND"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == kernel ]] ||
+    die 'Backup-storage verification failed: bare-metal/VM install must use the kernel NFS backend'
+  [[ $(awk -F= '$1=="VMAPI_BACKPLANE_NFS_VERSION"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == 4.2 ]] ||
+    die 'Backup-storage verification failed: bare-metal/VM install must use NFSv4.2'
+  [[ $(awk -F= '$1=="VMAPI_BACKPLANE_NFS_PORT"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == 2049 ]] ||
+    die 'Backup-storage verification failed: bare-metal/VM install must use native NFS port 2049'
 }
 
 finalize() {

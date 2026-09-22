@@ -176,23 +176,26 @@ read_meta(){
   local meta=$1
   OWNER=$(meta_get "$meta" OWNER); VM=$(meta_get "$meta" VM); DISK_INDEX=$(meta_get "$meta" DISK_INDEX)
   BYTES=$(meta_get "$meta" BYTES); FILE_NAME=$(meta_get "$meta" FILE_NAME); ACTIVE=$(meta_get "$meta" ACTIVE); UPDATED=$(meta_get "$meta" UPDATED)
+  RECOVERABLE=$(meta_get "$meta" RECOVERABLE); [[ $RECOVERABLE == true ]] || RECOVERABLE=false
 }
 write_meta(){
-  local meta=$1 owner=$2 vm=$3 idx=$4 bytes=$5 file=$6 active=$7 tmp
+  local meta=$1 owner=$2 vm=$3 idx=$4 bytes=$5 file=$6 active=$7 recoverable=${8:-false} tmp
   valid_peer_id "$owner"; validate_vm_name "$vm"; validate_int "$idx"; validate_positive_int "$bytes"
   [[ $file =~ ^[A-Za-z0-9._-]+$ ]] || die 'Invalid replica metadata file name'
+  validate_bool "$recoverable"
   tmp="${meta}.tmp.$$"
-  printf 'OWNER=%s\nVM=%s\nDISK_INDEX=%s\nBYTES=%s\nFILE_NAME=%s\nACTIVE=%s\nUPDATED=%s\n' \
-    "$owner" "$vm" "$idx" "$bytes" "$file" "$active" "$(date +%s)" > "$tmp"
+  printf 'OWNER=%s\nVM=%s\nDISK_INDEX=%s\nBYTES=%s\nFILE_NAME=%s\nACTIVE=%s\nRECOVERABLE=%s\nUPDATED=%s\n' \
+    "$owner" "$vm" "$idx" "$bytes" "$file" "$active" "$recoverable" "$(date +%s)" > "$tmp"
   chmod 0640 "$tmp"; mv -f "$tmp" "$meta"
 }
 
 refresh_meta(){
-  local meta=$1 active=${2:-true}
+  local meta=$1 active=${2:-true} recoverable=${3-}
   [[ -r $meta ]] || return 0
   read_meta "$meta"
   [[ -n $OWNER && -n $VM && -n $DISK_INDEX && -n $BYTES && -n $FILE_NAME ]] || return 0
-  write_meta "$meta" "$OWNER" "$VM" "$DISK_INDEX" "$BYTES" "$FILE_NAME" "$active"
+  [[ -n $recoverable ]] || recoverable=$RECOVERABLE
+  write_meta "$meta" "$OWNER" "$VM" "$DISK_INDEX" "$BYTES" "$FILE_NAME" "$active" "$recoverable"
 }
 
 image_virtual_size(){
@@ -257,7 +260,7 @@ start_replication(){
     bytes=$(image_virtual_size "$source")
     target="$remote/disk${idx}.qcow2"; meta="$remote/disk${idx}.meta"; job="repl-$idx"
     prepare_new_replica_target "$target"
-    write_meta "$meta" "$owner" "$vm" "$idx" "$bytes" "disk${idx}.qcow2" true
+    write_meta "$meta" "$owner" "$vm" "$idx" "$bytes" "disk${idx}.qcow2" true false
     printf 'DISK_%s_JOB=%q\nDISK_%s_TARGET=%q\nDISK_%s_META=%q\nDISK_%s_BYTES=%q\n' \
       "$idx" "$job" "$idx" "$target" "$idx" "$meta" "$idx" "$bytes" >> "$state"
     start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
@@ -290,7 +293,7 @@ resume_replication(){
         sed -i "s/^DISK_${idx}_BYTES=.*/DISK_${idx}_BYTES=${current}/" "$state"; bytes=$current
         if [[ -r $meta ]]; then
           read_meta "$meta"
-          if [[ -n $OWNER && -n $FILE_NAME ]]; then write_meta "$meta" "$OWNER" "$vm" "$idx" "$bytes" "$FILE_NAME" true; fi
+          if [[ -n $OWNER && -n $FILE_NAME ]]; then write_meta "$meta" "$OWNER" "$vm" "$idx" "$bytes" "$FILE_NAME" true "$RECOVERABLE"; fi
         fi
       fi
       qid=$(disk_qemu_id "$conf" "$idx"); bitmap=$(repl_bitmap "$idx")
@@ -304,31 +307,38 @@ resume_replication(){
         remove_bitmap "$vm" "$qid" "$bitmap"
         [[ -z $(query_job_json "$vm" "$job") ]] || { cancel_job "$vm" "$job"; sleep 1; }
         prepare_new_replica_target "$target"
+        refresh_meta "$meta" true false
         start_mirror_job "$vm" "$idx" "$target" "$job" "$speed"
       fi
     fi
-    refresh_meta "$meta" true
+    obj=$(query_job_json "$vm" "$job")
+    if [[ $obj == *'"ready":true'* ]]; then refresh_meta "$meta" true true; else refresh_meta "$meta" true; fi
   done < <(state_disk_indexes "$state")
 }
 
 status_replication(){
-  local vm=${1:?VM required} dir state peer idx job meta disk_bytes obj ready offset len first=true connected=false
+  local vm=${1:?VM required} dir state peer idx job meta disk_bytes obj ready recoverable=false offset len first=true connected=false running=false
   validate_vm_name "$vm"; dir=$(job_dir "$vm"); state="$dir/state.conf"
   [[ -r $state ]] || { printf '{"vm":"%s","configured":false}\n' "$vm"; return; }
   PEER=''; source "$state"; peer=$PEER; backplane_ready "$peer" && connected=true
+  [[ $(vm_state "$vm") == running ]] && running=true
   printf '{"vm":"%s","configured":true,"paused":%s,"peer_id":"%s","running":%s,"transport":"nfs4-wss-backplane","disks":[' \
-    "$vm" "$(replication_paused "$vm" && echo true || echo false)" "$peer" "$([[ $(vm_state "$vm") == running ]] && echo true || echo false)"
+    "$vm" "$(replication_paused "$vm" && echo true || echo false)" "$peer" "$running"
   while IFS= read -r idx; do
     eval "job=\${DISK_${idx}_JOB:-}"; eval "meta=\${DISK_${idx}_META:-}"; eval "disk_bytes=\${DISK_${idx}_BYTES:-0}"
-    ready=false; offset=0; len=0; obj=''
-    [[ $(vm_state "$vm") == running ]] && obj=$(query_job_json "$vm" "$job")
+    ready=false; recoverable=false; offset=0; len=0; obj=''
+    $running && obj=$(query_job_json "$vm" "$job")
     [[ $obj == *'"ready":true'* ]] && ready=true
     offset=$(printf '%s' "$obj" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p' | head -n1); offset=${offset:-0}
     len=$(printf '%s' "$obj" | sed -n 's/.*"len":\([0-9][0-9]*\).*/\1/p' | head -n1); len=${len:-0}
-    [[ -z $meta ]] || refresh_meta "$meta" true
+    if [[ -n $meta && -r $meta ]]; then
+      read_meta "$meta"
+      if $ready; then recoverable=true; refresh_meta "$meta" "$running" true
+      else recoverable=$RECOVERABLE; refresh_meta "$meta" "$running"; fi
+    fi
     $first || printf ','; first=false
-    printf '{"index":%s,"job":"%s","ready":%s,"offset":%s,"length":%s,"bytes":%s,"tunnel_running":%s,"backplane_connected":%s}' \
-      "$idx" "$job" "$ready" "$offset" "$len" "${disk_bytes:-0}" "$connected" "$connected"
+    printf '{"index":%s,"job":"%s","ready":%s,"recoverable":%s,"offset":%s,"length":%s,"bytes":%s,"tunnel_running":%s,"backplane_connected":%s}' \
+      "$idx" "$job" "$ready" "$recoverable" "$offset" "$len" "${disk_bytes:-0}" "$connected" "$connected"
   done < <(state_disk_indexes "$state")
   printf ']}\n'
 }
@@ -399,7 +409,7 @@ find_replica_meta(){
   valid_replica_id "$wanted"; shopt -s nullglob
   for meta in "$BACKPLANE_ROOT"/peers/*/replicas/*/disk*.meta; do
     [[ -f $meta ]] || continue
-    OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''
+    OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; RECOVERABLE=''; UPDATED=''
     read_meta "$meta"; owner=$OWNER; vm=$VM; idx=$DISK_INDEX
     [[ -n $owner && -n $vm && -n $idx ]] || continue
     if [[ $(replica_id "$owner" "$vm" "$idx") == "$wanted" ]]; then printf '%s\n' "$meta"; shopt -u nullglob; return 0; fi
@@ -410,15 +420,15 @@ find_replica_meta(){
 replica_show(){
   local id=${1:?id required} meta now active=false allocated=0
   meta=$(find_replica_meta "$id") || die 'Replica not found'
-  OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''
+  OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; RECOVERABLE=''; UPDATED=''
   read_meta "$meta"
   validate_vm_name "$VM"; validate_int "$DISK_INDEX"; validate_positive_int "$BYTES"; [[ $FILE_NAME =~ ^[A-Za-z0-9._-]+$ ]] || die 'Replica metadata has an invalid file name'
   local FILE="$(dirname "$meta")/$FILE_NAME"
   now=$(date +%s)
   if [[ $ACTIVE == true && $UPDATED =~ ^[0-9]+$ && $((now-UPDATED)) -le $STALE_SECONDS ]]; then active=true; fi
   [[ -f $FILE ]] && allocated=$(( $(du -k "$FILE" 2>/dev/null | awk '{print $1+0}') * 1024 ))
-  printf '{"id":"%s","owner":"%s","vm":"%s","disk_index":%s,"bytes":%s,"allocated_bytes":%s,"active":%s,"nbd_running":false,"websocket_running":%s,"backplane":true,"transport":"nfs4-wss-backplane","replica":"%s"}\n' \
-    "$id" "$(json_escape "$OWNER")" "$(json_escape "$VM")" "$DISK_INDEX" "$BYTES" "$allocated" "$active" "$active" "$(json_escape "$FILE")"
+  printf '{"id":"%s","owner":"%s","vm":"%s","disk_index":%s,"bytes":%s,"allocated_bytes":%s,"active":%s,"recoverable":%s,"nbd_running":false,"websocket_running":%s,"backplane":true,"transport":"nfs4-wss-backplane","replica":"%s"}\n' \
+    "$id" "$(json_escape "$OWNER")" "$(json_escape "$VM")" "$DISK_INDEX" "$BYTES" "$allocated" "$active" "$RECOVERABLE" "$active" "$(json_escape "$FILE")"
 }
 
 replica_list(){
@@ -426,7 +436,7 @@ replica_list(){
   printf '['; shopt -s nullglob
   for meta in "$BACKPLANE_ROOT"/peers/*/replicas/*/disk*.meta; do
     [[ -f $meta ]] || continue
-    OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''
+    OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; RECOVERABLE=''; UPDATED=''
     read_meta "$meta"; owner=$OWNER; vm=$VM; idx=$DISK_INDEX
     [[ -n $owner && -n $vm && $idx =~ ^[0-9]+$ ]] || continue
     id=$(replica_id "$owner" "$vm" "$idx")
@@ -434,6 +444,110 @@ replica_list(){
     replica_show "$id" | tr -d '\n'
   done
   shopt -u nullglob; printf ']\n'
+}
+
+restore_replica_to_source(){
+  local vm=${1:?VM required} peer=${2:?peer required} dir state configured_peer='' owner remote conf idx meta replica target format expected actual now active had_state=false
+  local token=$$ i swapped=0 metadata_count=0 stage rollback
+  local -a indexes=() replicas=() targets=() stages=() rollbacks=() formats=()
+  restore_cleanup(){
+    local j
+    for ((j=0; j<${#targets[@]}; j++)); do
+      if [[ -e ${rollbacks[$j]:-} ]]; then
+        rm -f -- "${targets[$j]}" 2>/dev/null || true
+        mv -- "${rollbacks[$j]}" "${targets[$j]}" 2>/dev/null || true
+      fi
+    done
+    for stage in "${stages[@]}"; do [[ -z $stage ]] || rm -f -- "$stage" 2>/dev/null || true; done
+  }
+  trap restore_cleanup EXIT
+  validate_vm_name "$vm"; valid_peer_id "$peer"; peer=${peer,,}
+  require_vm "$vm"
+  [[ $(vm_state "$vm") == stopped ]] || die "VM must be stopped before restoring a continuous replica: $vm"
+  need_cmd "$BACKPLANECTL"; need_cmd "$PEERCTL"; need_cmd "$QEMU_IMG"
+
+  dir=$(job_dir "$vm"); state="$dir/state.conf"
+  if [[ -r $state ]]; then
+    lock_replication "$vm"
+    load_state "$state"; configured_peer=${PEER,,}; had_state=true
+    [[ $configured_peer == "$peer" ]] || die "Replication for $vm is configured to a different peer"
+    # Keep the relationship configured. Because the VM is stopped there is no
+    # QEMU writer; after recovery the next VM start will re-establish the mirror.
+  fi
+
+  "$BACKPLANECTL" connect "$peer" >/dev/null
+  remote=$("$BACKPLANECTL" path "$peer" replicas "$vm")
+  [[ $remote == /* && -d $remote ]] || die 'Peer backplane replica directory is unavailable'
+  owner=$("$PEERCTL" identity | sed -n 's/.*"node_id":"\([a-fA-F0-9]*\)".*/\1/p' | head -n1)
+  valid_peer_id "$owner"; owner=${owner,,}
+  conf=$(vm_conf "$vm")
+  mapfile -t indexes < <(indexes_for "$conf" DISK)
+  ((${#indexes[@]} > 0)) || die "VM has no configured disks: $vm"
+
+  shopt -s nullglob
+  local all_meta=("$remote"/disk*.meta)
+  shopt -u nullglob
+  metadata_count=${#all_meta[@]}
+  ((metadata_count == ${#indexes[@]})) || die "Replica disk count does not match $vm; expected ${#indexes[@]}, found $metadata_count"
+
+  # Stage and validate every restored disk before replacing any source disk.
+  for idx in "${indexes[@]}"; do
+    meta="$remote/disk${idx}.meta"
+    [[ -r $meta ]] || die "Replica metadata is missing for $vm disk $idx"
+    OWNER=''; VM=''; DISK_INDEX=''; BYTES=''; FILE_NAME=''; ACTIVE=''; UPDATED=''; read_meta "$meta"
+    [[ ${OWNER,,} == "$owner" && $VM == "$vm" && $DISK_INDEX == "$idx" ]] || die "Replica metadata does not belong to this source VM: disk $idx"
+    [[ $RECOVERABLE == true ]] || die "Replica for $vm disk $idx has never completed initial synchronization and cannot be restored"
+    validate_positive_int "$BYTES"
+    [[ $FILE_NAME =~ ^[A-Za-z0-9._-]+$ ]] || die "Replica metadata has an invalid file name for disk $idx"
+    replica="$(dirname "$meta")/$FILE_NAME"
+    [[ -f $replica ]] || die "Replica disk is missing: $replica"
+    now=$(date +%s); active=false
+    if [[ $ACTIVE == true && $UPDATED =~ ^[0-9]+$ && $((now-UPDATED)) -le $STALE_SECONDS ]]; then active=true; fi
+    $active && ! $had_state && die "Replica for $vm disk $idx is still active on another source; stop replication before restoring"
+    actual=$(image_virtual_size "$replica"); [[ $actual == "$BYTES" ]] || die "Replica size mismatch for $vm disk $idx"
+
+    target=$(vm_disk_path_index "$vm" "$idx")
+    [[ -f $target ]] || die "Source disk is missing: $target"
+    format=$(cfg_get_file "$conf" "DISK_${idx}_FORMAT" qcow2)
+    [[ $format == qcow2 || $format == raw || $format == vmdk ]] || die "Unsupported source disk format for restore: $format"
+    stage="${target}.replica-restore.${token}"
+    rollback="${target}.pre-replica-restore.${token}"
+    rm -f -- "$stage" "$rollback"
+    "$QEMU_IMG" convert -f qcow2 -O "$format" "$replica" "$stage" || { rm -f -- "$stage"; die "Could not materialize replica for $vm disk $idx"; }
+    actual=$(image_virtual_size "$stage"); [[ $actual == "$BYTES" ]] || { rm -f -- "$stage"; die "Restored disk validation failed for $vm disk $idx"; }
+    chown --reference="$target" "$stage" 2>/dev/null || true
+    chmod --reference="$target" "$stage" 2>/dev/null || true
+    replicas+=("$replica"); targets+=("$target"); stages+=("$stage"); rollbacks+=("$rollback"); formats+=("$format")
+  done
+
+  # No process can be writing the replicas while the source VM is stopped.
+  # Mark their storage-side metadata inactive for accurate inventory display.
+  if $had_state; then
+    for idx in "${indexes[@]}"; do refresh_meta "$remote/disk${idx}.meta" false; done
+  fi
+
+  # All disks have been staged. Swap them in one at a time while retaining the
+  # originals under same-filesystem rollback names. If any swap fails, put all
+  # originals back before returning an error.
+  for ((i=0; i<${#targets[@]}; i++)); do
+    if ! mv -- "${targets[$i]}" "${rollbacks[$i]}"; then
+      for ((i=0; i<swapped; i++)); do rm -f -- "${targets[$i]}"; mv -- "${rollbacks[$i]}" "${targets[$i]}" || true; done
+      for stage in "${stages[@]}"; do rm -f -- "$stage"; done
+      die "Could not preserve the original source disk during replica restore"
+    fi
+    if ! mv -- "${stages[$i]}" "${targets[$i]}"; then
+      mv -- "${rollbacks[$i]}" "${targets[$i]}" || true
+      for ((i=0; i<swapped; i++)); do rm -f -- "${targets[$i]}"; mv -- "${rollbacks[$i]}" "${targets[$i]}" || true; done
+      for stage in "${stages[@]}"; do rm -f -- "$stage"; done
+      die "Could not install the restored replica disk; original disks were restored"
+    fi
+    swapped=$((swapped+1))
+  done
+
+  for rollback in "${rollbacks[@]}"; do rm -f -- "$rollback"; done
+  stages=(); rollbacks=(); trap - EXIT
+  printf '{"restored":true,"vm":"%s","peer_id":"%s","disk_count":%s,"source":"continuous-replica"}\n' \
+    "$(json_escape "$vm")" "$peer" "${#targets[@]}"
 }
 
 replica_purge(){
@@ -490,9 +604,10 @@ case ${1:-help} in
   replica-show) shift; replica_show "$@";;
   replica-list) replica_list;;
   replica-purge) shift; replica_purge "$@";;
+  restore) shift; lock_replication "${1:?VM required}"; restore_replica_to_source "$@";;
   revoke-peer) shift; revoke_peer "$@";;
   suspend) suspend;;
   daemon) daemon;;
-  help|-h|--help) echo 'replicationctl start VM PEER_ID [BYTES_PER_SEC] | resume VM | status VM | stop VM | pause VM HOLDER_PID | unpause VM | list | replica-list | replica-show ID | replica-purge ID [true|false] | daemon';;
+  help|-h|--help) echo 'replicationctl start VM PEER_ID [BYTES_PER_SEC] | resume VM | status VM | stop VM | pause VM HOLDER_PID | unpause VM | list | replica-list | replica-show ID | replica-purge ID [true|false] | restore VM PEER_ID | daemon';;
   *) die "Unknown replication command: ${1:-}";;
 esac

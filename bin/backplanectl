@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LiteVMM trusted peer storage backplane: NFSv4 over the existing peer WebSocket endpoint.
+# LiteVMM trusted peer storage backplane: NFS over the existing peer WebSocket endpoint.
 set -Eeuo pipefail
 LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 [[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
@@ -11,6 +11,11 @@ MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
 UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
 EXPORTFS=${VMAPI_EXPORTFS:-$(command -v exportfs 2>/dev/null || printf %s /usr/sbin/exportfs)}
 RPC_NFSD=${VMAPI_RPC_NFSD:-$(command -v rpc.nfsd 2>/dev/null || printf %s /usr/sbin/rpc.nfsd)}
+UNFSD=${VMAPI_UNFSD:-$(command -v unfsd 2>/dev/null || printf %s /usr/local/sbin/unfsd)}
+NFS_BACKEND=${VMAPI_BACKPLANE_NFS_BACKEND:-kernel}
+NFS_VERSION=${VMAPI_BACKPLANE_NFS_VERSION:-4.2}
+NFS_EXPORT=${VMAPI_BACKPLANE_NFS_EXPORT:-/}
+NFS_INTERNAL_ONLY=${VMAPI_BACKPLANE_NFS_INTERNAL_ONLY:-false}
 # Tool locations differ by distribution (Debian: /usr/bin/ss, Alpine: /sbin/ss)
 # and service managers may start us with a short PATH, so search the sbin dirs.
 find_tool(){
@@ -82,11 +87,17 @@ peer_profile(){ "$PEERCTL" transport-profile "$1"; }
 # reconcile loop must keep serving other peers.
 peer_supports_backplane(){
   local peer=$1 out
-  valid_peer "$peer"; PEER_QUERY_ERROR=''
+  valid_peer "$peer"; PEER_QUERY_ERROR=''; PEER_NFS_VERSION=''; PEER_NFS_EXPORT=''
   if ! out=$("$PEERCTL" proxy "$peer" GET / 2>&1); then
     PEER_QUERY_ERROR="Could not query paired host $peer: ${out:0:300}"; return 2
   fi
-  json_has_cap "$out" storage-backplane
+  json_has_cap "$out" storage-backplane || return 1
+  PEER_NFS_VERSION=$(json_field "$out" backplane_nfs_version)
+  [[ -n $PEER_NFS_VERSION ]] || PEER_NFS_VERSION=4.2
+  [[ $PEER_NFS_VERSION =~ ^(3|4|4[.]1|4[.]2)$ ]] || { PEER_QUERY_ERROR="Peer advertised an invalid backplane NFS version"; return 2; }
+  PEER_NFS_EXPORT=$(json_field "$out" backplane_nfs_export)
+  [[ -n $PEER_NFS_EXPORT ]] || PEER_NFS_EXPORT=/
+  [[ $PEER_NFS_EXPORT == /* && $PEER_NFS_EXPORT != *'..'* ]] || { PEER_QUERY_ERROR="Peer advertised an invalid backplane NFS export path"; return 2; }
 }
 
 load_state(){
@@ -132,13 +143,20 @@ wait_port(){ local p=$1; for _ in {1..100}; do port_in_use "$p" && return 0; sle
 is_mounted(){ local mp=$1; awk -v p="$mp" '$2==p && $3 ~ /^nfs/ {found=1} END{exit !found}' /proc/mounts; }
 
 start_tunnel(){
-  local peer=$1 port=$2 profile endpoint user pass header scheme host remote_port pf lf cfg tls_block=''
+  local peer=$1 port=$2 profile endpoint user pass ca_file header scheme host remote_port pf lf cfg tls_block=''
   need_cmd "$GOST"; need_cmd "$SS"
-  profile=$(peer_profile "$peer"); endpoint=$(json_field "$profile" endpoint); user=$(json_field "$profile" username); pass=$(json_field "$profile" password)
+  profile=$(peer_profile "$peer"); endpoint=$(json_field "$profile" endpoint); user=$(json_field "$profile" username); pass=$(json_field "$profile" password); ca_file=$(json_field "$profile" ca_file)
   [[ -n $user && -n $pass ]] || die 'Peer backplane credentials are unavailable'
   [[ $endpoint =~ ^(wss?)://([A-Za-z0-9.-]+)(:([0-9]{1,5}))?(/.*)?$ ]] || die 'Peer has no WebSocket-capable endpoint'
   scheme=${BASH_REMATCH[1]}; host=${BASH_REMATCH[2]}; remote_port=${BASH_REMATCH[4]}; [[ -n $remote_port ]] || { [[ $scheme == wss ]] && remote_port=443 || remote_port=80; }
-  header=$(printf '%s:%s' "$user" "$pass"|base64|tr -d '\n'); [[ $scheme != wss ]] || tls_block="        tls: {secure: true, serverName: \"$host\"}"
+  header=$(printf '%s:%s' "$user" "$pass"|base64|tr -d '\n')
+  if [[ $scheme == wss ]]; then
+    tls_block="        tls: {secure: true, serverName: \"$host\"}"
+    if [[ -n $ca_file ]]; then
+      [[ -r $ca_file ]] || die 'Peer TLS CA certificate is missing'
+      tls_block="        tls: {secure: true, serverName: \"$host\", caFile: \"$ca_file\"}"
+    fi
+  fi
   pf=$(pid_file "$peer"); lf=$(log_file "$peer"); cfg="$RUN_ROOT/${peer,,}.gost.yaml"; kill_pidfile "$pf"; rm -f "$cfg"; port_in_use "$port" && die "Backplane loopback port is already in use: $port"
   cat >"$cfg" <<YAML
 services:
@@ -180,13 +198,20 @@ repair_mount_traversal(){
 }
 
 mount_peer(){
-  local peer=$1 port=$2 mp id
+  local peer=$1 port=$2 version=${3:-4.2} export_path=${4:-/} mp id opts source
   need_cmd "$MOUNT_BIN"
   mp=$(mountpoint "$peer"); install -d -m 0755 "$mp"
   # retry=0 + timeout: one attempt per call. Retrying is the daemon's job, with
   # backoff; mount.nfs's own retry loop against an unreachable peer generated
   # enough connections to exhaust nf_conntrack on small hosts.
-  is_mounted "$mp" || timeout "${VMAPI_BACKPLANE_MOUNT_TIMEOUT:-90}" "$MOUNT_BIN" -t nfs -o "vers=4.2,proto=tcp,port=$port,nconnect=1,hard,timeo=600,retrans=2,retry=0" 127.0.0.1:/ "$mp"
+  if [[ $version == 3 ]]; then
+    opts="vers=3,proto=tcp,port=$port,mountport=$port,nolock,hard,timeo=600,retrans=2,retry=0"
+    source="127.0.0.1:$export_path"
+  else
+    opts="vers=$version,proto=tcp,port=$port,nconnect=1,hard,timeo=600,retrans=2,retry=0"
+    source="127.0.0.1:/"
+  fi
+  is_mounted "$mp" || timeout "${VMAPI_BACKPLANE_MOUNT_TIMEOUT:-90}" "$MOUNT_BIN" -t nfs -o "$opts" "$source" "$mp"
   repair_mount_traversal "$peer"
   id=$(local_node_id)
   install -d -m 0770 "$mp/peers/$id"
@@ -216,7 +241,7 @@ connect_peer(){
   is_mounted "$mp" && "$UMOUNT_BIN" "$mp" >/dev/null 2>&1 || true
   pid_alive "$(pid_file "$peer")" || start_tunnel "$peer" "$port"
   # Do not leave a tunnel behind a failed mount; the next attempt starts clean.
-  if ! (mount_peer "$peer" "$port"); then kill_pidfile "$(pid_file "$peer")"; die "Could not mount the storage backplane of peer $peer"; fi
+  if ! (mount_peer "$peer" "$port" "$PEER_NFS_VERSION" "$PEER_NFS_EXPORT"); then kill_pidfile "$(pid_file "$peer")"; die "Could not mount the storage backplane of peer $peer"; fi
   show_peer "$peer"
 }
 
@@ -288,14 +313,21 @@ is_bind_mounted(){
 }
 publish_shared_storage(){
   ensure_dirs
-  install -d -m 0755 "$ISO_ROOT"
-  install -d -m 0755 "$SHARED_ROOT/isos" "$SHARED_ROOT/docker-rootfs"
+  install -d -m 0755 "$ISO_ROOT" "$SHARED_ROOT/isos" "$SHARED_ROOT/docker-rootfs"
+  # Container storage profiles place ISO_ROOT directly in the exported tree so
+  # no bind mount or CAP_SYS_ADMIN is required. Host installs retain the
+  # read-only bind mount because their ISO library lives outside the backplane.
+  if [[ "$ISO_ROOT" == "$SHARED_ROOT/isos" ]]; then
+    return 0
+  fi
+  [[ "$NFS_BACKEND" == kernel ]] || die 'Userspace NFS requires ISO_ROOT to be inside the backplane shared/isos tree'
   if ! is_bind_mounted "$SHARED_ROOT/isos"; then
     "$MOUNT_BIN" --bind "$ISO_ROOT" "$SHARED_ROOT/isos"
     "$MOUNT_BIN" -o remount,bind,ro "$SHARED_ROOT/isos"
   fi
 }
 unpublish_shared_storage(){
+  [[ "$ISO_ROOT" == "$SHARED_ROOT/isos" ]] && return 0
   is_bind_mounted "$SHARED_ROOT/isos" && "$UMOUNT_BIN" "$SHARED_ROOT/isos" >/dev/null 2>&1 || true
 }
 
@@ -360,7 +392,12 @@ server_verify(){
   [[ $WS_BIND == 127.0.0.1 ]] || external=true
   while IFS= read -r addr; do
     [[ -n $addr ]] || continue
-    [[ $addr == "$NFS_BIND:$NFS_PORT" ]] && nfs_ok=true || external=true
+    if [[ $addr == "$NFS_BIND:$NFS_PORT" ||
+          ( $NFS_BACKEND == unfs3 && $NFS_BIND == 127.0.0.1 && $addr == "[::ffff:127.0.0.1]:$NFS_PORT" ) ]]; then
+      nfs_ok=true
+    else
+      external=true
+    fi
   done < <(listener_addresses "$NFS_PORT" tcp)
   while IFS= read -r addr; do
     [[ -n $addr ]] || continue
@@ -374,35 +411,66 @@ server_verify(){
 server_cleanup(){
   [[ -r "$RUN_ROOT/gost-server.pid" ]] && kill_pidfile "$RUN_ROOT/gost-server.pid" || true
   rm -f -- "$RUN_ROOT/gost-server.yaml"
-  [[ -r "$RUN_ROOT/exportd.pid" ]] && kill_pidfile "$RUN_ROOT/exportd.pid" || true
-  "$RPC_NFSD" 0 >/dev/null 2>&1 || true
-  "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
+  if [[ "$NFS_BACKEND" == unfs3 ]]; then
+    [[ -r "$RUN_ROOT/unfs3.pid" ]] && kill_pidfile "$RUN_ROOT/unfs3.pid" || true
+    rm -f -- "$RUN_ROOT/unfs3.exports"
+  else
+    [[ -r "$RUN_ROOT/exportd.pid" ]] && kill_pidfile "$RUN_ROOT/exportd.pid" || true
+    "$RPC_NFSD" 0 >/dev/null 2>&1 || true
+    "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
+  fi
   unpublish_shared_storage
+}
+
+start_unfs3(){
+  need_cmd "$UNFSD"
+  [[ $NFS_VERSION == 3 ]] || die 'UNFS3 backend requires VMAPI_BACKPLANE_NFS_VERSION=3'
+  ((10#$NFS_PORT >= 1024)) || die 'UNFS3 backend requires an unprivileged NFS port (1024 or higher)'
+  [[ $NFS_EXPORT == "$BACKPLANE_ROOT" ]] || die 'UNFS3 export path must match VMAPI_BACKPLANE_ROOT'
+  [[ $NFS_EXPORT_CLIENT == 127.0.0.1 ]] || die 'UNFS3 container backend only supports a loopback export client'
+  # GOST re-originates the loopback TCP connection from an ephemeral source port.
+  # 'insecure' permits that source port; the export itself remains restricted to 127.0.0.1.
+  printf '%s %s(rw,no_root_squash,insecure)\n' "$BACKPLANE_ROOT" "$NFS_EXPORT_CLIENT" > "$RUN_ROOT/unfs3.exports"
+  chmod 0600 "$RUN_ROOT/unfs3.exports"
+  setsid "$UNFSD" -d -t -p -u -l "$NFS_BIND" -n "$NFS_PORT" -m "$NFS_PORT" -e "$RUN_ROOT/unfs3.exports" </dev/null >>"$RUN_ROOT/unfs3.log" 2>&1 &
+  echo $! > "$RUN_ROOT/unfs3.pid"
 }
 
 server_daemon(){
   [[ $SERVER_ENABLED == true ]] || die 'Storage backplane server is disabled'
+  if [[ $NFS_INTERNAL_ONLY == true ]]; then
+    [[ $NFS_EXPORT_CLIENT == 127.0.0.1 ]] || die 'Internal-only NFS mode requires a loopback-only export client'
+  fi
   ensure_dirs
   publish_shared_storage
-  need_cmd "$EXPORTFS"; need_cmd "$RPC_NFSD"; need_cmd "$GOST"; need_cmd "$SS"
-  local -a export_daemon
-  if [[ -x $NFS_EXPORTD ]]; then export_daemon=("$NFS_EXPORTD" -F)
-  elif [[ -x $RPC_MOUNTD ]]; then export_daemon=("$RPC_MOUNTD" -F -N 2 -N 3 -u)
-  else die "Neither nfsv4.exportd nor rpc.mountd is installed ($NFS_EXPORTD, $RPC_MOUNTD)"; fi
+  need_cmd "$GOST"; need_cmd "$SS"
   valid_ipv4_bind "$NFS_BIND"; valid_port "$NFS_PORT"; valid_port "$WS_PORT"; validate_positive_int "$NFS_THREADS"
-  # /proc/fs/nfsd appears when the nfsd module loads; it cannot be created or
-  # chmod-ed from userspace (install -d failed here with EPERM on Alpine).
-  command -v modprobe >/dev/null 2>&1 && modprobe nfsd 2>/dev/null || true
-  [[ -d /proc/fs/nfsd ]] || die 'Kernel NFS server support (nfsd) is unavailable'
-  install -d -m 0755 /var/lib/nfs
-  # Not `mountpoint -q`: this script defines its own mountpoint() (peer mount
-  # paths), which shadowed the system command and aborted server start-up.
-  awk '$2=="/proc/fs/nfsd" && $3=="nfsd" {f=1} END{exit !f}' /proc/mounts || "$MOUNT_BIN" -t nfsd nfsd /proc/fs/nfsd
-  "$RPC_NFSD" 0 >/dev/null 2>&1 || true
-  "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
-  "$EXPORTFS" -i -o rw,sync,no_subtree_check,no_root_squash,insecure,crossmnt,fsid=0 "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT"
-  "${export_daemon[@]}" </dev/null >>"$RUN_ROOT/exportd.log" 2>&1 & echo $! > "$RUN_ROOT/exportd.pid"
-  "$RPC_NFSD" --host "$NFS_BIND" --port "$NFS_PORT" --no-udp --no-nfs-version 3 --no-nfs-version 4.0 --nfs-version 4.1 --nfs-version 4.2 "$NFS_THREADS"
+
+  case "$NFS_BACKEND" in
+    unfs3)
+      start_unfs3
+      ;;
+    kernel)
+      need_cmd "$EXPORTFS"; need_cmd "$RPC_NFSD"
+      local -a export_daemon
+      if [[ -x $NFS_EXPORTD ]]; then export_daemon=("$NFS_EXPORTD" -F)
+      elif [[ -x $RPC_MOUNTD ]]; then export_daemon=("$RPC_MOUNTD" -F -N 2 -N 3 -u)
+      else die "Neither nfsv4.exportd nor rpc.mountd is installed ($NFS_EXPORTD, $RPC_MOUNTD)"; fi
+      command -v modprobe >/dev/null 2>&1 && modprobe nfsd 2>/dev/null || true
+      [[ -d /proc/fs/nfsd ]] || die 'Kernel NFS server support (nfsd) is unavailable'
+      install -d -m 0755 /var/lib/nfs
+      awk '$2=="/proc/fs/nfsd" && $3=="nfsd" {f=1} END{exit !f}' /proc/mounts || "$MOUNT_BIN" -t nfsd nfsd /proc/fs/nfsd
+      "$RPC_NFSD" 0 >/dev/null 2>&1 || true
+      "$EXPORTFS" -u "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT" >/dev/null 2>&1 || true
+      "$EXPORTFS" -i -o rw,sync,no_subtree_check,no_root_squash,insecure,crossmnt,fsid=0 "$NFS_EXPORT_CLIENT:$BACKPLANE_ROOT"
+      "${export_daemon[@]}" </dev/null >>"$RUN_ROOT/exportd.log" 2>&1 & echo $! > "$RUN_ROOT/exportd.pid"
+      "$RPC_NFSD" --host "$NFS_BIND" --port "$NFS_PORT" --no-udp --no-nfs-version 3 --no-nfs-version 4.0 --nfs-version 4.1 --nfs-version 4.2 "$NFS_THREADS"
+      ;;
+    *)
+      die "Unknown NFS backend: $NFS_BACKEND"
+      ;;
+  esac
+
   cat > "$RUN_ROOT/gost-server.yaml" <<YAML
 services:
 - name: storage-server
@@ -415,9 +483,16 @@ YAML
   setsid "$GOST" -C "$RUN_ROOT/gost-server.yaml" </dev/null >>"$RUN_ROOT/gost-server.log" 2>&1 & echo $! > "$RUN_ROOT/gost-server.pid"
   trap 'server_cleanup; exit 0' TERM INT EXIT
   for _ in {1..100}; do server_verify >/dev/null 2>&1 && break; sleep .05; done
-  server_verify >/dev/null || die 'Storage backplane did not bind to the configured loopback endpoints'
+  if ! server_verify >/dev/null; then
+    [[ "$NFS_BACKEND" == unfs3 ]] && tail -100 "$RUN_ROOT/unfs3.log" >&2 2>/dev/null || true
+    die 'Storage backplane did not bind to the configured loopback endpoints'
+  fi
   while :; do
-    pid_alive "$RUN_ROOT/exportd.pid" || die 'NFSv4 export daemon exited'
+    if [[ "$NFS_BACKEND" == unfs3 ]]; then
+      pid_alive "$RUN_ROOT/unfs3.pid" || die 'Userspace NFS server exited'
+    else
+      pid_alive "$RUN_ROOT/exportd.pid" || die 'NFSv4 export daemon exited'
+    fi
     pid_alive "$RUN_ROOT/gost-server.pid" || die 'Backplane GOST WebSocket bridge exited'
     sleep "$DAEMON_INTERVAL" & wait $!
   done

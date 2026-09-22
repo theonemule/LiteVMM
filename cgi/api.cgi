@@ -348,7 +348,7 @@ read_params
 if [[ -z $route ]]; then
   caps=$(capabilities_json)
   effective_profile=$(vmapi_effective_profile)
-  reply '200 OK' "{\"service\":\"litevmm\",\"version\":12,\"profile\":\"$(json_escape "$effective_profile")\",\"configured_profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"capabilities\":$caps}"
+  reply '200 OK' "{\"service\":\"litevmm\",\"version\":12,\"profile\":\"$(json_escape "$effective_profile")\",\"configured_profile\":\"$(json_escape "$VMAPI_PROFILE")\",\"port\":$VMAPI_HTTP_PORT,\"tls_enabled\":$VMAPI_TLS_ENABLED,\"user\":\"$(json_escape "${REMOTE_USER:-}")\",\"backplane_nfs_version\":\"$(json_escape "$VMAPI_BACKPLANE_NFS_VERSION")\",\"backplane_nfs_export\":\"$(json_escape "$VMAPI_BACKPLANE_NFS_EXPORT")\",\"capabilities\":$caps}"
 fi
 
 case "${P[0]-}" in
@@ -395,10 +395,18 @@ case "${P[0]-}" in
           *) error_reply '405 Method Not Allowed' 'Use GET or POST';;
         esac;;
       *)
-        case "$method" in
-          GET) raw_json_reply '200 OK' replication_cmd status "${P[1]}";;
-          DELETE) raw_json_reply '200 OK' replication_cmd stop "${P[1]}";;
-          *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
+        case "${P[2]-}" in
+          restore)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            peer_id=$(param peer_id); [[ -n $peer_id ]] || error_reply '400 Bad Request' 'peer_id is required'
+            raw_json_reply '201 Created' replication_cmd restore "${P[1]}" "$peer_id";;
+          '')
+            case "$method" in
+              GET) raw_json_reply '200 OK' replication_cmd status "${P[1]}";;
+              DELETE) raw_json_reply '200 OK' replication_cmd stop "${P[1]}";;
+              *) error_reply '405 Method Not Allowed' 'Use GET or DELETE';;
+            esac;;
+          *) error_reply '404 Not Found' 'Unknown replication endpoint';;
         esac;;
     esac;;
 
@@ -559,6 +567,10 @@ case "${P[0]-}" in
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
             domain=$(param domain); email=$(param email); [[ -n $domain && -n $email ]] || error_reply '400 Bad Request' 'domain and email are required'
             raw_json_reply '200 OK' cert_cmd issue "$domain" "$email";;
+          self-signed)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            domain=$(param domain); [[ -n $domain ]] || error_reply '400 Bad Request' 'domain is required'
+            raw_json_reply '200 OK' cert_cmd self-sign "$domain" "$(param sans)" "$(param days 825)";;
           renew)
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
             raw_json_reply '200 OK' cert_cmd renew;;

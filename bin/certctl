@@ -14,6 +14,8 @@ VMAPI_TLS_CSR_FILE=${VMAPI_TLS_CSR_FILE:-}
 VMAPI_TLS_CSR_KEY_FILE=${VMAPI_TLS_CSR_KEY_FILE:-}
 VMAPI_TLS_CSR_DOMAIN=${VMAPI_TLS_CSR_DOMAIN:-}
 TLS_ROOT=${VMAPI_TLS_ROOT:-/etc/vmapi/tls}
+VMAPI_TLS_CA_CERT_FILE=${VMAPI_TLS_CA_CERT_FILE:-$TLS_ROOT/litevmm-root-ca.crt}
+VMAPI_TLS_CA_KEY_FILE=${VMAPI_TLS_CA_KEY_FILE:-$TLS_ROOT/litevmm-root-ca.key}
 LE_ROOT=${VMAPI_LETSENCRYPT_ROOT:-/etc/letsencrypt/live}
 NGINX_SITE=${VMAPI_NGINX_SITE:-/etc/nginx/sites-available/vmapi}
 LIGHTTPD_TLS_CONF=${VMAPI_LIGHTTPD_TLS_CONF:-/etc/lighttpd/conf.d/vmapi-tls.conf}
@@ -26,6 +28,21 @@ CERTBOT_LOGS_DIR=${VMAPI_CERTBOT_LOGS_DIR:-}
 die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 json_escape(){ local s=${1-}; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}; printf '%s' "$s"; }
 valid_domain(){ [[ ${1:-} =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ && ${1:-} == *.* ]] || die 'Invalid DNS name'; }
+is_ipv4(){
+  local value=${1:-} a b c d x
+  IFS=. read -r a b c d <<< "$value"
+  [[ -n $a && -n $b && -n $c && -n $d && $value != *.*.*.*.* ]] || return 1
+  for x in "$a" "$b" "$c" "$d"; do
+    [[ $x =~ ^[0-9]{1,3}$ ]] || return 1
+    ((10#$x <= 255)) || return 1
+  done
+}
+valid_cert_host(){
+  local value=${1:-}
+  is_ipv4 "$value" && return 0
+  [[ $value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die 'Invalid certificate DNS name or IPv4 address'
+}
+san_entry(){ is_ipv4 "$1" && printf 'IP:%s' "$1" || printf 'DNS:%s' "$1"; }
 valid_email(){ [[ ${1:-} =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Invalid email address'; }
 valid_key_type(){ [[ ${1:-} =~ ^(rsa2048|rsa4096|ec256)$ ]] || die 'key_type must be rsa2048, rsa4096, or ec256'; }
 safe_dn(){ [[ ${#1} -le 128 && $1 != *$'\n'* && $1 != *$'\r'* ]] || die 'CSR subject field is invalid'; }
@@ -33,16 +50,22 @@ require_root(){ [[ $EUID -eq 0 ]] || die 'Certificate changes require root privi
 need(){ command -v "$1" >/dev/null 2>&1 || die "Required command is missing: $1"; }
 
 set_config(){
-  local key=$1 value=${2-} tmp
+  local key=$1 value=${2-} tmp target=$VMAPI_CONFIG
   [[ $key =~ ^VMAPI_[A-Z0-9_]+$ ]] || die 'Invalid configuration key'
   [[ $value != *$'\n'* && $value != *$'\r'* ]] || die 'Invalid configuration value'
+  # Container installs keep /etc/vmapi/vmapi.conf as a symlink into the
+  # persistent /var/lib/vmapi volume. Write to the resolved target rather than
+  # replacing the symlink with an ephemeral regular file.
+  if [[ -L $VMAPI_CONFIG ]]; then
+    target=$(readlink -f -- "$VMAPI_CONFIG") || die "Could not resolve persistent configuration: $VMAPI_CONFIG"
+  fi
   tmp=$(mktemp)
-  if [[ -r $VMAPI_CONFIG ]]; then
-    awk -v k="$key" -v v="$value" 'BEGIN{done=0} index($0,k"=")==1 {if(!done){print k"="v;done=1};next} {print} END{if(!done)print k"="v}' "$VMAPI_CONFIG" > "$tmp"
+  if [[ -r $target ]]; then
+    awk -v k="$key" -v v="$value" 'BEGIN{done=0} index($0,k"=")==1 {if(!done){print k"="v;done=1};next} {print} END{if(!done)print k"="v}' "$target" > "$tmp"
   else
     printf '%s=%s\n' "$key" "$value" > "$tmp"
   fi
-  install -m 0644 "$tmp" "$VMAPI_CONFIG"; rm -f "$tmp"
+  install -m 0644 "$tmp" "$target"; rm -f "$tmp"
 }
 
 ensure_tls_root(){ require_root; install -d -m 0700 "$TLS_ROOT"; }
@@ -118,10 +141,14 @@ CFG
   lighttpd -tt -f "$LIGHTTPD_MAIN_CONF" >/dev/null
   # Certificate changes are made from the console, i.e. inside a request served
   # by this Lighttpd; reload gracefully after that request has been answered.
-  command -v rc-service >/dev/null 2>&1 || return 0
   local reload=${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}
-  if [[ -x $reload ]]; then VMAPI_LIGHTTPD_CONF="$LIGHTTPD_MAIN_CONF" "$reload"
-  else rc-service lighttpd restart >/dev/null; fi
+  if [[ -x $reload ]]; then
+    VMAPI_LIGHTTPD_CONF="$LIGHTTPD_MAIN_CONF" "$reload"
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service lighttpd restart >/dev/null
+  else
+    die 'Lighttpd configuration changed but no reload helper is available'
+  fi
 }
 
 apply_web_tls(){
@@ -131,6 +158,121 @@ apply_web_tls(){
     alpine) rewrite_lighttpd;;
     *) die 'No supported LiteVMM web server was detected';;
   esac
+}
+
+validate_ca(){
+  local cert=$1
+  validate_cert "$cert"
+  openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -q 'CA:TRUE' || die 'Certificate is not a CA certificate'
+  openssl verify -CAfile "$cert" "$cert" >/dev/null 2>&1 || die 'CA certificate is not self-verifying'
+}
+
+ensure_local_ca(){
+  require_root; ensure_tls_root; need openssl
+  if [[ -s $VMAPI_TLS_CA_CERT_FILE || -s $VMAPI_TLS_CA_KEY_FILE ]]; then
+    [[ -s $VMAPI_TLS_CA_CERT_FILE && -s $VMAPI_TLS_CA_KEY_FILE ]] || die 'Local CA is incomplete; both certificate and private key are required'
+    validate_ca "$VMAPI_TLS_CA_CERT_FILE"; validate_key "$VMAPI_TLS_CA_KEY_FILE"
+    [[ $(pubkey_digest_cert "$VMAPI_TLS_CA_CERT_FILE") == "$(pubkey_digest_key "$VMAPI_TLS_CA_KEY_FILE")" ]] || die 'Local CA certificate and private key do not match'
+    return 0
+  fi
+
+  local ca_name cfg host
+  host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf litevmm)
+  host=${host//[^A-Za-z0-9._-]/-}
+  ca_name="LiteVMM Root CA - $host"
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out "$VMAPI_TLS_CA_KEY_FILE" >/dev/null 2>&1
+  chmod 0600 "$VMAPI_TLS_CA_KEY_FILE"
+  cfg="$TLS_ROOT/.ca.$$.cnf"
+  cat > "$cfg" <<CFG
+[req]
+prompt = no
+distinguished_name = dn
+x509_extensions = v3_ca
+[dn]
+CN = $ca_name
+O = LiteVMM
+[v3_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+CFG
+  openssl req -x509 -new -sha256 -days 36500 -key "$VMAPI_TLS_CA_KEY_FILE" -out "$VMAPI_TLS_CA_CERT_FILE" -config "$cfg"
+  rm -f "$cfg"
+  chmod 0644 "$VMAPI_TLS_CA_CERT_FILE"
+  validate_ca "$VMAPI_TLS_CA_CERT_FILE"
+  set_config VMAPI_TLS_CA_CERT_FILE "$VMAPI_TLS_CA_CERT_FILE"
+  set_config VMAPI_TLS_CA_KEY_FILE "$VMAPI_TLS_CA_KEY_FILE"
+}
+
+local_ca_metadata(){
+  local available=false fingerprint='' subject='' expires=''
+  if [[ -s $VMAPI_TLS_CA_CERT_FILE ]]; then
+    available=true
+    fingerprint=$(openssl x509 -in "$VMAPI_TLS_CA_CERT_FILE" -noout -fingerprint -sha256 2>/dev/null | sed 's/^sha256 Fingerprint=//' || true)
+    subject=$(openssl x509 -in "$VMAPI_TLS_CA_CERT_FILE" -noout -subject 2>/dev/null | sed 's/^subject=//' || true)
+    expires=$(openssl x509 -in "$VMAPI_TLS_CA_CERT_FILE" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || true)
+  fi
+  printf '"local_ca_available":%s,"local_ca_certificate":"%s","local_ca_fingerprint_sha256":"%s","local_ca_subject":"%s","local_ca_expires":"%s"' \
+    "$available" "$(json_escape "$VMAPI_TLS_CA_CERT_FILE")" "$(json_escape "$fingerprint")" "$(json_escape "$subject")" "$(json_escape "$expires")"
+}
+
+self_sign(){
+  require_root; ensure_tls_root; need openssl
+  local host=${1:?DNS name or IPv4 address required} sans=${2-} days=${3:-825}
+  valid_cert_host "$host"
+  [[ $days =~ ^[0-9]+$ ]] && ((days >= 1 && days <= 36500)) || die 'days must be between 1 and 36500'
+  ensure_local_ca
+
+  local key="$TLS_ROOT/local-endpoint.key" csr="$TLS_ROOT/local-endpoint.csr" cert="$TLS_ROOT/local-endpoint.crt"
+  local reqcfg="$TLS_ROOT/.selfsign-req.$$.cnf" extcfg="$TLS_ROOT/.selfsign-ext.$$.cnf" san_list item entry
+  san_list=$(san_entry "$host")
+  IFS=',' read -ra items <<< "$sans"
+  for item in "${items[@]}"; do
+    item=${item//[[:space:]]/}
+    [[ -z $item ]] && continue
+    valid_cert_host "$item"
+    entry=$(san_entry "$item")
+    [[ ",$san_list," == *",$entry,"* ]] || san_list+=",$entry"
+  done
+
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out "$key" >/dev/null 2>&1
+  chmod 0600 "$key"
+  cat > "$reqcfg" <<CFG
+[req]
+prompt = no
+distinguished_name = dn
+req_extensions = req_ext
+[dn]
+CN = $host
+O = LiteVMM
+[req_ext]
+subjectAltName = $san_list
+CFG
+  cat > "$extcfg" <<CFG
+[v3_server]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = $san_list
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+CFG
+  openssl req -new -key "$key" -out "$csr" -config "$reqcfg"
+  openssl x509 -req -in "$csr" -CA "$VMAPI_TLS_CA_CERT_FILE" -CAkey "$VMAPI_TLS_CA_KEY_FILE" -CAcreateserial \
+    -out "$cert" -days "$days" -sha256 -extfile "$extcfg" -extensions v3_server >/dev/null 2>&1
+  rm -f "$reqcfg" "$extcfg" "$csr" "$VMAPI_TLS_CA_CERT_FILE.srl"
+  chmod 0644 "$cert"
+  validate_pair "$cert" "$key"
+  openssl verify -CAfile "$VMAPI_TLS_CA_CERT_FILE" "$cert" >/dev/null 2>&1 || die 'Generated endpoint certificate does not validate against the local CA'
+  activate local-ca "$host" "$cert" "$key" ''
+  status
+}
+
+show_ca(){
+  [[ -s $VMAPI_TLS_CA_CERT_FILE ]] || die 'No LiteVMM local CA certificate is available'
+  validate_ca "$VMAPI_TLS_CA_CERT_FILE"
+  cat "$VMAPI_TLS_CA_CERT_FILE"
 }
 
 cert_metadata(){
@@ -156,6 +298,8 @@ status(){
   printf '{"profile":"%s","port":%s,"certbot_available":%s,"tls_enabled":%s,"mode":"%s","domain":"%s","certificate":"%s","private_key":"%s","csr":"%s","csr_key":"%s","csr_domain":"%s","csr_available":%s,"csr_subject":"%s","platform":"%s",' \
     "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$available" "$VMAPI_TLS_ENABLED" "$(json_escape "$VMAPI_TLS_MODE")" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_FILE")" "$(json_escape "$VMAPI_TLS_CSR_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_DOMAIN")" "$csr_available" "$(json_escape "$csr_subject")" "$platform"
   cert_metadata
+  printf ','
+  local_ca_metadata
   printf '}\n'
 }
 
@@ -313,6 +457,8 @@ case ${1:-status} in
   csr-show) show_csr;;
   import-signed) shift; import_signed "$@";;
   import-pair) shift; import_pair "$@";;
+  self-sign) shift; self_sign "$@";;
+  ca-show) show_ca;;
   disable) disable;;
-  *) die 'Usage: certctl status | apply | issue DOMAIN EMAIL | renew | csr-generate DOMAIN [SANS] [ORG] [OU] [COUNTRY] [STATE] [LOCALITY] [rsa2048|rsa4096|ec256] | csr-show | import-signed CERT_FILE | import-pair CERT_FILE KEY_FILE [DOMAIN] | disable';;
+  *) die 'Usage: certctl status | apply | issue DOMAIN EMAIL | renew | self-sign HOST [SANS] [DAYS] | ca-show | csr-generate DOMAIN [SANS] [ORG] [OU] [COUNTRY] [STATE] [LOCALITY] [rsa2048|rsa4096|ec256] | csr-show | import-signed CERT_FILE | import-pair CERT_FILE KEY_FILE [DOMAIN] | disable';;
 esac

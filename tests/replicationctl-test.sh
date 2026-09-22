@@ -40,6 +40,9 @@ case ${1:-} in
     file=${!#}; size=1048576
     if [[ -f $file ]] && grep -q '^SIZE=' "$file"; then size=$(sed -n 's/^SIZE=//p' "$file"); fi
     printf '{\n    "children": [\n        {\n            "name": "file",\n            "info": {\n                "children": [\n                ],\n                "virtual-size": 196616,\n                "filename": "%s",\n                "format": "file",\n                "actual-size": 200704\n            }\n        }\n    ],\n    "virtual-size": %s,\n    "filename": "%s",\n    "format": "qcow2",\n    "actual-size": 200704\n}\n' "$file" "$size" "$file";;
+  convert)
+    src=${@: -2:1}; dst=${!#}
+    cp "$src" "$dst";;
   create)
     echo "replication must not pre-create mirror targets with qemu-img" >&2
     exit 19;;
@@ -72,15 +75,17 @@ cat > "$T/harness.sh" <<'HARNESS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source <(sed '/^case ${1:-help} in/,$d' "$ROOT/bin/replicationctl")
-require_vm(){ :; }; require_running(){ :; }; vm_state(){ printf 'running\n'; }
+require_vm(){ :; }; require_running(){ :; }; vm_state(){ printf '%s\n' "${VM_STATE:-running}"; }
 vm_conf(){ printf '%s\n' "$T/vm/demo.conf"; }
 vm_disk_path_index(){ printf '%s\n' "$T/vm/disk0.qcow2"; }
 indexes_for(){ printf '0\n'; }
-status_replication(){ printf '{"vm":"%s","configured":true}\n' "$1"; }
+[[ ${USE_REAL_STATUS:-false} == true ]] || status_replication(){ printf '{"vm":"%s","configured":true}\n' "$1"; }
 qmp(){
   case $2 in
     *query-block-jobs*)
-      if [[ -f $T/job-active ]]; then printf '%s\n' '{"return": [{"device":"repl-0","type":"mirror","offset":1,"len":1048576,"ready":false}]}'
+      if [[ -f $T/job-active ]]; then
+        if [[ ${JOB_READY:-false} == true ]]; then printf '%s\n' '{"return": [{"device":"repl-0","type":"mirror","offset":1048576,"len":1048576,"ready":true}]}'
+        else printf '%s\n' '{"return": [{"device":"repl-0","type":"mirror","offset":1,"len":1048576,"ready":false}]}' ; fi
       else printf '%s\n' '{"return": []}'; fi;;
     *drive-mirror*)
       printf '%s\n' "$2" >> "$T/qmp.log"
@@ -118,11 +123,26 @@ grep -Fq '"job-id":"repl-0"' "$T/qmp.log"
 grep -Fq '"mode":"absolute-paths"' "$T/qmp.log"
 grep -qx 'qemu-created' "$REMOTE/disk0.qcow2"
 grep -qx 'ACTIVE=true' "$REMOTE/disk0.meta"
+grep -qx 'RECOVERABLE=false' "$REMOTE/disk0.meta"
+# Once QEMU reports the full mirror ready, the replica becomes a valid recovery point.
+USE_REAL_STATUS=true JOB_READY=true MIRROR_REPLY=$ok_reply bash "$T/harness.sh" status_replication demo >/dev/null
+grep -qx 'RECOVERABLE=true' "$REMOTE/disk0.meta"
 # Stop must load the job state so it can cancel the mirror and retire the replica.
 MIRROR_REPLY=$ok_reply bash "$T/harness.sh" stop_replication demo true >/dev/null
 [[ ! -e $JOBS/demo ]]
 grep -Fq '"execute":"block-job-cancel","arguments":{"device":"repl-0"}' "$T/qmp.log"
 grep -qx 'ACTIVE=false' "$REMOTE/disk0.meta"
+
+# A stopped source VM can restore its retained replica back onto the disk that
+# originally produced it. The replica stays retained after recovery.
+printf 'source-before\n' > "$T/vm/disk0.qcow2"
+printf 'replica-restored\n' > "$REMOTE/disk0.qcow2"
+VM_STATE=stopped MIRROR_REPLY=$ok_reply bash "$T/harness.sh" restore_replica_to_source demo "$PEER" > "$T/restore.out"
+grep -Fq '"restored":true' "$T/restore.out"
+grep -Fq '"source":"continuous-replica"' "$T/restore.out"
+grep -qx 'replica-restored' "$T/vm/disk0.qcow2"
+grep -qx 'replica-restored' "$REMOTE/disk0.qcow2"
+! find "$T/vm" -maxdepth 1 \( -name '*.replica-restore.*' -o -name '*.pre-replica-restore.*' \) | grep -q .
 
 # State written by the buggy parser (file length recorded as the size) heals
 # on resume: state, peer metadata and the replica are all corrected.

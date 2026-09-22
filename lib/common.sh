@@ -9,7 +9,11 @@ VMAPI_CONFIG=${VMAPI_CONFIG:-/etc/vmapi/vmapi.conf}
 VMAPI_PROFILE=${VMAPI_PROFILE:-virtualization}
 VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
 VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
+VMAPI_TLS_CA_CERT_FILE=${VMAPI_TLS_CA_CERT_FILE:-}
+VMAPI_TLS_CA_KEY_FILE=${VMAPI_TLS_CA_KEY_FILE:-}
 VMAPI_BACKPLANE_SERVER=${VMAPI_BACKPLANE_SERVER:-false}
+VMAPI_BACKPLANE_NFS_VERSION=${VMAPI_BACKPLANE_NFS_VERSION:-4.2}
+VMAPI_BACKPLANE_NFS_EXPORT=${VMAPI_BACKPLANE_NFS_EXPORT:-/}
 DOCKER_BIN=${DOCKER_BIN:-/usr/bin/docker}
 
 vmapi_qemu_available() {
@@ -47,7 +51,7 @@ vmapi_has_capability() {
     docker|compose|container-terminal|registry|peer-volume-client) vmapi_docker_available;;
     backplane-client) vmapi_qemu_available || vmapi_docker_available;;
     storage-backplane) [[ $VMAPI_BACKPLANE_SERVER == true ]];;
-    files|host-terminal) vmapi_qemu_available || vmapi_docker_available;;
+    files|host-terminal) [[ $VMAPI_PROFILE == backup ]] || vmapi_qemu_available || vmapi_docker_available;;
     *) return 1;;
   esac
 }
