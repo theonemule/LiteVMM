@@ -92,4 +92,19 @@ grep -Fq RELOAD_REJECTED <<< "$body" || fail "invalid configuration was not reje
 sleep 1.5
 [[ $(curl -s -m 2 "http://127.0.0.1:$PORT/overlay/test") == new-route ]] || fail 'server stopped serving after an invalid configuration'
 
+# 5. Native installs must delegate replacement to OpenRC instead of sending
+# SIGUSR1 directly (which shuts Lighttpd down without relaunching it).
+echo 'alias.url += ( "/overlay/test" => "'$T'/www/new.txt" )' > "$T/conf.d/10-overlay.conf"
+mkdir -p "$T/mockbin"
+cat > "$T/mockbin/rc-service" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$T/openrc.log"
+[ "\${2:-}" = graceful ]
+EOF
+chmod +x "$T/mockbin/rc-service"
+PATH="$T/mockbin:$PATH" VMAPI_LIGHTTPD_CONF="$T/lighttpd.conf" VMAPI_WEB_RELOAD_NATIVE_CONF="$T/lighttpd.conf" \
+  "$ROOT/bin/vmapi-web-reload" --now
+grep -Fxq 'lighttpd graceful' "$T/openrc.log" || fail 'native reload did not delegate to OpenRC graceful replacement'
+kill -0 "$master" 2>/dev/null || fail 'native OpenRC branch signaled the Lighttpd process directly'
+
 echo 'web reload: PASS'

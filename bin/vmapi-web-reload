@@ -12,14 +12,16 @@
 #      if it is invalid;
 #   2. when called from a web request, detaches and waits for that request's
 #      CGI process to exit, so its response is fully handed to Lighttpd;
-#   3. applies the change with a graceful restart (SIGUSR1), which finishes
-#      in-flight responses instead of dropping them.
+#   3. applies the change through the native service manager, or signals the
+#      supervised container process to drain and be replaced, after the request
+#      has completed.
 #
 # From an SSH/CLI shell there is no request to protect and the reload happens
 # immediately.  Usage: vmapi-web-reload [--now]
 set -Eeuo pipefail
 
 CONF=${VMAPI_LIGHTTPD_CONF:-${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}/lighttpd.conf}
+NATIVE_CONF=${VMAPI_WEB_RELOAD_NATIVE_CONF:-/etc/lighttpd/lighttpd.conf}
 WAIT_MAX=${VMAPI_WEB_RELOAD_WAIT_MAX:-300}
 # Brief pause after the request exits so Lighttpd has written the response and
 # the console's immediate follow-up refresh is usually already served.
@@ -71,21 +73,40 @@ lighttpd_pid() {
 reload_now() {
   local pid
   lighttpd -tt -f "$CONF" >/dev/null 2>&1 || die "Lighttpd rejected $CONF; the running server was left unchanged"
+
+  # A native LiteVMM install is owned by the host service manager. Lighttpd's
+  # SIGUSR1 is a graceful *shutdown*, not a self-reload; sending it directly on
+  # Alpine leaves OpenRC believing the service is started while no process is
+  # listening. Have the service manager perform the replacement instead.
+  if [[ $CONF == "$NATIVE_CONF" ]]; then
+    if command -v rc-service >/dev/null 2>&1; then
+      if rc-service lighttpd graceful >/dev/null 2>&1; then
+        log 'gracefully replaced Lighttpd through OpenRC'
+        return 0
+      fi
+      log 'OpenRC graceful replacement failed; forcing Lighttpd restart'
+      if ! rc-service lighttpd restart >/dev/null 2>&1; then
+        rc-service lighttpd zap >/dev/null 2>&1 || true
+        rc-service lighttpd start >/dev/null
+      fi
+      return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      log 'restarting Lighttpd through systemd'
+      systemctl restart lighttpd
+      return 0
+    fi
+  fi
+
+  # Container and private-test configurations are supervised outside Lighttpd.
+  # SIGUSR1 lets the current server drain; the supervisor immediately launches
+  # a replacement with the updated configuration.
   if pid=$(lighttpd_pid); then
     kill -USR1 "$pid" || die "Could not signal Lighttpd (pid $pid)"
-    log "graceful reload of Lighttpd (pid $pid) for $CONF"
+    log "graceful shutdown/replacement of Lighttpd (pid $pid) for $CONF"
     return 0
   fi
-  # Not running, or no way to identify it: fall back to the service manager.
-  if command -v rc-service >/dev/null 2>&1; then
-    log 'Lighttpd master not found; restarting through OpenRC'
-    rc-service lighttpd restart >/dev/null
-  elif command -v systemctl >/dev/null 2>&1; then
-    log 'Lighttpd master not found; restarting through systemd'
-    systemctl reload-or-restart lighttpd
-  else
-    die 'Lighttpd is not running and no service manager is available'
-  fi
+  die 'Lighttpd is not running and no service manager is available'
 }
 
 # Detached worker: wait for the originating request, then reload.
