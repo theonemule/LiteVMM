@@ -6,6 +6,7 @@ VMAPI_CONFIG=${VMAPI_CONFIG:-/etc/vmapi/vmapi.conf}
 
 VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
 VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
+VMAPI_TLS_RELOAD_REQUIRED=${VMAPI_TLS_RELOAD_REQUIRED:-false}
 VMAPI_TLS_MODE=${VMAPI_TLS_MODE:-none}
 VMAPI_TLS_DOMAIN=${VMAPI_TLS_DOMAIN:-}
 VMAPI_TLS_CERT_FILE=${VMAPI_TLS_CERT_FILE:-}
@@ -122,7 +123,6 @@ rewrite_nginx(){
   ' "$file" > "$tmp"
   cat "$tmp" > "$file"; rm -f "$tmp"
   nginx -t >/dev/null
-  command -v systemctl >/dev/null 2>&1 && systemctl reload nginx
 }
 
 rewrite_lighttpd(){
@@ -139,16 +139,6 @@ CFG
     rm -f "$conf" "$pem"
   fi
   lighttpd -tt -f "$LIGHTTPD_MAIN_CONF" >/dev/null
-  # Certificate changes are made from the console, i.e. inside a request served
-  # by this Lighttpd; reload gracefully after that request has been answered.
-  local reload=${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}
-  if [[ -x $reload ]]; then
-    VMAPI_LIGHTTPD_CONF="$LIGHTTPD_MAIN_CONF" "$reload"
-  elif command -v rc-service >/dev/null 2>&1; then
-    rc-service lighttpd restart >/dev/null
-  else
-    die 'Lighttpd configuration changed but no reload helper is available'
-  fi
 }
 
 apply_web_tls(){
@@ -158,6 +148,34 @@ apply_web_tls(){
     alpine) rewrite_lighttpd;;
     *) die 'No supported LiteVMM web server was detected';;
   esac
+}
+
+reload_web_tls(){
+  require_root
+  apply_web_tls
+  case $(detect_platform) in
+    debian)
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload nginx
+      else
+        nginx -s reload
+      fi
+      ;;
+    alpine)
+      local reload=${VMAPI_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}
+      if [[ -x $reload ]]; then
+        VMAPI_LIGHTTPD_CONF="$LIGHTTPD_MAIN_CONF" "$reload"
+      elif command -v rc-service >/dev/null 2>&1; then
+        rc-service lighttpd restart >/dev/null
+      else
+        die 'Lighttpd configuration changed but no reload helper is available'
+      fi
+      ;;
+    *) die 'No supported LiteVMM web server was detected';;
+  esac
+  set_config VMAPI_TLS_RELOAD_REQUIRED false
+  VMAPI_TLS_RELOAD_REQUIRED=false
+  status
 }
 
 validate_ca(){
@@ -295,8 +313,8 @@ status(){
   command -v certbot >/dev/null 2>&1 && available=true
   [[ -n $VMAPI_TLS_CSR_FILE && -r $VMAPI_TLS_CSR_FILE ]] && { csr_available=true; csr_subject=$(openssl req -in "$VMAPI_TLS_CSR_FILE" -noout -subject 2>/dev/null | sed 's/^subject=//' || true); }
   platform=$(detect_platform)
-  printf '{"profile":"%s","port":%s,"certbot_available":%s,"tls_enabled":%s,"mode":"%s","domain":"%s","certificate":"%s","private_key":"%s","csr":"%s","csr_key":"%s","csr_domain":"%s","csr_available":%s,"csr_subject":"%s","platform":"%s",' \
-    "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$available" "$VMAPI_TLS_ENABLED" "$(json_escape "$VMAPI_TLS_MODE")" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_FILE")" "$(json_escape "$VMAPI_TLS_CSR_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_DOMAIN")" "$csr_available" "$(json_escape "$csr_subject")" "$platform"
+  printf '{"profile":"%s","port":%s,"certbot_available":%s,"tls_enabled":%s,"reload_required":%s,"mode":"%s","domain":"%s","certificate":"%s","private_key":"%s","csr":"%s","csr_key":"%s","csr_domain":"%s","csr_available":%s,"csr_subject":"%s","platform":"%s",' \
+    "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$available" "$VMAPI_TLS_ENABLED" "$VMAPI_TLS_RELOAD_REQUIRED" "$(json_escape "$VMAPI_TLS_MODE")" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_FILE")" "$(json_escape "$VMAPI_TLS_CSR_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_DOMAIN")" "$csr_available" "$(json_escape "$csr_subject")" "$platform"
   cert_metadata
   printf ','
   local_ca_metadata
@@ -307,6 +325,7 @@ activate(){
   local mode=$1 domain=$2 cert=$3 key=$4 csr=${5-}
   validate_pair "$cert" "$key"
   set_config VMAPI_TLS_ENABLED true
+  set_config VMAPI_TLS_RELOAD_REQUIRED true
   set_config VMAPI_TLS_MODE "$mode"
   set_config VMAPI_TLS_DOMAIN "$domain"
   set_config VMAPI_TLS_CERT_FILE "$cert"
@@ -315,7 +334,7 @@ activate(){
   set_config VMAPI_TLS_CSR_KEY_FILE ""
   set_config VMAPI_TLS_CSR_DOMAIN ""
   VMAPI_TLS_CSR_FILE='' VMAPI_TLS_CSR_KEY_FILE='' VMAPI_TLS_CSR_DOMAIN=''
-  VMAPI_TLS_ENABLED=true VMAPI_TLS_MODE=$mode VMAPI_TLS_DOMAIN=$domain VMAPI_TLS_CERT_FILE=$cert VMAPI_TLS_KEY_FILE=$key
+  VMAPI_TLS_ENABLED=true VMAPI_TLS_RELOAD_REQUIRED=true VMAPI_TLS_MODE=$mode VMAPI_TLS_DOMAIN=$domain VMAPI_TLS_CERT_FILE=$cert VMAPI_TLS_KEY_FILE=$key
   apply_web_tls
 }
 
@@ -345,6 +364,8 @@ renew(){
   [[ -n $CERTBOT_WORK_DIR ]] && cb_args+=(--work-dir "$CERTBOT_WORK_DIR")
   [[ -n $CERTBOT_LOGS_DIR ]] && cb_args+=(--logs-dir "$CERTBOT_LOGS_DIR")
   certbot renew "${cb_args[@]}" --non-interactive --cert-name "$VMAPI_TLS_DOMAIN"
+  set_config VMAPI_TLS_RELOAD_REQUIRED true
+  VMAPI_TLS_RELOAD_REQUIRED=true
   apply_web_tls
   status
 }
@@ -443,14 +464,16 @@ import_pair(){
 disable(){
   require_root
   set_config VMAPI_TLS_ENABLED false
-  VMAPI_TLS_ENABLED=false
+  set_config VMAPI_TLS_RELOAD_REQUIRED true
+  VMAPI_TLS_ENABLED=false VMAPI_TLS_RELOAD_REQUIRED=true
   apply_web_tls
-  status
+  reload_web_tls
 }
 
 case ${1:-status} in
   status) status;;
   apply) require_root; apply_web_tls; status;;
+  reload) reload_web_tls;;
   issue) shift; issue "$@";;
   renew) renew;;
   csr-generate) shift; generate_csr "$@";;
@@ -460,5 +483,5 @@ case ${1:-status} in
   self-sign) shift; self_sign "$@";;
   ca-show) show_ca;;
   disable) disable;;
-  *) die 'Usage: certctl status | apply | issue DOMAIN EMAIL | renew | self-sign HOST [SANS] [DAYS] | ca-show | csr-generate DOMAIN [SANS] [ORG] [OU] [COUNTRY] [STATE] [LOCALITY] [rsa2048|rsa4096|ec256] | csr-show | import-signed CERT_FILE | import-pair CERT_FILE KEY_FILE [DOMAIN] | disable';;
+  *) die 'Usage: certctl status | apply | reload | issue DOMAIN EMAIL | renew | self-sign HOST [SANS] [DAYS] | ca-show | csr-generate DOMAIN [SANS] [ORG] [OU] [COUNTRY] [STATE] [LOCALITY] [rsa2048|rsa4096|ec256] | csr-show | import-signed CERT_FILE | import-pair CERT_FILE KEY_FILE [DOMAIN] | disable';;
 esac

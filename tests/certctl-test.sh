@@ -8,6 +8,7 @@ cat > "$T/vmapi.conf" <<CFG
 VMAPI_PROFILE=virtualization
 VMAPI_HTTP_PORT=5186
 VMAPI_TLS_ENABLED=false
+VMAPI_TLS_RELOAD_REQUIRED=false
 VMAPI_TLS_MODE=none
 VMAPI_TLS_DOMAIN=
 VMAPI_TLS_CERT_FILE=
@@ -70,6 +71,11 @@ run_certctl(){
 
 out=$(run_certctl self-sign local.example.com '127.0.0.1,alt.local.example.com' 30)
 [[ $out == *'"tls_enabled":true'* && $out == *'"mode":"local-ca"'* && $out == *'"local_ca_available":true'* ]]
+[[ $out == *'"reload_required":true'* ]]
+grep -Fqx 'VMAPI_TLS_RELOAD_REQUIRED=true' "$T/vmapi.conf"
+out=$(run_certctl reload)
+[[ $out == *'"reload_required":false'* ]]
+grep -Fqx 'VMAPI_TLS_RELOAD_REQUIRED=false' "$T/vmapi.conf"
 ca_cert=$(awk -F= '$1=="VMAPI_TLS_CA_CERT_FILE"{print $2}' "$T/vmapi.conf")
 ca_key=$(awk -F= '$1=="VMAPI_TLS_CA_KEY_FILE"{print $2}' "$T/vmapi.conf")
 local_cert=$(awk -F= '$1=="VMAPI_TLS_CERT_FILE"{print $2}' "$T/vmapi.conf")
@@ -92,7 +98,7 @@ grep -Fq "VMAPI_TLS_ENABLED=true" "$T/vmapi.conf"
 sudo -n openssl x509 -req -in "$T/tls/demo.example.com.csr" -signkey "$T/tls/demo.example.com.key" \
   -days 30 -copy_extensions copy -out "$T/signed.pem" >/dev/null 2>&1
 out=$(run_certctl import-signed "$T/signed.pem")
-[[ $out == *'"tls_enabled":true'* && $out == *'"mode":"imported-csr"'* ]]
+[[ $out == *'"tls_enabled":true'* && $out == *'"mode":"imported-csr"'* && $out == *'"reload_required":true'* ]]
 grep -Fqx 'VMAPI_TLS_CSR_FILE=' "$T/vmapi.conf"
 grep -Fqx 'VMAPI_TLS_CSR_KEY_FILE=' "$T/vmapi.conf"
 grep -Fqx 'VMAPI_TLS_CSR_DOMAIN=' "$T/vmapi.conf"
@@ -111,7 +117,7 @@ grep -Fq 'VMAPI_TLS_CSR_DOMAIN=replacement.example.com' "$T/vmapi.conf"
 openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=direct.example.com' \
   -addext 'subjectAltName=DNS:direct.example.com' -keyout "$T/direct.key" -out "$T/direct.crt" >/dev/null 2>&1
 out=$(run_certctl import-pair "$T/direct.crt" "$T/direct.key" direct.example.com)
-[[ $out == *'"mode":"imported"'* && $out == *'"domain":"direct.example.com"'* ]]
+[[ $out == *'"mode":"imported"'* && $out == *'"domain":"direct.example.com"'* && $out == *'"reload_required":true'* ]]
 grep -Fq 'VMAPI_TLS_CSR_FILE=' "$T/vmapi.conf"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=wrong.example.com' \
@@ -122,7 +128,7 @@ if run_certctl import-pair "$T/direct.crt" "$T/wrong.key" wrong.example.com >/de
 fi
 
 out=$(run_certctl issue le.example.com admin@example.com)
-[[ $out == *'"mode":"certbot"'* && $out == *'"domain":"le.example.com"'* ]]
+[[ $out == *'"mode":"certbot"'* && $out == *'"domain":"le.example.com"'* && $out == *'"reload_required":true'* ]]
 [[ -f "$T/certbot/live/le.example.com/fullchain.pem" && -f "$T/certbot/live/le.example.com/privkey.pem" ]]
 run_certctl renew >/dev/null
 
@@ -131,12 +137,16 @@ python3 - "$status" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
 assert x["tls_enabled"] is True
+assert x["reload_required"] is True
 assert x["mode"] == "certbot"
 assert x["domain"] == "le.example.com"
 assert x["certbot_available"] is True
 assert x["fingerprint_sha256"]
 assert x["expires"]
 PY
+
+out=$(run_certctl reload)
+[[ $out == *'"reload_required":false'* ]]
 
 out=$(run_certctl disable)
 [[ $out == *'"tls_enabled":false'* ]]
@@ -157,7 +167,8 @@ run_light_certctl(){
   sudo -n env     PATH="$T/lightbin:/usr/local/bin:/usr/bin:/bin"     VMAPI_CONFIG="$T/vmapi.conf"     VMAPI_TLS_ROOT="$T/tls"     VMAPI_LIGHTTPD_TLS_CONF="$T/light/10-tls.conf"     VMAPI_LIGHTTPD_PEM="$T/light/server.pem"     VMAPI_LIGHTTPD_MAIN_CONF="$T/light/lighttpd.conf"     bash "$ROOT/bin/certctl" "$@"
 }
 out=$(run_light_certctl import-pair "$T/direct.crt" "$T/direct.key" direct.example.com)
-[[ $out == *'"platform":"alpine"'* && $out == *'"tls_enabled":true'* ]]
+[[ $out == *'"platform":"alpine"'* && $out == *'"tls_enabled":true'* && $out == *'"reload_required":true'* ]]
+run_light_certctl reload | grep -Fq '"reload_required":false'
 grep -Fq 'ssl.engine = "enable"' "$T/light/10-tls.conf"
 sudo -n grep -Fq 'BEGIN PRIVATE KEY' "$T/light/server.pem"
 sudo -n grep -Fq 'BEGIN CERTIFICATE' "$T/light/server.pem"

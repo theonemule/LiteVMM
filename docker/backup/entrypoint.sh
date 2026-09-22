@@ -60,7 +60,7 @@ vmapi ALL=(root) NOPASSWD: /usr/local/bin/backplanectl server-status
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/logctl *
-vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl self-sign *, /usr/local/bin/certctl ca-show, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl reload, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl self-sign *, /usr/local/bin/certctl ca-show, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable
 SUDOERS
 chmod 0440 /etc/sudoers.d/vmapi
 

@@ -574,6 +574,9 @@ case "${P[0]-}" in
           renew)
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
             raw_json_reply '200 OK' cert_cmd renew;;
+          reload)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            raw_json_reply '200 OK' cert_cmd reload;;
           csr)
             case "$method" in
               GET) text_reply '200 OK' cert_cmd csr-show;;
