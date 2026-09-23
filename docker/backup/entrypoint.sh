@@ -30,6 +30,22 @@ tls_explicit=$(cfg_value VMAPI_TLS_DISABLED_EXPLICITLY)
 tls_mode=$(cfg_value VMAPI_TLS_MODE)
 tls_cert_cfg=$(cfg_value VMAPI_TLS_CERT_FILE)
 tls_key_cfg=$(cfg_value VMAPI_TLS_KEY_FILE)
+tls_domain_cfg=$(cfg_value VMAPI_TLS_DOMAIN)
+
+# Repair malformed persisted certificate host values left by older images. A
+# control byte in VMAPI_TLS_DOMAIN can make /api/admin invalid JSON even though
+# the certificate itself is fine. Re-derive the host from the active cert CN.
+if [[ -n $tls_cert_cfg && -r $tls_cert_cfg ]]; then
+  if [[ ! $tls_domain_cfg =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+    cert_subject=$(openssl x509 -in "$tls_cert_cfg" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')
+    repaired_domain=${cert_subject#*CN=}; repaired_domain=${repaired_domain%%,*}
+    if [[ $repaired_domain =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+      sed -i -E "s#^VMAPI_TLS_DOMAIN=.*#VMAPI_TLS_DOMAIN=$repaired_domain#" "$persistent_config"
+      tls_domain_cfg=$repaired_domain
+      echo "Repaired persisted TLS domain from certificate: $repaired_domain"
+    fi
+  fi
+fi
 
 # Recover only the signature of the old persistence bug: TLS says disabled,
 # there is no remembered active mode/path, but a complete managed certificate

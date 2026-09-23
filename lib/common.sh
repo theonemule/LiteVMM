@@ -257,10 +257,31 @@ resolve_image() {
   printf '%s\n' "$path"
 }
 
-json_escape() {
-  local s=${1-}
-  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
-  printf '%s' "$s"
+json_escape(){
+  local s=${1-} out='' c code esc i
+  LC_ALL=C
+  for ((i=0; i<${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in
+      $'\\') out+='\\';;
+      '"') out+='\"';;
+      $'\b') out+='\b';;
+      $'\f') out+='\f';;
+      $'\n') out+='\n';;
+      $'\r') out+='\r';;
+      $'\t') out+='\t';;
+      *)
+        printf -v code '%d' "'$c"
+        if ((code < 32)); then
+          printf -v esc '\\u%04X' "$code"
+          out+=$esc
+        else
+          out+=$c
+        fi
+        ;;
+    esac
+  done
+  printf '%s' "$out"
 }
 
 # Print only the direct members of the top-level JSON object read from stdin,

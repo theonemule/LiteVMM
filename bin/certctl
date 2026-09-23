@@ -30,7 +30,33 @@ CERTBOT_WORK_DIR=${VMAPI_CERTBOT_WORK_DIR:-}
 CERTBOT_LOGS_DIR=${VMAPI_CERTBOT_LOGS_DIR:-}
 
 die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-json_escape(){ local s=${1-}; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}; printf '%s' "$s"; }
+json_escape(){
+  local s=${1-} out='' c code esc i
+  LC_ALL=C
+  for ((i=0; i<${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in
+      $'\\') out+='\\';;
+      '"') out+='\"';;
+      $'\b') out+='\b';;
+      $'\f') out+='\f';;
+      $'\n') out+='\n';;
+      $'\r') out+='\r';;
+      $'\t') out+='\t';;
+      *)
+        printf -v code '%d' "'$c"
+        if ((code < 32)); then
+          printf -v esc '\\u%04X' "$code"
+          out+=$esc
+        else
+          out+=$c
+        fi
+        ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 valid_domain(){ [[ ${1:-} =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ && ${1:-} == *.* ]] || die 'Invalid DNS name'; }
 is_ipv4(){
   local value=${1:-} a b c d x
@@ -41,11 +67,20 @@ is_ipv4(){
     ((10#$x <= 255)) || return 1
   done
 }
-valid_cert_host(){
+is_cert_host(){
   local value=${1:-}
   is_ipv4 "$value" && return 0
-  [[ $value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die 'Invalid certificate DNS name or IPv4 address'
+  [[ $value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]
 }
+valid_cert_host(){ is_cert_host "${1:-}" || die 'Invalid certificate DNS name or IPv4 address'; }
+cert_host_from_file(){
+  local cert=${1:?certificate required} host subject
+  subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//') || return 1
+  host=${subject#*CN=}; host=${host%%,*}
+  is_cert_host "$host" || return 1
+  printf '%s\n' "$host"
+}
+
 san_entry(){ is_ipv4 "$1" && printf 'IP:%s' "$1" || printf 'DNS:%s' "$1"; }
 valid_email(){ [[ ${1:-} =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Invalid email address'; }
 valid_key_type(){ [[ ${1:-} =~ ^(rsa2048|rsa4096|ec256)$ ]] || die 'key_type must be rsa2048, rsa4096, or ec256'; }
@@ -447,6 +482,9 @@ status(){
       effective_key=''
       effective_domain=$(openssl x509 -in "$runtime_cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -n1)
     fi
+  fi
+  if [[ -n $effective_cert && -r $effective_cert ]] && ! is_cert_host "$effective_domain"; then
+    effective_domain=$(cert_host_from_file "$effective_cert" || true)
   fi
   [[ $configured_tls_enabled == "$effective_tls_enabled" ]] || state_mismatch=true
 
