@@ -158,7 +158,8 @@ component_version() {
     qemu) [[ -x $QEMU_BIN ]] && out=$("$QEMU_BIN" --version 2>/dev/null | head -n1 || true);;
     qemu_img) [[ -x $QEMU_IMG ]] && out=$("$QEMU_IMG" --version 2>/dev/null | head -n1 || true);;
     docker) command -v "$DOCKER_BIN" >/dev/null 2>&1 && out=$("$DOCKER_BIN" --version 2>/dev/null | head -n1 || true);;
-    gost) command -v gost >/dev/null 2>&1 && out=$(gost -V 2>&1 | head -n1 || true);;
+    websocat) command -v websocat >/dev/null 2>&1 && out=$(websocat --version 2>&1 | head -n1 || true);;
+    wsvpn) [[ -r /usr/local/share/litevmm/wsvpn.version ]] && out="WSVPN $(cat /usr/local/share/litevmm/wsvpn.version)" || command -v wsvpn >/dev/null 2>&1 && out="WSVPN installed";;
     nginx) command -v nginx >/dev/null 2>&1 && out=$(nginx -v 2>&1 | head -n1 || true);;
     lighttpd) command -v lighttpd >/dev/null 2>&1 && out=$(lighttpd -v 2>&1 | head -n1 || true);;
     ttyd) command -v ttyd >/dev/null 2>&1 && out=$(ttyd -v 2>&1 | head -n1 || true);;
@@ -223,8 +224,8 @@ cmd_system() {
     "$(json_escape "$cpu_model")" "$(host_cpu_count)" "$(json_escape "$sockets")" "$(json_escape "$cores")" "$(json_escape "$threads")" "$mt" "$ma" "$swap_total" "$swap_free" "$([[ -r $KVM_DEVICE && -w $KVM_DEVICE ]] && printf true || printf false)"
   printf '"network":{"primary_ipv4":"%s","default_gateway":"%s","dns":%s,"interfaces":%s,"routes":%s},' "$(json_escape "$primary_ip")" "$(json_escape "$gateway")" "$dns_json" "$ip_json" "$route_json"
   printf '"storage":{"vm_root":"%s","disk_root":"%s","iso_root":"%s","block_devices":%s,"mounts":%s},' "$(json_escape "$VM_ROOT")" "$(json_escape "$DISK_ROOT")" "$(json_escape "$ISO_ROOT")" "$block_json" "$mount_json"
-  printf '"components":{"litevmm":"%s","qemu":"%s","qemu_img":"%s","docker":"%s","gost":"%s","nginx":"%s","lighttpd":"%s","ttyd":"%s","socat":"%s","xorriso":"%s","bash":"%s"},' \
-    "$(json_escape "$(component_version litevmm)")" "$(json_escape "$(component_version qemu)")" "$(json_escape "$(component_version qemu_img)")" "$(json_escape "$(component_version docker)")" "$(json_escape "$(component_version gost)")" "$(json_escape "$(component_version nginx)")" "$(json_escape "$(component_version lighttpd)")" "$(json_escape "$(component_version ttyd)")" "$(json_escape "$(component_version socat)")" "$(json_escape "$(component_version xorriso)")" "$(json_escape "$(component_version bash)")"
+  printf '"components":{"litevmm":"%s","qemu":"%s","qemu_img":"%s","docker":"%s","websocat":"%s","wsvpn":"%s","nginx":"%s","lighttpd":"%s","ttyd":"%s","socat":"%s","xorriso":"%s","bash":"%s"},' \
+    "$(json_escape "$(component_version litevmm)")" "$(json_escape "$(component_version qemu)")" "$(json_escape "$(component_version qemu_img)")" "$(json_escape "$(component_version docker)")" "$(json_escape "$(component_version websocat)")" "$(json_escape "$(component_version wsvpn)")" "$(json_escape "$(component_version nginx)")" "$(json_escape "$(component_version lighttpd)")" "$(json_escape "$(component_version ttyd)")" "$(json_escape "$(component_version socat)")" "$(json_escape "$(component_version xorriso)")" "$(json_escape "$(component_version bash)")"
   printf '"services":{'
   first=true
   for svc in docker nginx lighttpd fcgiwrap-vmapi vmapi-network vmapi-overlay ttyd-vmapi ttyd-host-vmapi; do

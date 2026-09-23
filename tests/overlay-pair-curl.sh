@@ -2,7 +2,7 @@
 # Purpose: focused VMAPI regression test.
 # Scope: creates isolated fixtures or uses the supplied HTTP endpoint; it does not modify repository files.
 # Run directly with Bash; a non-zero exit status identifies the failed assertion.
-# Two-host GOST TAP data-plane test. All setup and cleanup uses authenticated HTTP.
+# Two-host WSVPN TAP data-plane test. All setup and cleanup uses authenticated HTTP.
 set -Eeuo pipefail
 [[ $# -eq 4 ]] || { echo 'Usage: overlay-pair-curl.sh HUB_URL HUB_USER SPOKE_URL SPOKE_USER'; exit 2; }
 hub=${1%/}; hub_user=$2; spoke=${3%/}; spoke_user=$4

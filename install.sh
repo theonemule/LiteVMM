@@ -25,7 +25,8 @@ umask 022
 BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 PLATFORM=''
 ADMIN_USER=${VMAPI_ADMIN_USER:-${SUDO_USER:-}}
-GOST_VERSION=3.2.6
+WEBSOCAT_VERSION=1.14.1
+WSVPN_VERSION=5.43.0
 PROFILE=${VMAPI_INSTALL_PROFILE:-}
 HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
 
@@ -118,27 +119,56 @@ install_packages() {
 }
 
 
-install_gost() {
-  local arch asset sha archive work binary
+install_websocat() {
+  local arch asset sha work binary marker=/usr/local/share/litevmm/websocat.version
   case $(uname -m) in
-    x86_64|amd64) arch=amd64; sha=b39037b0380ea001fb3c0c28441c2e10bfc694f90682739a65b53e55dce5238b ;;
-    aarch64|arm64) arch=arm64; sha=f674c8f4a033dc1dfd4f0d5e9602fbe5b0d0f81307bf3794f44b5b5d6d622eae ;;
-    *) die "Unsupported CPU for bundled GOST v3: $(uname -m)" ;;
+    x86_64|amd64) arch=x86_64; sha=66f8dd3a0394761556339117f8bb5123bddefd44e087af2a72ec22b0bd08d514 ;;
+    aarch64|arm64) arch=aarch64; sha=711a69576a2ff473fb01a90ffafb571c2ed019e55479d7ae71b12c2eadeb7011 ;;
+    *) die "Unsupported CPU for bundled websocat: $(uname -m)" ;;
   esac
-  if command -v gost >/dev/null 2>&1 && gost -V 2>&1 | grep -Eq '(^|[[:space:]])v?3\.'; then return; fi
-  asset="gost_${GOST_VERSION}_linux_${arch}.tar.gz"
+  if [[ -x /usr/local/bin/websocat && -r $marker && $(cat "$marker") == "$WEBSOCAT_VERSION" ]]; then return; fi
+  asset="websocat.${arch}-unknown-linux-musl"
   work=$(mktemp -d); trap 'rm -rf -- "$work"' RETURN
-  archive="$work/$asset"
+  binary="$work/$asset"
   curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
-    -o "$archive" "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/$asset"
-  printf '%s  %s\n' "$sha" "$archive" | sha256sum -c -
-  tar -xzf "$archive" -C "$work"
-  binary=$(find "$work" -type f -name gost -print -quit)
-  [[ -n $binary ]] || die 'GOST release archive did not contain its binary'
-  install -m 0755 "$binary" /usr/local/bin/gost
-  gost -V 2>&1 | grep -Eq '(^|[[:space:]])v?3\.' || die 'Installed GOST is not version 3'
-  trap - RETURN
-  rm -rf -- "$work"
+    -o "$binary" "https://github.com/vi/websocat/releases/download/v${WEBSOCAT_VERSION}/$asset"
+  printf '%s  %s\n' "$sha" "$binary" | sha256sum -c -
+  install -m 0755 "$binary" /usr/local/bin/websocat
+  /usr/local/bin/websocat --version 2>&1 | grep -Fq "websocat $WEBSOCAT_VERSION" || die 'Installed websocat version check failed'
+  install -d -m 0755 /usr/local/share/litevmm; printf '%s\n' "$WEBSOCAT_VERSION" > "$marker"
+  trap - RETURN; rm -rf -- "$work"
+}
+
+install_wsvpn() {
+  [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]] || return 0
+  local arch asset sha work binary marker=/usr/local/share/litevmm/wsvpn.version
+  case $(uname -m) in
+    x86_64|amd64) arch=amd64; sha=b7917c55d1370ae07a4d667a47fb13b260287949bb5bac290734763039e8dea3 ;;
+    aarch64|arm64) arch=arm64; sha=552f110e568e1afa95d3e969dfa089b5ed6d581df8ddd1cf98f595d88515dea4 ;;
+    *) die "Unsupported CPU for bundled WSVPN: $(uname -m)" ;;
+  esac
+  if [[ -x /usr/local/bin/wsvpn && -r $marker && $(cat "$marker") == "$WSVPN_VERSION" ]]; then return; fi
+  asset="wsvpn-linux-$arch"
+  work=$(mktemp -d); trap 'rm -rf -- "$work"' RETURN
+  binary="$work/$asset"
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+    -o "$binary" "https://github.com/Doridian/wsvpn/releases/download/v${WSVPN_VERSION}/$asset"
+  printf '%s  %s\n' "$sha" "$binary" | sha256sum -c -
+  install -m 0755 "$binary" /usr/local/bin/wsvpn
+  install -d -m 0755 /usr/local/share/litevmm; printf '%s\n' "$WSVPN_VERSION" > "$marker"
+  trap - RETURN; rm -rf -- "$work"
+}
+
+remove_managed_gost() {
+  local expected='' actual=''
+  [[ -x /usr/local/bin/gost ]] || return 0
+  case $(uname -m) in
+    x86_64|amd64) expected=a2aea24efb4597b5f57b35b8e1bbcc59f439b80723854d4371f6828b46682ffb ;;
+    aarch64|arm64) expected=343c3e003996ca0437b9cc47dd1500cd0475ba09f5a5f17e50851854e06a1ca7 ;;
+    *) return 0 ;;
+  esac
+  actual=$(sha256sum /usr/local/bin/gost 2>/dev/null | awk '{print $1}')
+  [[ $actual == "$expected" ]] && rm -f -- /usr/local/bin/gost || true
 }
 
 ensure_tun() {
@@ -447,6 +477,8 @@ verify_profile_install() {
     die 'Backup-storage verification failed: bare-metal/VM install must use NFSv4.2'
   [[ $(awk -F= '$1=="VMAPI_BACKPLANE_NFS_PORT"{print $2}' /etc/vmapi/vmapi.conf | tail -n1) == 2049 ]] ||
     die 'Backup-storage verification failed: bare-metal/VM install must use native NFS port 2049'
+  command -v websocat >/dev/null 2>&1 || die 'Transport verification failed: websocat is not installed'
+  if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then command -v wsvpn >/dev/null 2>&1 || die 'Overlay verification failed: WSVPN is not installed'; fi
 }
 
 finalize() {
@@ -511,7 +543,9 @@ case $PROFILE in
 esac
 [[ -z $ADMIN_USER ]] || usermod -aG vmapi-admin "$ADMIN_USER"
 if [[ $PROFILE == virtualization || $PROFILE == virtualization-docker ]]; then ensure_tun; fi
-install_gost
+install_websocat
+install_wsvpn
+remove_managed_gost
 install_common_files
 write_sudoers
 configure_docker_runtime

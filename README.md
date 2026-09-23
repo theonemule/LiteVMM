@@ -31,7 +31,7 @@ Browser / curl
   QEMU / KVM            Docker daemon         qemu-img / Docke
 ```
 
-The network tools also manage named GOST TAP Layer-2 overlays. On Alpine, lighttpd carries each overlay on `/overlay/NAME` and proxies it to a GOST listener bound only to loopback, so no additional public port is required.
+The network tools also manage named WSVPN TAP Layer-2 overlays. On Alpine, Lighttpd terminates HTTP(S), authenticates the peer, and proxies `/overlay/NAME` as plaintext WebSocket to a WSVPN listener bound only to loopback, so no additional public port is required.
 
 The CGI layer does not reimplement lifecycle logic. It invokes the same shell APIs that can be used directly over SSH.
 
@@ -56,7 +56,7 @@ The console covers:
 - Docker image pull/list/remove plus streamed build-context image builds
 - federated Docker image discovery plus zero-copy peer-backed container root filesystems, with explicit local pulls and an optional OCI registry
 - Docker network create/list/inspect/remove plus host bridge/interface visibility
-- named GOST TAP-over-WebSocket Layer-2 overlays for paired peers
+- named WSVPN TAP-over-WebSocket Layer-2 overlays for paired peers
 - continuous VM disk replication to paired storage-backplane nodes without requiring an overlay network
 - Docker volume create/list/inspect/remove with Docker-local, host bind, NFS, SMB/CIFS, tmpfs, custom-driver, and LiteVMM peer-backed NFS/WSS storage
 - five-second host, VM and container resource monitoring with rolling in-browser graphs
@@ -92,13 +92,13 @@ VMAPI_PASSWORD='...' ./tests/api-regression-curl.sh https://vmapi.example alice
 
 Use `--insecure` only for a test server with a self-signed TLS certificate. A successful run ends with `authenticated HTTP regression checks completed and all test resources were removed`.
 
-The default tier avoids host-network changes. On a disposable development host, add `--destructive` to also create, inspect, update, and remove a temporary Linux bridge and paired GOST overlay. That tier is recoverable through the same cleanup trap, but it has a wider blast radius and therefore requires an explicit opt-in.
+The default tier avoids host-network changes. On a disposable development host, add `--destructive` to also create, inspect, update, and remove a temporary Linux bridge and paired WSVPN overlay. That tier is recoverable through the same cleanup trap, but it has a wider blast radius and therefore requires an explicit opt-in.
 
 To verify the actual Layer-2 data path between an already-paired hub and spoke,
 run the two-host test from any Linux machine. It creates matching overlays and
 temporary fixed-address endpoints through each host's authenticated HTTP API,
 verifies the TAP device and bridge attachment on both sides, then proves a
-DHCP lease, ARP broadcast resolution, and ICMP through GOST TAP over WebSocket
+DHCP lease, ARP broadcast resolution, and ICMP through WSVPN TAP over WebSocket
 before removing every test resource.
 
 ```bash
@@ -157,7 +157,7 @@ Docker objects are **not** duplicated into this filesystem. The Docker daemon re
 
 ### Brokered overlay networks
 
-Creating a GOST TAP overlay from one LiteVMM host is a coordinated peer operation. Select one or more paired hosts in the network dialog and LiteVMM creates the local endpoint plus the matching endpoint on each selected peer through the authenticated peer API. A local hub creates remote spokes; a local spoke creates the selected remote host as its hub. Both ends use the same overlay name and bridge name, and the data plane runs as TAP Ethernet over the existing HTTP(S) WebSocket endpoint.
+Creating a WSVPN TAP overlay from one LiteVMM host is a coordinated peer operation. Select one or more paired hosts in the network dialog and LiteVMM creates the local endpoint plus the matching endpoint on each selected peer through the authenticated peer API. A local hub creates remote spokes; a local spoke creates the selected remote host as its hub. Both ends use the same overlay name and bridge name, and the data plane runs as TAP Ethernet over the existing HTTP(S) WebSocket endpoint.
 
 If either side cannot create or start its endpoint, LiteVMM rolls back the endpoints already created for that request. Deleting the overlay from the initiating host also deletes its paired endpoints.
 
@@ -179,13 +179,16 @@ peer NFS mount
         |
 127.0.0.1:dynamic-port
         |
-       GOST
+    websocat
         |
  WSS /backplane/storage
         |
  existing LiteVMM HTTP(S) port
+        |  TLS terminates at Nginx/Lighttpd
+        v
+ plaintext WS on loopback
         |
-       GOST
+    websocat
         |
 127.0.0.1:2049
         |
@@ -194,7 +197,7 @@ peer NFS mount
 /var/lib/vmapi/backplane
 ```
 
-The client runs GOST as a loopback TCP-to-WebSocket bridge and mounts it with the normal Linux NFS client. The storage host runs GOST as the matching WebSocket-to-TCP bridge behind Nginx or Lighttpd. One peer-wide mount is reused by backups, VM replicas, Docker volumes, read-only Docker image-rootfs exports, registry data, and future filesystem-backed storage features.
+The client runs `websocat` as a loopback TCP-to-WebSocket bridge and mounts it with the normal Linux NFS client. The storage host runs `websocat` as the matching plaintext WebSocket-to-TCP bridge on loopback. Nginx or Lighttpd owns the public HTTP(S) endpoint, TLS termination, and peer authentication before proxying the upgraded connection to `websocat`. One peer-wide mount is reused by backups, VM replicas, Docker volumes, read-only Docker image-rootfs exports, registry data, and future filesystem-backed storage features.
 
 Each source node receives a namespace under `peers/NODE_ID/` with storage classes including `backups`, `replicas`, `docker-volumes`, `registry`, and `artifacts`. Shared read-only resources such as ISO media and Docker image-rootfs exports live under the backplane `shared/` tree.
 
@@ -279,7 +282,7 @@ sudo ./install.sh --profile virtualization-docker --port 5186
 
 Running `sudo ./install.sh` interactively presents the four profile choices and uses port `5186` by default. Noninteractive automation can set `VMAPI_INSTALL_PROFILE`, `VMAPI_HTTP_PORT`, `VMAPI_HTTP_USER`, and `VMAPI_HTTP_PASSWORD`.
 
-Debian uses Nginx on `127.0.0.1:5186` by default. Alpine uses Lighttpd on the configured management port. Both web servers proxy `/backplane/storage` to a loopback-only GOST WebSocket listener; NFS itself remains bound to loopback.
+Debian uses Nginx on `127.0.0.1:5186` by default. Alpine uses Lighttpd on the configured management port. Both web servers proxy `/backplane/storage` to a loopback-only plaintext `websocat` WebSocket listener; the web server owns TLS termination and NFS itself remains bound to loopback.
 
 ### Containerized backup storage node
 
@@ -655,9 +658,9 @@ Hyper-V switch discards replies for the nested guest MAC.
 
 Docker networking is intentionally separate and is managed through `docker-netctl` / the Docker daemon.
 
-## GOST TAP Layer-2 overlay over Lighttpd
+## WSVPN TAP Layer-2 overlay over Lighttpd
 
-The hub accepts `/overlay/NAME` on its existing HTTP(S) listener. Lighttpd authenticates the upgrade using the paired credential and proxies it to a loopback-only GOST Relay/WS listener. The spoke runs GOST TAP with a Relay connector and an HTTP `Authorization: Basic ...` header; it has no overlay proxy or public GOST listener. The TAP UDP listener is also bound to loopback.
+The hub accepts `/overlay/NAME` on its existing HTTP(S) listener. Lighttpd owns the public endpoint, terminates TLS when HTTPS is enabled, authenticates the WebSocket upgrade using the paired credential, and proxies plaintext WebSocket traffic to a loopback-only WSVPN listener. WSVPN itself is not configured with the LiteVMM server certificate and does not expose a public listener. A spoke connects to the hub's normal `ws://` or `wss://` LiteVMM endpoint and verifies the paired host CA for WSS.
 
 Create the same overlay name on both endpoints after completing pairing:
 
@@ -674,13 +677,13 @@ sudo overlayctl activate backend
 
 The staged test assigns temporary TAP addresses and proves ARP/ICMP crosses the authenticated WebSocket. Activation removes these addresses and attaches the TAP to the bridge. Test an active overlay using addresses of workloads on opposite hosts. The API exposes `POST /overlays/NAME/stage`, `/validate`, and `/activate`; creation accepts `staged=true`. Normal UI creation activates immediately.
 
-A hub may select up to 16 paired spokes; each spoke selects exactly one hub. Staged address testing is for a single pair. Each route allows only its selected paired usernames. GOST configuration is generated with mode 0600, carries a 15-second WebSocket heartbeat, and verifies WSS certificates. Lighttpd idle limits are 600 seconds. No second Relay password is needed.
+A hub may select up to 16 paired spokes; each spoke selects exactly one hub. WSVPN runs in TAP mode with client-to-client forwarding, multiple MAC addresses, IP spoofing permitted for bridged guests, and unknown EtherTypes enabled so the overlay remains a transparent Layer-2 segment rather than an IP-only VPN. This permits protocols such as IPX in addition to ARP, IPv4 and IPv6. Generated WSVPN configuration and spoke authentication files are mode 0600.
 
-The overlay service supervises GOST children, cleans them up on stop, and restarts after a child exits. `overlayctl list` and `show NAME` report actual process, TAP and bridge state. It does not create Docker networks or assign workload addresses.
+The overlay service supervises WSVPN children, cleans them up on stop, and restarts after a child exits. `overlayctl list` and `show NAME` report actual process, TAP and bridge state. It does not create Docker networks or assign workload addresses.
 
 ### Overlay MTU
 
-Overlays default to a 1500-byte MTU, the same as a guest's NIC. GOST carries each Ethernet frame as bytes inside the TCP/WebSocket stream, so no headroom is needed for encapsulation. A smaller overlay MTU is a trap: guests keep sending 1500-byte frames, and anything that does not fit is silently dropped. Pings and DNS still work, but routed TCP stalls; for example, downloads fail through a router VM such as pfSense serving the overlay.
+Overlays default to a 1500-byte MTU, the same as a guest's NIC. WSVPN preserves Ethernet frame boundaries over WebSocket and supports fragmentation when required by the transport. A smaller overlay MTU is a trap unless the guests use the same value: guests can continue sending 1500-byte frames that no longer fit the configured segment.
 
 Overlays created before this default keep their stored MTU (formerly 1400). To change an existing overlay, run on **every** member host:
 
@@ -690,15 +693,15 @@ sudo overlayctl set-mtu backend 1500
 
 On a bridge the overlay created, this moves every port, including running VM taps, to the new MTU and restarts the overlay transport (a brief reconnect). On a pre-existing bridge only the overlay TAP changes; set the other ports yourself. If you choose an MTU below 1500, configure the same MTU inside each guest.
 
-### Replacing previous overlay attempts
+### Replacing previous overlay transports
 
-Stop attached workloads before replacing a segment. Run `overlayctl reset` on each endpoint to stop and remove VMAPI's named TAP transports and generated hub routes, preserving paired hosts, bridges and workload configuration. Pull the current source and rerun `sudo ./install.sh`, then recreate the hub and spoke as above. Upgrade both peers together: peer API authentication has changed from request signatures to HTTP Basic.
+Stop attached workloads before replacing a segment. Run `overlayctl reset` on each endpoint to stop and remove LiteVMM's named TAP transports and generated hub routes, preserving paired hosts, bridges and workload configuration. Pull the current source and rerun `sudo ./install.sh`, then recreate the hub and spoke as above. Current installs use WSVPN instead of the earlier GOST transport.
 
 ### Validation
 
-`tests/overlay-netns-test.sh` runs real GOST and Lighttpd in two disposable Linux network namespaces. Run as root with `VMAPI_TEST_GOST=/path/to/gost`; it verifies HTTP Basic rejection, matching API/upgrade credentials, TAP ARP/ICMP, active bridge traffic, supervisor cleanup and revocation. `tests/overlay-pair-curl.sh` tests two deployed full-app hosts with Docker DHCP and ping endpoints.
+`tests/overlay-netns-test.sh` runs real WSVPN and Lighttpd in two disposable Linux network namespaces. Run as root with `VMAPI_TEST_WSVPN=/path/to/wsvpn`; it verifies HTTP Basic rejection, the Lighttpd offload/proxy boundary, TAP ARP/ICMP, full-size frames, raw EtherType `0x8137` traffic, active bridge traffic, supervisor cleanup and revocation. `tests/websocket-transport-test.sh` exercises the `websocat` backplane and console byte streams. `tests/overlay-pair-curl.sh` tests two deployed full-app hosts with Docker DHCP and ping endpoints.
 
-Configuration references: [GOST TAP](https://latest.gost.run/en/reference/listeners/tap/), [GOST WebSocket dialer](https://gost.run/reference/dialers/ws/), [Lighttpd authentication](https://redmine.lighttpd.net/projects/lighttpd/wiki/Mod_auth), and [Lighttpd WebSocket proxy](https://redmine.lighttpd.net/projects/1/wiki/Docs_ModProxy).
+Configuration references: [WSVPN](https://github.com/Doridian/wsvpn), [websocat](https://github.com/vi/websocat), [Lighttpd authentication](https://redmine.lighttpd.net/projects/lighttpd/wiki/Mod_auth), and [Lighttpd WebSocket proxy](https://redmine.lighttpd.net/projects/1/wiki/Docs_ModProxy).
 
 ## VM console
 
@@ -708,7 +711,7 @@ Each running graphical VM gets a VNC display bound to `127.0.0.1` by default, pl
 vm-console-info debian01
 ```
 
-On Alpine/lighttpd installs, the web console opens a same-origin noVNC tab. `consolectl` creates a short-lived token, allocates a loopback-only GOST WebSocket forwarder for that VM's QEMU VNC listener, and writes an exact `/console/ws/TOKEN` Lighttpd route. Multiple VM consoles can be active at the same time without exposing VNC ports.
+On Alpine/lighttpd installs, the web console opens a same-origin noVNC tab. `consolectl` creates a short-lived token, allocates a loopback-only `websocat` WebSocket-to-TCP forwarder for that VM's QEMU VNC listener, and writes an exact `/console/ws/TOKEN` Lighttpd route. Multiple VM consoles can be active at the same time without exposing VNC ports.
 
 The browser opens `/console.html`, imports the packaged noVNC RFB module from `/novnc/core/rfb.js`, and connects to the session-specific `/console/ws/TOKEN` path. It heartbeats the session every 30 seconds.
 
@@ -760,7 +763,7 @@ GET     /api/metrics
 GET     /api/system
 ```
 
-`/api/system` returns the host/OS/kernel identity, CPU and RAM inventory, IP interfaces and routes, storage devices and mounted filesystems, LiteVMM/QEMU/Docker/GOST/web-server/tool versions, and service state.
+`/api/system` returns the host/OS/kernel identity, CPU and RAM inventory, IP interfaces and routes, storage devices and mounted filesystems, LiteVMM/QEMU/Docker/WSVPN/websocat/web-server/tool versions, and service state.
 
 The web console polls this endpoint every five seconds while the Overview page is visible.
 

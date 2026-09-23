@@ -8,7 +8,8 @@ bash -n "$ROOT/install.sh"
 head -n 1 "$ROOT/install.sh" | grep -Fxq '#!/bin/sh'
 grep -Fq 'VMAPI_INSTALL_BASH=1 bash "$0" "$@"' "$ROOT/install.sh"
 grep -Fq 'detect_platform' "$ROOT/install.sh"
-grep -Fq 'GOST_VERSION=3.2.6' "$ROOT/install.sh"
+grep -Fq 'WEBSOCAT_VERSION=1.14.1' "$ROOT/install.sh"
+grep -Fq 'WSVPN_VERSION=5.43.0' "$ROOT/install.sh"
 grep -Fq 'PROFILE=${VMAPI_INSTALL_PROFILE:-}' "$ROOT/install.sh"
 grep -Fq 'HTTP_PORT=${VMAPI_HTTP_PORT:-5186}' "$ROOT/install.sh"
 grep -Fq 'VMAPI_BACKPLANE_NFS_BACKEND=kernel' "$ROOT/etc/vmapi.conf"
@@ -41,6 +42,7 @@ grep -Fq 'report_nested_hyperv_requirement' "$ROOT/install.sh"
 grep -Fq '/usr/local/bin/netctl restore' "$ROOT/openrc/vmapi-network"
 grep -Fq '"ports":[' "$ROOT/bin/netctl"
 grep -Fq 'configured_bridge_members "$name"' "$ROOT/bin/netctl"
+grep -Fq 'ensure_qemu_bridge_allowed()' "$ROOT/bin/netctl"
 grep -Fq 'function bridgeMemberOptions' "$ROOT/www/app.js"
 grep -Fq '/^(tap|vnet)\d+$/.test(i)' "$ROOT/www/app.js"
 grep -Fq 'netctl restore' "$ROOT/systemd/vmapi-network.service"
@@ -74,7 +76,14 @@ grep -Fq 'type=cifs' "$ROOT/www/app.js"
 grep -Fq 'LiteVMM peer NFS backplane volume' "$ROOT/www/app.js"
 grep -Fq '/backplane/storage' "$ROOT/lighttpd/vmapi.conf"
 grep -Fq 'VMAPI_BACKPLANE_NFS_BIND=127.0.0.1' "$ROOT/etc/vmapi.conf"
-grep -Fq 'install_gost' "$ROOT/install.sh"
+grep -Fq 'install_websocat' "$ROOT/install.sh"
+grep -Fq 'install_wsvpn' "$ROOT/install.sh"
+grep -Fq 'COPY --from=websocat /websocat /usr/local/bin/websocat' "$ROOT/Dockerfile"
+! grep -Fq 'COPY --from=gost' "$ROOT/Dockerfile"
+grep -Fq 'allow-unknown-ether-types: true' "$ROOT/bin/overlayctl"
+grep -Fq 'Lighttpd terminates TLS and authenticates before proxying plaintext WebSocket to WSVPN' "$ROOT/bin/overlayctl"
+grep -Fq 'ws-l:$WS_BIND:$WS_PORT' "$ROOT/bin/backplanectl"
+grep -Fq 'ws-l:127.0.0.1:$ws_port' "$ROOT/bin/consolectl"
 grep -Fq '1) backup                 Backup only' "$ROOT/install.sh"
 grep -Fq "Docker profile verification failed: docker is not installed" "$ROOT/install.sh"
 grep -Fq 'verify_profile_install' "$ROOT/install.sh"
@@ -152,6 +161,7 @@ bash -n "$ROOT/tests/overlay-pair-curl.sh"
 echo 'syntax: PASS'
 
 install_packages_line=$(grep -n '^install_packages$' "$ROOT/install.sh" | tail -n1 | cut -d: -f1)
-install_gost_line=$(grep -n '^install_gost$' "$ROOT/install.sh" | tail -n1 | cut -d: -f1)
-[[ $install_packages_line =~ ^[0-9]+$ && $install_gost_line =~ ^[0-9]+$ ]]
-(( install_packages_line < install_gost_line ))
+install_websocat_line=$(grep -n '^install_websocat$' "$ROOT/install.sh" | tail -n1 | cut -d: -f1)
+install_wsvpn_line=$(grep -n '^install_wsvpn$' "$ROOT/install.sh" | tail -n1 | cut -d: -f1)
+[[ $install_packages_line =~ ^[0-9]+$ && $install_websocat_line =~ ^[0-9]+$ && $install_wsvpn_line =~ ^[0-9]+$ ]]
+(( install_packages_line < install_websocat_line && install_websocat_line < install_wsvpn_line ))

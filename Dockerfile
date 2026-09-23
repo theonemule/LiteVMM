@@ -1,4 +1,16 @@
-FROM gogost/gost:3.2.6 AS gost
+FROM alpine:3.24 AS websocat
+
+ARG WEBSOCAT_VERSION=1.14.1
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates curl \
+ && case "${TARGETARCH:-$(uname -m)}" in \
+      amd64|x86_64) asset=websocat.x86_64-unknown-linux-musl; sha=66f8dd3a0394761556339117f8bb5123bddefd44e087af2a72ec22b0bd08d514 ;; \
+      arm64|aarch64) asset=websocat.aarch64-unknown-linux-musl; sha=711a69576a2ff473fb01a90ffafb571c2ed019e55479d7ae71b12c2eadeb7011 ;; \
+      *) echo "Unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL "https://github.com/vi/websocat/releases/download/v${WEBSOCAT_VERSION}/$asset" -o /websocat \
+ && printf '%s  %s\n' "$sha" /websocat | sha256sum -c - \
+ && chmod 0755 /websocat
 
 FROM alpine:3.24 AS unfs3-build
 
@@ -18,7 +30,7 @@ LABEL org.opencontainers.image.title="LiteVMM Storage"       org.opencontainers.
 
 RUN apk add --no-cache     bash coreutils findutils gawk grep sed shadow util-linux     curl jq openssl ca-certificates sudo tar gzip zip iproute2     lighttpd lighttpd-mod_auth apache2-utils fcgiwrap spawn-fcgi ttyd certbot     nfs-utils libtirpc
 
-COPY --from=gost /bin/gost /usr/local/bin/gost
+COPY --from=websocat /websocat /usr/local/bin/websocat
 COPY --from=unfs3-build /out/usr/local/sbin/unfsd /usr/local/sbin/unfsd
 
 RUN addgroup -S vmapi  && adduser -S -D -H -h /var/lib/vmapi -s /sbin/nologin -G vmapi vmapi

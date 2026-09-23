@@ -15,13 +15,15 @@ emit(){
     done
 }
 
-emit_gost(){
+emit_transports(){
   local f
-  emit gost /var/log/vmapi-overlay.log
-  emit gost /var/log/vmapi-backplane.log
-  emit gost /var/log/vmapi-backplane-server.log
+  emit transport /var/log/vmapi-overlay.log
+  emit transport /var/log/vmapi-backplane.log
+  emit transport /var/log/vmapi-backplane-server.log
   shopt -s nullglob
-  for f in /run/vmapi/consoles/*.gost.log /run/vmapi-backplane/*.gost.log; do emit gost "$f"; done
+  for f in /run/vmapi/consoles/*.websocat.log /run/vmapi-backplane/*.websocat.log /run/vmapi-backplane/websocat-server.log; do emit transport "$f"; done
+  # Include pre-upgrade GOST logs if they remain on disk.
+  for f in /run/vmapi/consoles/*.gost.log /run/vmapi-backplane/*.gost.log; do emit legacy-gost "$f"; done
   shopt -u nullglob
 }
 
@@ -32,13 +34,13 @@ case $source_name in
     emit docker /var/log/docker.log
     emit fcgi /var/log/fcgiwrap-vmapi.log
     emit ttyd /var/log/ttyd-vmapi.log
-    emit_gost
+    emit_transports
     ;;
   system) emit system /var/log/messages;;
   overlay) emit overlay /var/log/vmapi-overlay.log;;
   docker) emit docker /var/log/docker.log;;
   fcgi) emit fcgi /var/log/fcgiwrap-vmapi.log;;
   ttyd) emit ttyd /var/log/ttyd-vmapi.log;;
-  gost) emit_gost;;
+  transport|gost) emit_transports;;
   *) echo 'unknown log source' >&2; exit 1;;
 esac

@@ -1,8 +1,8 @@
 #!/sbin/openrc-run
-# supervise-daemon tracks the foreground controller and restarts it if GOST
-# exits. overlayctl owns and cleans up only the child GOST processes it starts.
+# supervise-daemon tracks the foreground controller and restarts it if WSVPN
+# exits. overlayctl owns and cleans up only the child WSVPN processes it starts.
 name="vmapi-overlay"
-description="VMAPI persistent GOST TAP overlays"
+description="VMAPI persistent WSVPN TAP overlays"
 supervisor="supervise-daemon"
 command="/usr/local/bin/overlayctl"
 command_args="run"

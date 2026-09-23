@@ -6,7 +6,7 @@ LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 source "$LIB"
 
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
-GOST=${VMAPI_GOST:-$(command -v gost 2>/dev/null || printf %s /usr/local/bin/gost)}
+WEBSOCAT=${VMAPI_WEBSOCAT:-$(command -v websocat 2>/dev/null || printf %s /usr/local/bin/websocat)}
 MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
 UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
 EXPORTFS=${VMAPI_EXPORTFS:-$(command -v exportfs 2>/dev/null || printf %s /usr/sbin/exportfs)}
@@ -51,8 +51,9 @@ valid_name(){ [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || die "Invalid
 valid_port(){ validate_positive_int "$1"; ((10#$1 <= 65535)) || die 'Invalid port'; }
 valid_ipv4_bind(){ [[ ${1:-} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die 'Backplane NFS bind must be an IPv4 address'; }
 state_file(){ valid_peer "$1"; printf '%s/%s.conf\n' "$STATE_ROOT" "${1,,}"; }
-pid_file(){ valid_peer "$1"; printf '%s/%s.gost.pid\n' "$RUN_ROOT" "${1,,}"; }
-log_file(){ valid_peer "$1"; printf '%s/%s.gost.log\n' "$RUN_ROOT" "${1,,}"; }
+pid_file(){ valid_peer "$1"; printf '%s/%s.websocat.pid\n' "$RUN_ROOT" "${1,,}"; }
+legacy_pid_file(){ valid_peer "$1"; printf '%s/%s.gost.pid\n' "$RUN_ROOT" "${1,,}"; }
+log_file(){ valid_peer "$1"; printf '%s/%s.websocat.log\n' "$RUN_ROOT" "${1,,}"; }
 mountpoint(){ valid_peer "$1"; printf '%s/%s\n' "$MOUNT_ROOT" "${1,,}"; }
 
 ensure_dirs(){
@@ -143,46 +144,30 @@ wait_port(){ local p=$1; for _ in {1..100}; do port_in_use "$p" && return 0; sle
 is_mounted(){ local mp=$1; awk -v p="$mp" '$2==p && $3 ~ /^nfs/ {found=1} END{exit !found}' /proc/mounts; }
 
 start_tunnel(){
-  local peer=$1 port=$2 profile endpoint user pass ca_file header scheme host remote_port pf lf cfg tls_block=''
-  need_cmd "$GOST"; need_cmd "$SS"
+  local peer=$1 port=$2 profile endpoint user pass ca_file header scheme host remote_port pf lf legacy_pf url
+  local -a args env_args
+  need_cmd "$WEBSOCAT"; need_cmd "$SS"
   profile=$(peer_profile "$peer"); endpoint=$(json_field "$profile" endpoint); user=$(json_field "$profile" username); pass=$(json_field "$profile" password); ca_file=$(json_field "$profile" ca_file)
   [[ -n $user && -n $pass ]] || die 'Peer backplane credentials are unavailable'
   [[ $endpoint =~ ^(wss?)://([A-Za-z0-9.-]+)(:([0-9]{1,5}))?(/.*)?$ ]] || die 'Peer has no WebSocket-capable endpoint'
   scheme=${BASH_REMATCH[1]}; host=${BASH_REMATCH[2]}; remote_port=${BASH_REMATCH[4]}; [[ -n $remote_port ]] || { [[ $scheme == wss ]] && remote_port=443 || remote_port=80; }
   header=$(printf '%s:%s' "$user" "$pass"|base64|tr -d '\n')
+  pf=$(pid_file "$peer"); legacy_pf=$(legacy_pid_file "$peer"); lf=$(log_file "$peer")
+  kill_pidfile "$pf"; kill_pidfile "$legacy_pf"; rm -f -- "$RUN_ROOT/${peer,,}.gost.yaml"
+  port_in_use "$port" && die "Backplane loopback port is already in use: $port"
+  url="$scheme://$host:$remote_port/backplane/storage"
+  args=(--binary --exit-on-eof --ping-interval 20 --basic-auth "$header")
+  env_args=()
   if [[ $scheme == wss ]]; then
-    tls_block="        tls: {secure: true, serverName: \"$host\"}"
+    args+=(--tls-domain "$host")
     if [[ -n $ca_file ]]; then
       [[ -r $ca_file ]] || die 'Peer TLS CA certificate is missing'
-      tls_block="        tls: {secure: true, serverName: \"$host\", caFile: \"$ca_file\"}"
+      env_args+=("SSL_CERT_FILE=$ca_file")
     fi
   fi
-  pf=$(pid_file "$peer"); lf=$(log_file "$peer"); cfg="$RUN_ROOT/${peer,,}.gost.yaml"; kill_pidfile "$pf"; rm -f "$cfg"; port_in_use "$port" && die "Backplane loopback port is already in use: $port"
-  cat >"$cfg" <<YAML
-services:
-- name: storage-client
-  addr: "127.0.0.1:$port"
-  handler: {type: tcp, chain: storage-chain}
-  listener: {type: tcp}
-chains:
-- name: storage-chain
-  hops:
-  - name: peer
-    nodes:
-    - name: peer
-      addr: "$host:$remote_port"
-      connector: {type: forward}
-      dialer:
-        type: $scheme
-$tls_block
-        metadata:
-          path: "/backplane/storage"
-          keepalive: true
-          ttl: 20s
-          header: {Authorization: "Basic $header"}
-YAML
-  chmod 0600 "$cfg"; : >"$lf"; chmod 0600 "$lf"; setsid "$GOST" -C "$cfg" </dev/null >>"$lf" 2>&1 & echo $! >"$pf"
-  wait_port "$port" && pid_alive "$pf" || { tail -40 "$lf" >&2 2>/dev/null || true; die 'Peer backplane GOST tunnel failed to start'; }
+  : >"$lf"; chmod 0600 "$lf"
+  setsid env "${env_args[@]}" "$WEBSOCAT" "${args[@]}" "tcp-l:127.0.0.1:$port" "$url" </dev/null >>"$lf" 2>&1 & echo $! >"$pf"
+  wait_port "$port" && pid_alive "$pf" || { tail -40 "$lf" >&2 2>/dev/null || true; die 'Peer backplane WebSocket tunnel failed to start'; }
 }
 
 repair_mount_traversal(){
@@ -250,7 +235,8 @@ disconnect_peer(){
   valid_peer "$peer"; validate_bool "$forget"; peer=${peer,,}; mp=$(mountpoint "$peer")
   if is_mounted "$mp"; then "$UMOUNT_BIN" "$mp" || "$UMOUNT_BIN" -l "$mp" || true; fi
   kill_pidfile "$(pid_file "$peer")"
-  $forget && rm -f -- "$(state_file "$peer")" "$(log_file "$peer")"
+  kill_pidfile "$(legacy_pid_file "$peer")"
+  $forget && rm -f -- "$(state_file "$peer")" "$(log_file "$peer")" "$RUN_ROOT/${peer,,}.gost.log" "$RUN_ROOT/${peer,,}.gost.yaml"
   rmdir "$mp" 2>/dev/null || true
 }
 
@@ -409,6 +395,7 @@ server_verify(){
 }
 
 server_cleanup(){
+  [[ -r "$RUN_ROOT/websocat-server.pid" ]] && kill_pidfile "$RUN_ROOT/websocat-server.pid" || true
   [[ -r "$RUN_ROOT/gost-server.pid" ]] && kill_pidfile "$RUN_ROOT/gost-server.pid" || true
   rm -f -- "$RUN_ROOT/gost-server.yaml"
   if [[ "$NFS_BACKEND" == unfs3 ]]; then
@@ -428,7 +415,7 @@ start_unfs3(){
   ((10#$NFS_PORT >= 1024)) || die 'UNFS3 backend requires an unprivileged NFS port (1024 or higher)'
   [[ $NFS_EXPORT == "$BACKPLANE_ROOT" ]] || die 'UNFS3 export path must match VMAPI_BACKPLANE_ROOT'
   [[ $NFS_EXPORT_CLIENT == 127.0.0.1 ]] || die 'UNFS3 container backend only supports a loopback export client'
-  # GOST re-originates the loopback TCP connection from an ephemeral source port.
+  # The WebSocket bridge re-originates the loopback TCP connection from an ephemeral source port.
   # 'insecure' permits that source port; the export itself remains restricted to 127.0.0.1.
   printf '%s %s(rw,no_root_squash,insecure)\n' "$BACKPLANE_ROOT" "$NFS_EXPORT_CLIENT" > "$RUN_ROOT/unfs3.exports"
   chmod 0600 "$RUN_ROOT/unfs3.exports"
@@ -443,7 +430,7 @@ server_daemon(){
   fi
   ensure_dirs
   publish_shared_storage
-  need_cmd "$GOST"; need_cmd "$SS"
+  need_cmd "$WEBSOCAT"; need_cmd "$SS"
   valid_ipv4_bind "$NFS_BIND"; valid_port "$NFS_PORT"; valid_port "$WS_PORT"; validate_positive_int "$NFS_THREADS"
 
   case "$NFS_BACKEND" in
@@ -471,16 +458,10 @@ server_daemon(){
       ;;
   esac
 
-  cat > "$RUN_ROOT/gost-server.yaml" <<YAML
-services:
-- name: storage-server
-  addr: "$WS_BIND:$WS_PORT"
-  handler: {type: forward}
-  listener: {type: ws, metadata: {path: "/backplane/storage"}}
-  forwarder: {nodes: [{name: nfs, addr: "$NFS_BIND:$NFS_PORT"}]}
-YAML
-  chmod 0600 "$RUN_ROOT/gost-server.yaml"
-  setsid "$GOST" -C "$RUN_ROOT/gost-server.yaml" </dev/null >>"$RUN_ROOT/gost-server.log" 2>&1 & echo $! > "$RUN_ROOT/gost-server.pid"
+  # Lighttpd owns public HTTP(S), TLS and Basic authentication. This listener
+  # is deliberately plaintext WebSocket on loopback only.
+  : >"$RUN_ROOT/websocat-server.log"; chmod 0600 "$RUN_ROOT/websocat-server.log"
+  setsid "$WEBSOCAT" --binary --exit-on-eof --ping-interval 20 "ws-l:$WS_BIND:$WS_PORT" "tcp:$NFS_BIND:$NFS_PORT" </dev/null >>"$RUN_ROOT/websocat-server.log" 2>&1 & echo $! > "$RUN_ROOT/websocat-server.pid"
   trap 'server_cleanup; exit 0' TERM INT EXIT
   for _ in {1..100}; do server_verify >/dev/null 2>&1 && break; sleep .05; done
   if ! server_verify >/dev/null; then
@@ -493,7 +474,7 @@ YAML
     else
       pid_alive "$RUN_ROOT/exportd.pid" || die 'NFSv4 export daemon exited'
     fi
-    pid_alive "$RUN_ROOT/gost-server.pid" || die 'Backplane GOST WebSocket bridge exited'
+    pid_alive "$RUN_ROOT/websocat-server.pid" || die 'Backplane WebSocket bridge exited'
     sleep "$DAEMON_INTERVAL" & wait $!
   done
 }

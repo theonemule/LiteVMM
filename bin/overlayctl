@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GOST TAP -> Relay over WebSocket -> hub Lighttpd HTTP Basic authentication.
+# WSVPN TAP -> WebSocket -> hub Lighttpd HTTP Basic authentication.
 set -Eeuo pipefail
 umask 077
 ROOT=${VMAPI_OVERLAY_ROOT:-/etc/vmapi/overlays}
@@ -7,7 +7,7 @@ RUN=${VMAPI_OVERLAY_RUN:-/run/vmapi-overlay}
 PEERS=${VMAPI_PEER_ROOT:-/var/lib/vmapi/peers}
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
 NETCTL=${VMAPI_NETCTL:-/usr/local/bin/netctl}
-GOST=${VMAPI_GOST:-$(command -v gost 2>/dev/null || printf '%s' /usr/bin/gost)}
+WSVPN=${VMAPI_WSVPN:-$(command -v wsvpn 2>/dev/null || printf '%s' /usr/local/bin/wsvpn)}
 WEB_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
 PASSWD=${VMAPI_PEER_PASSWD_FILE:-/etc/vmapi-peer.htpasswd}
 SERVICE=${VMAPI_RC_SERVICE:-rc-service}
@@ -20,8 +20,8 @@ valid_id() { [[ ${1:-} =~ ^[a-f0-9]{32}$ ]] || die 'Invalid peer node id'; }
 conf() { printf '%s/%s.conf' "$ROOT" "$1"; }
 tap_name() { printf 'vmo-%s' "$1"; }
 checksum() { printf '%s' "$1" | cksum | awk '{print $1}'; }
-tap_port() { echo $((38000 + $(checksum "tap-$1") % 10000)); }
 relay_port() { echo $((18080 + $(checksum "relay-$1") % 10000)); }
+health_subnet() { local octet=$((20 + $(checksum "$NAME") % 200)); echo "10.77.$octet.0/24"; }
 health_cidr() { local octet=$((20 + $(checksum "$NAME") % 200)); [[ $ROLE == hub ]] && echo "10.77.$octet.1/24" || echo "10.77.$octet.2/24"; }
 health_peer() { local octet=$((20 + $(checksum "$NAME") % 200)); [[ $ROLE == hub ]] && echo "10.77.$octet.2" || echo "10.77.$octet.1"; }
 
@@ -45,17 +45,17 @@ load() {
   [[ $BRIDGE =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && $BRIDGE != "$(tap_name "$NAME")" ]] || die 'Invalid Linux bridge name'
   [[ $MTU =~ ^[0-9]{4}$ && $MTU -ge 1200 && $MTU -le 1500 ]] || die 'MTU must be 1200-1500'
   [[ $STAGED == true || $STAGED == false ]] || die 'Invalid staged flag'
-  [[ $TAP_BRIDGE_LEARNING == off ]] || die 'TAP bridge learning must remain disabled for GOST overlays'
+  [[ $TAP_BRIDGE_LEARNING == off ]] || die 'TAP bridge learning must remain disabled for WSVPN overlays'
   [[ $OWN_BRIDGE == true || $OWN_BRIDGE == false || $OWN_BRIDGE == legacy ]] || die 'Invalid bridge ownership flag'
   ((${#MEMBERS[@]} > 0 && ${#MEMBERS[@]} <= 16)) || die 'Select 1-16 paired peers'
   [[ $ROLE == hub || ${#MEMBERS[@]} == 1 ]] || die 'A spoke needs exactly one hub'
   [[ $STAGED == false || ${#MEMBERS[@]} == 1 ]] || die 'Staged address validation requires one peer'
   local id; for id in "${MEMBERS[@]}"; do valid_id "$id"; done
-  # Recompute ports so previous renderers cannot leave publicly bound listeners.
-  TAP_PORT=$(tap_port "$NAME"); RELAY_PORT=$(relay_port "$NAME")
+  # WSVPN listens only on the loopback relay port; Lighttpd owns the public endpoint.
+  RELAY_PORT=$(relay_port "$NAME")
 }
 peer() {
-  local id=${1:?peer node id required} NAME='' RELAY_USER='' RELAY_PASSWORD='' URL=''
+  local id=${1:?peer node id required} NAME='' RELAY_USER='' RELAY_PASSWORD='' URL='' TLS_CA_FILE=''
   valid_id "$id"; [[ -r $PEERS/$id.conf ]] || die "Peer $id is not paired"
   # shellcheck source=/dev/null
   source "$PEERS/$id.conf"
@@ -65,7 +65,7 @@ peer() {
   PEER_SCHEME=${BASH_REMATCH[1]}; PEER_HOST=${BASH_REMATCH[2]}; PEER_PORT=${BASH_REMATCH[4]}
   [[ -n $PEER_PORT ]] || { [[ $PEER_SCHEME == https ]] && PEER_PORT=443 || PEER_PORT=80; }
   ((10#$PEER_PORT > 0 && 10#$PEER_PORT <= 65535)) || die 'Invalid peer port'
-  PEER_USER=$RELAY_USER; PEER_PASSWORD=$RELAY_PASSWORD
+  PEER_USER=$RELAY_USER; PEER_PASSWORD=$RELAY_PASSWORD; PEER_CA_FILE=$TLS_CA_FILE
 }
 write_config() {
   local tmp; tmp=$(mktemp "$ROOT/.config.XXXXXX")
@@ -76,52 +76,80 @@ write_config() {
 
 render_config() (
   load "$1"
-  local tmp header scheme id
+  local tmp auth scheme id ca_line=''
   for id in "${MEMBERS[@]}"; do peer "$id"; done
-  tmp=$(mktemp "$RUN/.gost.XXXXXX"); trap 'rm -f -- "$tmp"' EXIT
+  tmp=$(mktemp "$RUN/.wsvpn.XXXXXX"); trap 'rm -f -- "$tmp"' EXIT
+  auth="$RUN/$NAME.auth"
   if [[ $ROLE == hub ]]; then
+    rm -f -- "$auth"
     cat > "$tmp" <<YAML
-services:
-- name: overlay-tap
-  addr: "127.0.0.1:$TAP_PORT"
-  handler: {type: tap}
-  listener:
-    type: tap
-    metadata: {name: "$(tap_name "$NAME")", net: "$(health_cidr)", mtu: $MTU}
-- name: overlay-relay
-  addr: "127.0.0.1:$RELAY_PORT"
-  handler: {type: relay, metadata: {bind: true}}
-  listener: {type: ws, metadata: {path: "/overlay/$NAME"}}
+tunnel:
+  mtu: $MTU
+  subnet: "$(health_subnet)"
+  mode: TAP
+  allow-client-to-client: true
+  allow-ip-spoofing: true
+  allow-mac-changing: true
+  allowed-macs-per-connection: 256
+  allow-unknown-ether-types: true
+  features:
+    fragmentation: true
+  ip-config:
+    local: false
+    remote: false
+  ping:
+    interval: 15s
+    timeout: 5s
+interface:
+  name: "$(tap_name "$NAME")"
+  persist: false
+  one-interface-per-connection: false
+server:
+  listen: "127.0.0.1:$RELAY_PORT"
+  enable-http3: false
+  website-directory: ""
+  tls:
+    client-ca: ""
+    certificate: ""
+    key: ""
+  authenticator:
+    type: allow-all
+    config: ""
+  api:
+    enabled: false
 YAML
   else
-    header=$(printf '%s:%s' "$PEER_USER" "$PEER_PASSWORD" | base64 | tr -d '\n')
+    printf '%s:%s\n' "$PEER_USER" "$PEER_PASSWORD" > "$auth"
+    chmod 0600 "$auth"
     [[ $PEER_SCHEME == https ]] && scheme=wss || scheme=ws
+    if [[ $scheme == wss && -n $PEER_CA_FILE ]]; then
+      [[ -r $PEER_CA_FILE ]] || die 'Peer TLS CA certificate is missing'
+      ca_line="    ca: \"$PEER_CA_FILE\""
+    else
+      ca_line='    ca: ""'
+    fi
     cat > "$tmp" <<YAML
-services:
-- name: overlay-tap
-  addr: "127.0.0.1:$TAP_PORT"
-  handler: {type: tap, chain: overlay-chain}
-  listener:
-    type: tap
-    metadata: {name: "$(tap_name "$NAME")", net: "$(health_cidr)", mtu: $MTU}
-  forwarder: {nodes: [{name: hub-tap, addr: "127.0.0.1:$TAP_PORT"}]}
-chains:
-- name: overlay-chain
-  hops:
-  - name: hub
-    nodes:
-    - name: hub
-      addr: "$PEER_HOST:$PEER_PORT"
-      connector: {type: relay}
-      dialer:
-        type: $scheme
-        tls: {secure: true, serverName: "$PEER_HOST"}
-        metadata:
-          path: "/overlay/$NAME"
-          keepalive: true
-          ttl: 15s
-          header:
-            Authorization: "Basic $header"
+tunnel:
+  set-default-gateway: false
+  ping:
+    interval: 15s
+    timeout: 5s
+  features:
+    fragmentation: true
+interface:
+  name: "$(tap_name "$NAME")"
+  persist: false
+client:
+  server: "$scheme://$PEER_HOST:$PEER_PORT/overlay/$NAME"
+  auth-file: "$auth"
+  auto-reconnect-delay: 2s
+  tls:
+$ca_line
+    server-name: "$PEER_HOST"
+    certificate: ""
+    key: ""
+    config:
+      insecure: false
 YAML
   fi
   chmod 0600 "$tmp"; mv -f -- "$tmp" "$RUN/$NAME.yaml"
@@ -153,7 +181,7 @@ render_web() (
   tmp=$(mktemp "$WEB_ROOT/conf.d/.overlay.XXXXXX"); backup=$(mktemp "$RUN/.web-backup.XXXXXX")
   trap 'rm -f -- "$tmp" "$backup"' EXIT
   [[ ! -f $out ]] || cp -p -- "$out" "$backup"
-  printf '# Generated by overlayctl. Authentication occurs before WebSocket upgrade.\n' > "$tmp"
+  printf '# Generated by overlayctl. Lighttpd terminates TLS and authenticates before proxying plaintext WebSocket to WSVPN.\n' > "$tmp"
   for file in "$ROOT"/*.conf; do
     [[ -f $file ]] || continue
     load "$(basename "$file" .conf)"; [[ $ROLE == hub ]] || continue
@@ -203,26 +231,33 @@ start_one() {
   load "$1"; render_config "$NAME"
   modprobe tun 2>/dev/null || true
   [[ -c /dev/net/tun ]] || die 'TUN/TAP is unavailable'
+  [[ -x $WSVPN ]] || die "WSVPN is not installed: $WSVPN"
   if ! ip link show "$BRIDGE" >/dev/null 2>&1; then "$NETCTL" bridge-create "$BRIDGE" --manual >&2; fi
   [[ -d /sys/class/net/$BRIDGE/bridge ]] || die "$BRIDGE is not a Linux bridge"
   ip link set "$BRIDGE" up
   stop_one "$NAME"
-  "$GOST" -C "$RUN/$NAME.yaml" </dev/null &
+  local mode=$ROLE
+  [[ $mode == hub ]] && mode=server || mode=client
+  "$WSVPN" --mode "$mode" --config "$RUN/$NAME.yaml" </dev/null &
   local pid=$!; CHILDREN+=("$pid"); STARTED+=("$NAME")
   printf '%s\n' "$pid" > "$RUN/$NAME.pid"
-  for _ in {1..50}; do tap_is_tap "$NAME" && break; kill -0 "$pid" 2>/dev/null || die "GOST exited for $NAME"; sleep .1; done
-  tap_is_tap "$NAME" || die "GOST did not create TAP for $NAME"
-  if [[ $STAGED == false ]]; then
+  for _ in {1..100}; do tap_is_tap "$NAME" && break; kill -0 "$pid" 2>/dev/null || die "WSVPN exited for $NAME"; sleep .1; done
+  tap_is_tap "$NAME" || die "WSVPN did not create TAP for $NAME"
+  if [[ $STAGED == true ]]; then
+    ip addr flush dev "$(tap_name "$NAME")"
+    ip addr add "$(health_cidr)" dev "$(tap_name "$NAME")"
+  else
     ip addr flush dev "$(tap_name "$NAME")"
     ip link set "$(tap_name "$NAME")" master "$BRIDGE"
-  # GOST tracks remote MAC addresses itself.  If the Linux bridge learns a
-  # locally attached guest MAC from a reflected overlay frame, unicast return
-  # traffic (including DHCP ACKs) is sent back into the tunnel.  Keep this
-  # aggregate TAP port flooding unknown remote destinations instead.
-  bridge link set dev "$(tap_name "$NAME")" learning "$TAP_BRIDGE_LEARNING" flood on hairpin off
+    # WSVPN learns remote source MACs internally. Keep the aggregate TAP port
+    # from learning reflected VM MACs in the Linux bridge, matching the prior
+    # overlay behavior and flooding unknown remote destinations into WSVPN.
+    bridge link set dev "$(tap_name "$NAME")" learning "$TAP_BRIDGE_LEARNING" flood on hairpin off
   fi
+  ip link set "$(tap_name "$NAME")" mtu "$MTU"
   ip link set "$(tap_name "$NAME")" up
 }
+
 run() {
   access
   local file pid; CHILDREN=(); STARTED=()
@@ -239,7 +274,7 @@ run() {
   for file in "$ROOT"/*.conf; do [[ -f $file ]] && start_one "$(basename "$file" .conf)"; done
   if ((${#CHILDREN[@]})); then
     wait -n "${CHILDREN[@]}" || true
-    die 'A GOST child exited; restarting the overlay service'
+    die 'A WSVPN child exited; restarting the overlay service'
   else
     while :; do sleep 60 & wait $!; done
   fi
@@ -310,8 +345,8 @@ validate() {
 }
 create() {
   NAME=${1:?overlay name required}; shift; valid_name "$NAME"
-  # 1500 by default: GOST carries each Ethernet frame as bytes in a TCP/WebSocket
-  # stream, so there is no encapsulation overhead to reserve. A smaller overlay
+  # 1500 by default: WSVPN carries complete Ethernet frames over WebSocket and supports
+  # fragmentation when the transport requires it. A smaller overlay
   # MTU silently dropped full-size packets from guests whose NICs default to
   # 1500, e.g. TCP forwarded by a router VM such as pfSense.
   BRIDGE='' ROLE='' MTU=1500 STAGED=false TAP_BRIDGE_LEARNING=off; MEMBERS=()
@@ -330,16 +365,16 @@ create() {
   # Reserve each local bridge and computed port for exactly one overlay.
   for file in "$ROOT"/*.conf; do
     [[ -f $file ]] || continue; other=$(basename "$file" .conf)
-    [[ $(tap_port "$other") != "$(tap_port "$name")" && $(relay_port "$other") != "$(relay_port "$name")" ]] || die "Port collision with $other; choose another overlay name"
+    [[ $(relay_port "$other") != "$(relay_port "$name")" ]] || die "Port collision with $other; choose another overlay name"
     (load "$other"; [[ $BRIDGE != "$new_bridge" ]]) || die "Bridge is already used by $other"
   done
   write_config
   # Validation failure must not leave a half-created definition behind.
   if ! (load "$name"; render_config "$name"; render_web); then
-    rm -f -- "$(conf "$name")" "$RUN/$name.yaml"; die 'Overlay configuration failed'
+    rm -f -- "$(conf "$name")" "$RUN/$name.yaml" "$RUN/$name.auth"; die 'Overlay configuration failed'
   fi
   if ! restart_service || ! wait_ready "$name"; then
-    rm -f -- "$(conf "$name")" "$RUN/$name.yaml"
+    rm -f -- "$(conf "$name")" "$RUN/$name.yaml" "$RUN/$name.auth"
     render_web; restart_service || true; die 'Overlay startup failed'
   fi
   show "$name"
@@ -368,7 +403,7 @@ delete() {
     owned=$OWN_BRIDGE
   fi
   stop_one "$name" || true
-  rm -f -- "$(conf "$name")" "$RUN/$name.yaml" "$RUN/$name.pid"
+  rm -f -- "$(conf "$name")" "$RUN/$name.yaml" "$RUN/$name.auth" "$RUN/$name.pid"
   render_web || true
   restart_service || true
   cleanup_bridge "$bridge" "$owned"
@@ -379,7 +414,7 @@ reset() {
   local file name
   for file in "$ROOT"/*.conf; do
     [[ -f $file ]] || continue; name=$(basename "$file" .conf); valid_name "$name"
-    stop_one "$name"; rm -f -- "$file" "$RUN/$name.yaml"
+    stop_one "$name"; rm -f -- "$file" "$RUN/$name.yaml" "$RUN/$name.auth"
   done
   render_web
 }
@@ -392,7 +427,7 @@ revoke_peer() {
     ((${#remaining[@]} != ${#MEMBERS[@]})) || continue
     changed=true; stop_one "$name"
     if ((${#remaining[@]})); then MEMBERS=("${remaining[@]}"); write_config
-    else rm -f -- "$file" "$RUN/$name.yaml"; fi
+    else rm -f -- "$file" "$RUN/$name.yaml" "$RUN/$name.auth"; fi
   done
   if $changed; then render_web; restart_service; fi
 }

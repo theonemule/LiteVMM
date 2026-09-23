@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Real GOST + Lighttpd test in two disposable Linux network namespaces.
-# Run as root with VMAPI_TEST_GOST=/path/to/gost (v3), lighttpd and iproute2.
+# Real WSVPN + Lighttpd test in two disposable Linux network namespaces.
+# Run as root with VMAPI_TEST_WSVPN=/path/to/wsvpn, lighttpd and iproute2.
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-GOST=${VMAPI_TEST_GOST:?Set VMAPI_TEST_GOST to a GOST v3 binary}
+WSVPN=${VMAPI_TEST_WSVPN:?Set VMAPI_TEST_WSVPN to a WSVPN binary}
 [[ $EUID == 0 ]] || { echo 'Network namespace test requires root'; exit 2; }
 T=$(mktemp -d); H="vmoh-$$"; S="vmos-$$"
 cleanup() {
@@ -37,7 +37,23 @@ ip -n "$H" link set lo up; ip -n "$S" link set lo up
 for node in hub spoke; do mkdir -p "$T/$node/overlays" "$T/$node/run" "$T/$node/peers"; done
 chmod 755 "$T" "$T/hub"
 
-# Stand in for OpenRC only; use the actual foreground GOST/controller/Lighttpd.
+# Real local-CA certificate for the hub. Lighttpd terminates TLS; WSVPN never
+# receives the private key or certificate and sees only plaintext WebSocket on
+# its loopback listener.
+mkdir -p "$T/hub/tls"
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2   -subj '/CN=LiteVMM Overlay Test Root/O=LiteVMM'   -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign'   -keyout "$T/hub/tls/root.key" -out "$T/hub/tls/root.crt" >/dev/null 2>&1
+openssl req -new -newkey rsa:2048 -nodes -sha256 -subj '/CN=192.0.2.1/O=LiteVMM'   -keyout "$T/hub/tls/server.key" -out "$T/hub/tls/server.csr" >/dev/null 2>&1
+cat >"$T/hub/tls/server.ext" <<'TLS_EXT'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=IP:192.0.2.1
+TLS_EXT
+openssl x509 -req -in "$T/hub/tls/server.csr" -CA "$T/hub/tls/root.crt" -CAkey "$T/hub/tls/root.key"   -CAcreateserial -days 2 -sha256 -extfile "$T/hub/tls/server.ext" -out "$T/hub/tls/server.crt" >/dev/null 2>&1
+cat "$T/hub/tls/server.key" "$T/hub/tls/server.crt" > "$T/hub/tls/server.pem"
+chmod 0600 "$T/hub/tls/root.key" "$T/hub/tls/server.key" "$T/hub/tls/server.pem"
+
+# Stand in for OpenRC only; use the actual foreground WSVPN/controller/Lighttpd.
 cat > "$T/service" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -58,17 +74,22 @@ echo $! > "$NODE/$name.pid"
 SH
 chmod +x "$T/service"
 node() {
-  local which=$1; shift; local ns=$H; [[ $which == hub ]] || ns=$S
-  ip netns exec "$ns" env NODE="$T/$which" VMAPI_CTL="$ROOT/bin/overlayctl" \
+  local which=$1; shift; local ns=$H tls_enabled=false tls_mode=none tls_ca=/nonexistent
+  if [[ $which == hub ]]; then
+    tls_enabled=true; tls_mode=local-ca; tls_ca="$T/hub/tls/root.crt"
+  else
+    ns=$S
+  fi
+  ip netns exec "$ns" env NODE="$T/$which" VMAPI_CTL="$ROOT/bin/overlayctl"     VMAPI_TLS_ENABLED="$tls_enabled" VMAPI_TLS_MODE="$tls_mode" VMAPI_TLS_CA_CERT_FILE="$tls_ca" \
     VMAPI_CONFIG=/nonexistent VMAPI_LIB="$ROOT/lib/common.sh" VMAPI_NETCTL="$ROOT/bin/netctl" \
     VMAPI_PEERCTL="$ROOT/bin/peerctl" VMAPI_OVERLAYCTL="$ROOT/bin/overlayctl" \
     VMAPI_PEER_ROOT="$T/$which/peers" VMAPI_IDENTITY_ROOT="$T/$which/identity" VMAPI_NODE_ID_FILE="$T/$which/node-id" \
     VMAPI_PEER_PASSWD_FILE="$T/$which/passwd" VMAPI_PEER_AUTH_GROUP=root \
     VMAPI_OVERLAY_ROOT="$T/$which/overlays" VMAPI_OVERLAY_RUN="$T/$which/run" \
-    VMAPI_GOST="$GOST" VMAPI_LIGHTTPD_ROOT="$T/$which/lighttpd" VMAPI_RC_SERVICE="$T/service" "$@"
+    VMAPI_QEMU_BRIDGE_CONF="$T/$which/qemu/bridge.conf" VMAPI_WSVPN="$WSVPN" VMAPI_LIGHTTPD_ROOT="$T/$which/lighttpd" VMAPI_RC_SERVICE="$T/service" "$@"
 }
 request=$(node spoke "$ROOT/bin/peerctl" request spoke http://192.0.2.2:8080)
-response=$(node hub "$ROOT/bin/peerctl" accept "$request" hub http://192.0.2.1:8080)
+response=$(node hub "$ROOT/bin/peerctl" accept "$request" hub https://192.0.2.1:8443)
 node spoke "$ROOT/bin/peerctl" complete "$response" >/dev/null
 hid=$(cat "$T/hub/node-id"); sid=$(cat "$T/spoke/node-id")
 mkdir -p "$T/hub/lighttpd/conf.d" "$T/hub/www"
@@ -76,7 +97,10 @@ sed -e "s|@NOVNC_ROOT@|$T/hub/www|g" -e "s|/etc/vmapi-peer.htpasswd|$T/hub/passw
 cat > "$T/hub/lighttpd/lighttpd.conf" <<CONF
 server.document-root = "$T/hub/www"
 server.bind = "192.0.2.1"
-server.port = 8080
+server.port = 8443
+server.modules += ( "mod_openssl" )
+ssl.engine = "enable"
+ssl.pemfile = "$T/hub/tls/server.pem"
 include "$T/hub/lighttpd/conf.d/*.conf"
 CONF
 node hub "$ROOT/bin/overlayctl" create demo --bridge br-demo --role hub --peer "$sid" --staged > "$T/hub-created.json"
@@ -84,30 +108,41 @@ node spoke "$ROOT/bin/overlayctl" create demo --bridge br-demo --role spoke --pe
 [[ ! -e $T/spoke/lighttpd ]]
 ! grep -q lighttpd "$T/spoke/service.log"
 python3 - "$T" <<'PY'
-import json,sys,yaml,base64
+import json,sys,yaml
 from pathlib import Path
-t=Path(sys.argv[1]); c=yaml.safe_load((t/'spoke/run/demo.yaml').read_text())
-d=c['chains'][0]['hops'][0]['nodes'][0]
-assert d['addr']=='192.0.2.1:8080'
-assert d['dialer']['metadata']['path']=='/overlay/demo'
-assert 'auth' not in d['connector']
+t=Path(sys.argv[1])
+h=yaml.safe_load((t/'hub/run/demo.yaml').read_text())
+s=yaml.safe_load((t/'spoke/run/demo.yaml').read_text())
+assert h['tunnel']['mode']=='TAP'
+assert h['tunnel']['allow-client-to-client'] is True
+assert h['tunnel']['allow-ip-spoofing'] is True
+assert h['tunnel']['allow-unknown-ether-types'] is True
+assert h['server']['listen'].startswith('127.0.0.1:')
+assert h['server']['tls']['certificate']=='' and h['server']['tls']['key']==''
+assert s['client']['server']=='wss://192.0.2.1:8443/overlay/demo'
+assert s['client']['auth-file']==str(t/'spoke/run/demo.auth')
+assert s['client']['tls']['config']['insecure'] is False
+assert s['client']['tls']['ca']==str(t/'spoke/peers/ca'/((t/'hub/node-id').read_text().strip()+'.crt'))
 for n in ('hub','spoke'):
     assert json.loads((t/f'{n}-created.json').read_text())['running']
 PY
 source "$T/spoke/peers/$hid.conf"
-curl_spoke() { ip netns exec "$S" curl -sS --noproxy '*' "$@"; }
-[[ $(curl_spoke -o /dev/null -w '%{http_code}' http://192.0.2.1:8080/overlay/demo) == 401 ]]
-[[ $(curl_spoke --user "$RELAY_USER:wrong" -o /dev/null -w '%{http_code}' http://192.0.2.1:8080/overlay/demo) == 401 ]]
+[[ -s $TLS_CA_FILE ]]
+openssl verify -CAfile "$TLS_CA_FILE" "$T/hub/tls/server.crt" >/dev/null
+curl_spoke() { ip netns exec "$S" curl -sS --noproxy '*' --cacert "$TLS_CA_FILE" "$@"; }
+[[ $(curl_spoke -o /dev/null -w '%{http_code}' https://192.0.2.1:8443/overlay/demo) == 401 ]]
+[[ $(curl_spoke --user "$RELAY_USER:wrong" -o /dev/null -w '%{http_code}' https://192.0.2.1:8443/overlay/demo) == 401 ]]
 for path in /peer-api /peer-api.cgi /peer-api/cluster/identity; do
-  [[ $(curl_spoke -o /dev/null -w '%{http_code}' "http://192.0.2.1:8080$path") == 401 ]]
-  code=$(curl_spoke --user "$RELAY_USER:$RELAY_PASSWORD" -o /dev/null -w '%{http_code}' "http://192.0.2.1:8080$path")
+  [[ $(curl_spoke -o /dev/null -w '%{http_code}' "https://192.0.2.1:8443$path") == 401 ]]
+  code=$(curl_spoke --user "$RELAY_USER:$RELAY_PASSWORD" -o /dev/null -w '%{http_code}' "https://192.0.2.1:8443$path")
   [[ $code != 401 ]]
 done
 sleep 2
 node spoke "$ROOT/bin/overlayctl" validate demo
-# The hub UDP TAP endpoint and relay must be unreachable from the underlay.
+# WSVPN must expose only its loopback listener; Lighttpd is the only underlay-facing endpoint.
 ip netns exec "$H" ss -lntu > "$T/listeners"
 ! grep -E '0.0.0.0:(18[0-9]{3}|[23][0-9]{4}|[34][0-9]{4})' "$T/listeners"
+grep -Eq '127.0.0.1:(18[0-9]{3}|2[0-9]{4})' "$T/listeners"
 node hub "$ROOT/bin/overlayctl" activate demo >/dev/null
 node spoke "$ROOT/bin/overlayctl" activate demo >/dev/null
 # Workload-like addresses on opposite bridges prove the active Ethernet path.
@@ -128,9 +163,34 @@ ip netns exec "$S" ping -c 2 -s 1372 -M do -W 3 198.18.0.1
 node hub "$ROOT/bin/overlayctl" set-mtu demo 1500 >/dev/null; node spoke "$ROOT/bin/overlayctl" set-mtu demo 1500 >/dev/null
 for _ in {1..30}; do ip netns exec "$S" ping -c 1 -W 1 198.18.0.1 >/dev/null 2>&1 && break; sleep .5; done
 ip netns exec "$S" ping -c 2 -s 1472 -M do -W 3 198.18.0.1
+# Verify a non-IP Ethernet frame survives the overlay. EtherType 0x8137 is
+# historically used by IPX; WSVPN must not filter it.
+ip -n "$H" link add hguest type veth peer name hport
+ip -n "$S" link add sguest type veth peer name sport
+ip -n "$H" link set hport master br-demo; ip -n "$H" link set hport up; ip -n "$H" link set hguest up
+ip -n "$S" link set sport master br-demo; ip -n "$S" link set sport up; ip -n "$S" link set sguest up
+ip netns exec "$S" python3 - <<'PYRX' >"$T/raw-frame.out" &
+import socket,sys
+s=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x8137)); s.bind(('sguest',0)); s.settimeout(5)
+while True:
+    frame=s.recv(2048)
+    if frame[12:14] == b'\x81\x37' and b'LITEVMM-IPX-PROBE' in frame:
+        print('raw-ethertype-8137=ok'); break
+PYRX
+raw_pid=$!
+sleep .3
+ip netns exec "$H" python3 - <<'PYTX'
+import socket
+s=socket.socket(socket.AF_PACKET,socket.SOCK_RAW); s.bind(('hguest',0))
+src=s.getsockname()[4]
+frame=b'\xff'*6+src+b'\x81\x37'+b'LITEVMM-IPX-PROBE'
+s.send(frame)
+PYTX
+wait "$raw_pid"
+grep -Fxq 'raw-ethertype-8137=ok' "$T/raw-frame.out"
 node hub "$ROOT/bin/overlayctl" list | python3 -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==1 and x[0]["tap_bridged"]'
-# Killing GOST must take down the supervisor, allowing OpenRC to respawn it.
-gpid=$(cat "$T/spoke/run/demo.pid"); kill "$gpid"; sleep 1
+# Killing WSVPN must take down the supervisor, allowing OpenRC to respawn it.
+wpid=$(cat "$T/spoke/run/demo.pid"); kill "$wpid"; sleep 1
 [[ ! -e $T/spoke/run/demo.pid ]]
 node spoke "$ROOT/bin/overlayctl" restart-service
 sleep 2
@@ -140,7 +200,7 @@ node hub "$ROOT/bin/peerctl" revoke "$sid"
 [[ ! -s $T/hub/passwd && ! -f $T/hub/overlays/demo.conf && ! -f $T/hub/run/demo.pid ]]
 # The fake service manager starts Lighttpd in the background without waiting
 # for it to bind, so give the restart triggered by revocation a moment.
-code=000; for _ in {1..50}; do code=$(curl_spoke --user "$RELAY_USER:$RELAY_PASSWORD" -o /dev/null -w '%{http_code}' http://192.0.2.1:8080/peer-api 2>/dev/null || true); [[ $code == 000 ]] || break; sleep .1; done
+code=000; for _ in {1..50}; do code=$(curl_spoke --user "$RELAY_USER:$RELAY_PASSWORD" -o /dev/null -w '%{http_code}' https://192.0.2.1:8443/peer-api 2>/dev/null || true); [[ $code == 000 ]] || break; sleep .1; done
 [[ $code == 401 ]]
 ! ip -n "$H" link show vmo-demo >/dev/null 2>&1
-echo 'overlay netns: PASS (Basic auth, TAP ARP/ICMP, 1500-byte frames, set-mtu, activation, child cleanup, revocation, no spoke Lighttpd)'
+echo 'overlay netns: PASS (Lighttpd HTTPS/WSS TLS-offload/auth boundary, WSVPN TAP ARP/ICMP/raw EtherType 0x8137, 1500-byte frames, set-mtu, activation, child cleanup, revocation, no spoke Lighttpd)'

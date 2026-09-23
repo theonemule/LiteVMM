@@ -4,6 +4,7 @@
 # Validate externally supplied values before passing them to host virtualization or container tools.
 set -Eeuo pipefail
 BRIDGE_CONFIG_ROOT=${VMAPI_BRIDGE_CONFIG_ROOT:-/etc/vmapi/bridges}
+QEMU_BRIDGE_CONF=${VMAPI_QEMU_BRIDGE_CONF:-/etc/qemu/bridge.conf}
 valid_bridge() { [[ ${1:-} =~ ^[A-Za-z0-9_.:-]{1,31}$ ]] || { echo "Invalid bridge name: ${1:-}" >&2; exit 2; }; }
 valid_iface() { [[ ${1:-} =~ ^[A-Za-z0-9_.:-]{1,31}$ ]] || { echo "Invalid interface name: ${1:-}" >&2; exit 2; }; }
 valid_vm_tap() { [[ ${1:-} =~ ^tap[0-9]{1,10}$ ]] || { echo "Invalid VM TAP name: ${1:-}" >&2; exit 2; }; }
@@ -116,6 +117,20 @@ ensure_bridge_route() {
     [[ -n $subnet ]] && ip route replace "$subnet" dev "$name" 2>/dev/null || true
     ip route replace default via "$gateway" dev "$name" 2>/dev/null || true
   }
+}
+ensure_qemu_bridge_allowed() {
+  local name=$1 dir tmp
+  valid_bridge "$name"
+  dir=$(dirname "$QEMU_BRIDGE_CONF")
+  install -d -m 0755 "$dir"
+  [[ -f $QEMU_BRIDGE_CONF ]] || : > "$QEMU_BRIDGE_CONF"
+  grep -Fxq "allow $name" "$QEMU_BRIDGE_CONF" 2>/dev/null && return 0
+  tmp=$(mktemp "$dir/.bridge.conf.XXXXXX")
+  cat "$QEMU_BRIDGE_CONF" > "$tmp" 2>/dev/null || true
+  printf 'allow %s
+' "$name" >> "$tmp"
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$QEMU_BRIDGE_CONF"
 }
 case ${1:-} in
   bridges)

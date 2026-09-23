@@ -1,6 +1,6 @@
-# Long-running named GOST TAP overlay manager. Networking must be online before it reconciles overlay state.
+# Long-running named WSVPN TAP overlay manager. Networking must be online before it reconciles overlay state.
 [Unit]
-Description=VMAPI named GOST TAP overlays
+Description=VMAPI named WSVPN TAP overlays
 After=network-online.target
 Wants=network-online.target
 
