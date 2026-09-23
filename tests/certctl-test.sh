@@ -164,8 +164,10 @@ grep -Fq 'listen 127.0.0.1:5186 ssl;' "$T/nginx/vmapi"
 ! grep -Fq 'listen 127.0.0.1:5444 ssl;' "$T/nginx/vmapi-tls.conf"
 
 out=$(run_certctl disable)
-[[ $out == *'"tls_enabled":false'* ]]
+[[ $out == *'"tls_enabled":false'* && $out == *'"tls_disabled_explicitly":true'* ]]
 ! grep -Fq 'listen 127.0.0.1:5186 ssl;' "$T/nginx/vmapi"
+grep -Fqx 'VMAPI_TLS_DISABLED_EXPLICITLY=true' "$T/vmapi.conf"
+[[ -s "$T/certbot/live/le.example.com/fullchain.pem" ]]
 
 mkdir -p "$T/lightbin" "$T/light"
 cat > "$T/lightbin/lighttpd" <<'MOCK'
@@ -187,8 +189,22 @@ run_light_certctl reload | grep -Fq '"reload_required":false'
 grep -Fq 'ssl.engine = "enable"' "$T/light/10-tls.conf"
 sudo -n grep -Fq 'BEGIN PRIVATE KEY' "$T/light/server.pem"
 sudo -n grep -Fq 'BEGIN CERTIFICATE' "$T/light/server.pem"
-run_light_certctl disable >/dev/null
+out=$(run_light_certctl disable)
+[[ $out == *'"tls_enabled":false'* && $out == *'"tls_disabled_explicitly":true'* ]]
 [[ ! -e "$T/light/10-tls.conf" && ! -e "$T/light/server.pem" ]]
+grep -Fqx 'VMAPI_TLS_MODE=imported' "$T/vmapi.conf"
+grep -Fqx 'VMAPI_TLS_DISABLED_EXPLICITLY=true' "$T/vmapi.conf"
+sudo -n test -s "$T/tls/imported.crt"
+sudo -n test -s "$T/tls/imported.key"
+
+out=$(run_light_certctl remove)
+[[ $out == *'"tls_enabled":false'* && $out == *'"tls_disabled_explicitly":true'* && $out == *'"mode":"none"'* ]]
+grep -Fqx 'VMAPI_TLS_MODE=none' "$T/vmapi.conf"
+grep -Fqx 'VMAPI_TLS_CERT_FILE=' "$T/vmapi.conf"
+grep -Fqx 'VMAPI_TLS_KEY_FILE=' "$T/vmapi.conf"
+[[ ! -e "$T/tls/imported.crt" && ! -e "$T/tls/imported.key" ]]
+sudo -n test -s "$T/tls/litevmm-root-ca.crt"
+sudo -n test -s "$T/tls/litevmm-root-ca.key"
 
 # Container config is a symlink into persistent storage. Certificate updates
 # must write through it without replacing the link.

@@ -16,26 +16,60 @@ defaults=/usr/share/vmapi/vmapi-container-defaults.conf
 persistent_config=/var/lib/vmapi/config/vmapi.conf
 if [[ ! -s $persistent_config ]]; then
   install -m 0644 "$defaults" "$persistent_config"
+fi
 
-  # Migration from storage images that persisted certificate files but kept the
-  # active TLS flags in ephemeral /etc. Recover the common existing certificate
-  # layouts so an image upgrade does not silently fall back to HTTP.
+# Backfill the explicit-disable marker for persistent configs created by older
+# images. An old config can exist and still be stale because earlier images
+# accidentally replaced /etc/vmapi/vmapi.conf's persistence symlink.
+grep -q '^VMAPI_TLS_DISABLED_EXPLICITLY=' "$persistent_config" ||
+  printf '%s\n' 'VMAPI_TLS_DISABLED_EXPLICITLY=false' >> "$persistent_config"
+
+cfg_value(){ awk -F= -v k="$1" '$1==k{v=substr($0,index($0,"=")+1)} END{print v}' "$persistent_config"; }
+tls_enabled=$(cfg_value VMAPI_TLS_ENABLED)
+tls_explicit=$(cfg_value VMAPI_TLS_DISABLED_EXPLICITLY)
+tls_mode=$(cfg_value VMAPI_TLS_MODE)
+tls_cert_cfg=$(cfg_value VMAPI_TLS_CERT_FILE)
+tls_key_cfg=$(cfg_value VMAPI_TLS_KEY_FILE)
+
+# Recover only the signature of the old persistence bug: TLS says disabled,
+# there is no remembered active mode/path, but a complete managed certificate
+# pair exists on persistent storage. A deliberate disable retains mode/path and
+# now also sets VMAPI_TLS_DISABLED_EXPLICITLY=true, so it is never re-enabled.
+if [[ $tls_enabled != true && $tls_explicit != true && ${tls_mode:-none} == none && -z $tls_cert_cfg && -z $tls_key_cfg ]]; then
   tls_root=/var/lib/vmapi/tls
   recover_cert=''; recover_key=''; recover_mode=''; recover_domain=''
   if [[ -s $tls_root/local-endpoint.crt && -s $tls_root/local-endpoint.key ]]; then
     recover_cert=$tls_root/local-endpoint.crt; recover_key=$tls_root/local-endpoint.key; recover_mode=local-ca
   elif [[ -s $tls_root/imported.crt && -s $tls_root/imported.key ]]; then
     recover_cert=$tls_root/imported.crt; recover_key=$tls_root/imported.key; recover_mode=imported
+  else
+    certbot_live=/var/lib/vmapi/certbot/live
+    if [[ -d $certbot_live ]]; then
+      recover_dir=$(find "$certbot_live" -mindepth 1 -maxdepth 1 -type d ! -name README -print -quit 2>/dev/null || true)
+      if [[ -n $recover_dir && -s $recover_dir/fullchain.pem && -s $recover_dir/privkey.pem ]]; then
+        recover_cert=$recover_dir/fullchain.pem; recover_key=$recover_dir/privkey.pem; recover_mode=certbot; recover_domain=${recover_dir##*/}
+      fi
+    fi
   fi
   if [[ -n $recover_cert ]] && openssl x509 -in "$recover_cert" -noout >/dev/null 2>&1 && openssl pkey -in "$recover_key" -noout >/dev/null 2>&1; then
     cert_pub=$(openssl x509 -in "$recover_cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
     key_pub=$(openssl pkey -in "$recover_key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
     if [[ -n $cert_pub && $cert_pub == "$key_pub" ]]; then
-      recover_domain=$(openssl x509 -in "$recover_cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -n1)
-      sed -i -E         -e 's#^VMAPI_TLS_ENABLED=.*#VMAPI_TLS_ENABLED=true#'         -e "s#^VMAPI_TLS_MODE=.*#VMAPI_TLS_MODE=$recover_mode#"         -e "s#^VMAPI_TLS_DOMAIN=.*#VMAPI_TLS_DOMAIN=$recover_domain#"         -e "s#^VMAPI_TLS_CERT_FILE=.*#VMAPI_TLS_CERT_FILE=$recover_cert#"         -e "s#^VMAPI_TLS_KEY_FILE=.*#VMAPI_TLS_KEY_FILE=$recover_key#"         "$persistent_config"
+      [[ -n $recover_domain ]] || recover_domain=$(openssl x509 -in "$recover_cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -n1)
+      sed -i -E \
+        -e 's#^VMAPI_TLS_ENABLED=.*#VMAPI_TLS_ENABLED=true#' \
+        -e 's#^VMAPI_TLS_DISABLED_EXPLICITLY=.*#VMAPI_TLS_DISABLED_EXPLICITLY=false#' \
+        -e 's#^VMAPI_TLS_RELOAD_REQUIRED=.*#VMAPI_TLS_RELOAD_REQUIRED=false#' \
+        -e "s#^VMAPI_TLS_MODE=.*#VMAPI_TLS_MODE=$recover_mode#" \
+        -e "s#^VMAPI_TLS_DOMAIN=.*#VMAPI_TLS_DOMAIN=$recover_domain#" \
+        -e "s#^VMAPI_TLS_CERT_FILE=.*#VMAPI_TLS_CERT_FILE=$recover_cert#" \
+        -e "s#^VMAPI_TLS_KEY_FILE=.*#VMAPI_TLS_KEY_FILE=$recover_key#" \
+        "$persistent_config"
+      echo "Recovered persisted TLS certificate state ($recover_mode) from $recover_cert"
     fi
   fi
 fi
+
 rm -f /etc/vmapi/vmapi.conf
 ln -s "$persistent_config" /etc/vmapi/vmapi.conf
 
@@ -67,7 +101,7 @@ vmapi ALL=(root) NOPASSWD: /usr/local/bin/backplanectl server-status
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/logctl *
-vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl reload *, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl self-sign *, /usr/local/bin/certctl ca-show, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl reload *, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl self-sign *, /usr/local/bin/certctl ca-show, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable, /usr/local/bin/certctl remove
 SUDOERS
 chmod 0440 /etc/sudoers.d/vmapi
 

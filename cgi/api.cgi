@@ -596,6 +596,9 @@ case "${P[0]-}" in
             [[ -n $certificate && -n $private_key ]] || error_reply '400 Bad Request' 'certificate and private_key are required'
             out=$(cert_import_pair_cmd "$certificate" "$private_key" "$(param domain)" 2>&1) || error_reply '400 Bad Request' "$out"
             reply '200 OK' "$out";;
+          remove)
+            [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
+            raw_json_reply '200 OK' cert_cmd remove;;
           *) error_reply '404 Not Found' 'Unknown certificate endpoint';;
         esac;;
       *) error_reply '404 Not Found' 'Unknown admin endpoint';;

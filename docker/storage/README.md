@@ -56,6 +56,8 @@ Issuing or importing a certificate does not immediately change the listener. The
 
 For TrueNAS, publish container port `5187` when using `dual` or `redirect`. Keep the host and container port the same unless you intentionally account for the external port in the URL presented to users.
 
+Certificate files, the local CA, and TLS activation state are persisted below `/var/lib/vmapi`. On upgrade, the container recognizes the legacy state where certificate files survived but the old config incorrectly reported TLS as disabled. A user-initiated disable is recorded explicitly and will remain disabled across container recreation. The UI can either disable HTTPS while retaining the certificate or remove the managed endpoint certificate and return to HTTP; removing an endpoint certificate retains the LiteVMM root CA.
+
 ## Persistent data
 
 Mount `/var/lib/vmapi` as a named volume or bind mount. This contains the node identity, peer configuration, TLS material, backup metadata, and the peer storage tree.

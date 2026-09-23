@@ -85,4 +85,19 @@ out=$(printf '%s' "$body" | \
 grep -Fq 'Status: 200 OK' <<< "$out"
 cmp -s <(printf '%s\n' "$cert") "$T/seen/signed.pem"
 
+
+out=$(printf '' | \
+  PATH="$T/bin:/usr/local/bin:/usr/bin:/bin" \
+  FAKE_CERT_DIR="$T/seen" \
+  REQUEST_METHOD=POST \
+  PATH_INFO=/api/admin/certificates/remove \
+  CONTENT_TYPE='application/x-www-form-urlencoded;charset=UTF-8' \
+  CONTENT_LENGTH=0 \
+  VMAPI_CONFIG="$T/vmapi.conf" \
+  VMAPI_LIB="$ROOT/lib/common.sh" \
+  CERTCTL="$T/bin/certctl" \
+  bash "$ROOT/cgi/api.cgi")
+grep -Fq 'Status: 200 OK' <<< "$out"
+grep -Fq '"ok":true' <<< "$out"
+
 echo 'certificate API PEM transport: PASS'

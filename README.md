@@ -305,6 +305,10 @@ Managed key material is stored under `/etc/vmapi/tls` on normal host installatio
 
 The administration UI shows the active certificate subject, issuer, SANs, validity dates, SHA-256 fingerprint, management mode, pending CSR state, HTTPS policy, and HTTPS port. When a certificate is staged, the UI does not reload the web server automatically. It asks which transport policy to apply, then waits for the HTTPS endpoint before redirecting the browser.
 
+`Disable HTTPS, keep certificate` returns the management listener to HTTP and retains the certificate/key for later reuse. `Remove certificate + use HTTP` returns to HTTP, clears the active certificate state, and removes LiteVMM-managed endpoint certificate/key files. The LiteVMM local root CA is deliberately retained so removing one endpoint certificate does not destroy peer trust. Removing a Let's Encrypt certificate deletes its local Certbot material but does not request CA revocation.
+
+Storage-container upgrades also reconcile the legacy persistence bug where the certificate files survived under `/var/lib/vmapi/tls` but the old persistent configuration still said `VMAPI_TLS_ENABLED=false`, `VMAPI_TLS_MODE=none`, and had blank certificate paths. Explicitly disabled TLS is marked separately and is never auto-enabled during recovery.
+
 Certificate API routes:
 
 ```text
@@ -317,7 +321,8 @@ POST    /api/admin/certificates/csr           form: domain=...&sans=...&organiza
 GET     /api/admin/certificates/csr
 POST    /api/admin/certificates/signed        form: certificate=<PEM>
 POST    /api/admin/certificates/import        form: certificate=<PEM>&private_key=<PEM>&domain=...
-DELETE  /api/admin/certificates
+DELETE  /api/admin/certificates              disable HTTPS, retain active certificate material
+POST    /api/admin/certificates/remove       remove active certificate material and use HTTP
 ```
 
 ### Install on a remote host over SSH
