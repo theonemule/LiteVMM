@@ -352,6 +352,59 @@ show_ca(){
   cat "$VMAPI_TLS_CA_CERT_FILE"
 }
 
+cert_fingerprint(){ openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^sha256 Fingerprint=//' | tr -d ':' | tr '[:lower:]' '[:upper:]'; }
+
+runtime_tls_certificate(){
+  local out=${1:?output certificate required} port probe host=${VMAPI_TLS_DOMAIN:-localhost}
+  local -a ports=()
+  [[ $VMAPI_TLS_TRANSPORT == replace ]] && ports+=("$VMAPI_HTTP_PORT")
+  ports+=("$VMAPI_HTTPS_PORT" "$VMAPI_HTTP_PORT")
+  : > "$out"
+  for port in "${ports[@]}"; do
+    valid_port "$port" || continue
+    probe=$(mktemp)
+    if timeout 2 openssl s_client -connect "127.0.0.1:$port" -servername "$host" -showcerts </dev/null > "$probe" 2>/dev/null; then
+      awk 'BEGIN{p=0} /-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' "$probe" > "$out"
+      rm -f -- "$probe"
+      if openssl x509 -in "$out" -noout >/dev/null 2>&1; then
+        printf '%s\n' "$port"
+        return 0
+      fi
+    else
+      rm -f -- "$probe"
+    fi
+  done
+  rm -f -- "$out"
+  return 1
+}
+
+match_managed_runtime_cert(){
+  local runtime=${1:?runtime certificate required} runtime_fp candidate fp dir
+  runtime_fp=$(cert_fingerprint "$runtime"); [[ -n $runtime_fp ]] || return 1
+  for candidate in "$TLS_ROOT/local-endpoint.crt" "$TLS_ROOT/imported.crt"; do
+    [[ -r $candidate ]] || continue
+    fp=$(cert_fingerprint "$candidate"); [[ $fp == "$runtime_fp" ]] || continue
+    if [[ $candidate == */local-endpoint.crt ]]; then
+      printf 'local-ca|%s|%s\n' "$candidate" "$TLS_ROOT/local-endpoint.key"
+    else
+      printf 'imported|%s|%s\n' "$candidate" "$TLS_ROOT/imported.key"
+    fi
+    return 0
+  done
+  local live_root=$LE_ROOT
+  [[ -n $CERTBOT_CONFIG_DIR ]] && live_root="$CERTBOT_CONFIG_DIR/live"
+  if [[ -d $live_root ]]; then
+    while IFS= read -r candidate; do
+      [[ -r $candidate ]] || continue
+      fp=$(cert_fingerprint "$candidate"); [[ $fp == "$runtime_fp" ]] || continue
+      dir=${candidate%/fullchain.pem}
+      printf 'certbot|%s|%s\n' "$candidate" "$dir/privkey.pem"
+      return 0
+    done < <(find "$live_root" -mindepth 2 -maxdepth 2 -type f -name fullchain.pem -print 2>/dev/null)
+  fi
+  return 1
+}
+
 cert_metadata(){
   local expiry='' subject='' issuer='' serial='' fingerprint='' not_before='' sans=''
   if [[ -n $VMAPI_TLS_CERT_FILE && -r $VMAPI_TLS_CERT_FILE ]]; then
@@ -368,16 +421,50 @@ cert_metadata(){
 }
 
 status(){
-  local available=false platform csr_available=false csr_subject=''
+  local available=false platform csr_available=false csr_subject='' configured_tls_enabled=$VMAPI_TLS_ENABLED
+  local runtime_cert='' runtime_port='' runtime_match='' effective_source=config state_mismatch=false
+  local effective_mode=$VMAPI_TLS_MODE effective_domain=$VMAPI_TLS_DOMAIN effective_cert=$VMAPI_TLS_CERT_FILE effective_key=$VMAPI_TLS_KEY_FILE
+  local effective_tls_enabled=$VMAPI_TLS_ENABLED tmp_runtime
   command -v certbot >/dev/null 2>&1 && available=true
   [[ -n $VMAPI_TLS_CSR_FILE && -r $VMAPI_TLS_CSR_FILE ]] && { csr_available=true; csr_subject=$(openssl req -in "$VMAPI_TLS_CSR_FILE" -noout -subject 2>/dev/null | sed 's/^subject=//' || true); }
   platform=$(detect_platform)
-  printf '{"profile":"%s","port":%s,"https_port":%s,"certbot_available":%s,"tls_enabled":%s,"tls_disabled_explicitly":%s,"reload_required":%s,"tls_transport":"%s","mode":"%s","domain":"%s","certificate":"%s","private_key":"%s","csr":"%s","csr_key":"%s","csr_domain":"%s","csr_available":%s,"csr_subject":"%s","platform":"%s",' \
-    "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$VMAPI_HTTPS_PORT" "$available" "$VMAPI_TLS_ENABLED" "$VMAPI_TLS_DISABLED_EXPLICITLY" "$VMAPI_TLS_RELOAD_REQUIRED" "$(json_escape "$VMAPI_TLS_TRANSPORT")" "$(json_escape "$VMAPI_TLS_MODE")" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_FILE")" "$(json_escape "$VMAPI_TLS_CSR_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_DOMAIN")" "$csr_available" "$(json_escape "$csr_subject")" "$platform"
+
+  # What the listener is actually serving is authoritative for display. This
+  # repairs visibility for legacy containers where the cert survived but the
+  # persisted TLS flags did not.
+  tmp_runtime=$(mktemp)
+  if runtime_port=$(runtime_tls_certificate "$tmp_runtime"); then
+    runtime_cert=$tmp_runtime; effective_tls_enabled=true; effective_source=runtime
+    runtime_match=$(match_managed_runtime_cert "$runtime_cert" || true)
+    if [[ -n $runtime_match ]]; then
+      IFS='|' read -r effective_mode effective_cert effective_key <<< "$runtime_match"
+      if [[ -z $effective_domain || $effective_domain == none ]]; then
+        effective_domain=$(openssl x509 -in "$effective_cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -n1)
+      fi
+    else
+      effective_mode=detected
+      effective_cert=$runtime_cert
+      effective_key=''
+      effective_domain=$(openssl x509 -in "$runtime_cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -n1)
+    fi
+  fi
+  [[ $configured_tls_enabled == "$effective_tls_enabled" ]] || state_mismatch=true
+
+  # Dynamic scoping lets cert_metadata inspect the effective cert without
+  # changing the persisted configuration.
+  local VMAPI_TLS_ENABLED=$effective_tls_enabled
+  local VMAPI_TLS_MODE=$effective_mode
+  local VMAPI_TLS_DOMAIN=$effective_domain
+  local VMAPI_TLS_CERT_FILE=$effective_cert
+  local VMAPI_TLS_KEY_FILE=$effective_key
+
+  printf '{"profile":"%s","port":%s,"https_port":%s,"certbot_available":%s,"tls_enabled":%s,"configured_tls_enabled":%s,"tls_state_mismatch":%s,"tls_effective_source":"%s","runtime_tls_port":"%s","tls_disabled_explicitly":%s,"reload_required":%s,"tls_transport":"%s","mode":"%s","domain":"%s","certificate":"%s","private_key":"%s","csr":"%s","csr_key":"%s","csr_domain":"%s","csr_available":%s,"csr_subject":"%s","platform":"%s",' \
+    "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$VMAPI_HTTPS_PORT" "$available" "$VMAPI_TLS_ENABLED" "$configured_tls_enabled" "$state_mismatch" "$effective_source" "$(json_escape "$runtime_port")" "$VMAPI_TLS_DISABLED_EXPLICITLY" "$VMAPI_TLS_RELOAD_REQUIRED" "$(json_escape "$VMAPI_TLS_TRANSPORT")" "$(json_escape "$VMAPI_TLS_MODE")" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_FILE")" "$(json_escape "$VMAPI_TLS_CSR_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_DOMAIN")" "$csr_available" "$(json_escape "$csr_subject")" "$platform"
   cert_metadata
   printf ','
   local_ca_metadata
   printf '}\n'
+  [[ -z $runtime_cert ]] || rm -f -- "$runtime_cert"
 }
 
 activate(){
