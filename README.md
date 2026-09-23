@@ -287,23 +287,23 @@ Debian uses Nginx on `127.0.0.1:5186` by default. Alpine uses Lighttpd on the co
 
 ```bash
 docker build -f docker/storage/Dockerfile -t blaize/litevmm-storage:latest .
-docker run -d --name litevmm-storage -p 5186:5186 -e VMAPI_HTTP_USER=admin -e VMAPI_HTTP_PASSWORD='choose-a-strong-password' -v litevmm-storage-data:/var/lib/vmapi blaize/litevmm-storage:latest
+docker run -d --name litevmm-storage -p 5186:5186 -p 5187:5187 -e VMAPI_HTTP_USER=admin -e VMAPI_HTTP_PASSWORD='choose-a-strong-password' -v litevmm-storage-data:/var/lib/vmapi blaize/litevmm-storage:latest
 ```
 
-Only the LiteVMM management port is published. The userspace NFS endpoint stays inside the container and is reachable by peers only through `/backplane/storage`. Native LiteVMM installs continue to use the kernel NFS backend for every workload profile.
+Port `5186` is the normal management HTTP port. Port `5187` is only needed when using the `dual` or `redirect` HTTPS policy. The userspace NFS endpoint stays inside the container and is reachable by peers only through `/backplane/storage`. Native LiteVMM installs continue to use the kernel NFS backend for every workload profile.
 
 ### HTTPS certificate management
 
-LiteVMM can manage the management endpoint certificate without adding another listener or certificate service.
+LiteVMM can manage the management endpoint certificate and lets the administrator choose how HTTPS changes the existing HTTP listener.
 
 - **Let's Encrypt** uses Certbot with the standalone HTTP-01 challenge. Certbot is installed automatically with LiteVMM. DNS must resolve to the host and TCP port 80 must be reachable during issuance and renewal.
 - **CSR workflow** generates an RSA 2048, RSA 4096, or ECDSA P-256 private key plus a PKCS#10 CSR. The private key remains on the LiteVMM host. A pending CSR does not replace an active HTTPS certificate.
 - **Signed CSR import** accepts the PEM certificate or full chain returned by an external CA and verifies that it matches both the retained CSR and private key before activating it.
 - **Direct import** accepts an existing PEM certificate/full chain plus PEM private key and verifies that the public/private keys match before changing the endpoint.
 
-Managed key material is stored under `/etc/vmapi/tls` on normal host installations with private keys mode `0600`. The backup container uses `/var/lib/vmapi/tls` so imported keys and CSRs persist with the backup data volume. Nginx is reloaded after validation. Lighttpd receives a generated OpenSSL include and is restarted only after its configuration validates.
+Managed key material is stored under `/etc/vmapi/tls` on normal host installations. The backup container uses `/var/lib/vmapi/tls` so imported keys, the local CA, and CSRs persist with the backup data volume. Certificate changes are staged first. The explicit reload step offers three transport policies: `dual` keeps HTTP on the existing management port and adds HTTPS on `5187` by default; `redirect` keeps the HTTP listener but redirects it to the secondary HTTPS port; `replace` changes the existing management port from HTTP to HTTPS. `dual` is the compatibility-safe choice when peers already store an `http://` endpoint.
 
-The administration UI shows the active certificate subject, issuer, SANs, validity dates, SHA-256 fingerprint, management mode, and pending CSR state.
+The administration UI shows the active certificate subject, issuer, SANs, validity dates, SHA-256 fingerprint, management mode, pending CSR state, HTTPS policy, and HTTPS port. When a certificate is staged, the UI does not reload the web server automatically. It asks which transport policy to apply, then waits for the HTTPS endpoint before redirecting the browser.
 
 Certificate API routes:
 
@@ -312,6 +312,7 @@ GET     /api/admin
 GET     /api/admin/certificates
 POST    /api/admin/certificates/letsencrypt   form: domain=...&email=...
 POST    /api/admin/certificates/renew
+POST    /api/admin/certificates/reload        form: transport=dual|redirect|replace&https_port=5187
 POST    /api/admin/certificates/csr           form: domain=...&sans=...&organization=...&organizational_unit=...&country=...&state=...&locality=...&key_type=...
 GET     /api/admin/certificates/csr
 POST    /api/admin/certificates/signed        form: certificate=<PEM>

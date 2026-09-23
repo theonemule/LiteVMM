@@ -37,6 +37,6 @@ RUN chmod 0755       /usr/local/bin/vmapi       /usr/local/bin/vmapi-web-reload 
 ENV VMAPI_HTTP_PORT=5186     VMAPI_HTTP_USER=admin
 
 VOLUME ["/var/lib/vmapi"]
-EXPOSE 5186
+EXPOSE 5186 5187
 
 ENTRYPOINT ["/usr/local/bin/litevmm-backup-entrypoint"]

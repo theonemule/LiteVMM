@@ -2040,10 +2040,10 @@ ${commandLine(ci)} < user-data`;
     frequency.onchange=sync;sync();bindBackupTarget(root);
   }
 
-  function httpsTransitionTarget(status) {
+  function httpsTransitionTarget(status,transport,httpsPort) {
     let host=String(status.domain||location.hostname||'').trim();
     if(host.includes(':')&&!host.startsWith('['))host=`[${host}]`;
-    const port=Number(status.port||location.port||5186);
+    const port=transport==='replace'?Number(status.port||location.port||5186):Number(httpsPort||status.https_port||5187);
     const authority=`${host}${port===443?'':`:${port}`}`;
     const base=`https://${authority}`;
     return {base,health:`${base}/healthz.svg`,url:`${base}${location.pathname}${location.search}${location.hash}`};
@@ -2051,16 +2051,21 @@ ${commandLine(ci)} < user-data`;
 
   async function beginHttpsTransition(status) {
     const button=$('#tlsReloadBtn'),notice=$('#tlsReloadNotice'),message=$('#tlsReloadMessage'),manual=$('#tlsManualHttps');
+    const transport=$('#tlsTransportMode')?.value||'replace';
+    const httpsPort=Number($('#tlsHttpsPort')?.value||status.https_port||5187);
     if(!button||!notice)return;
-    const target=httpsTransitionTarget(status);
+    if(!['replace','dual','redirect'].includes(transport)){if(message)message.textContent='Choose a valid HTTPS activation mode.';return;}
+    if(transport!=='replace'&&(!Number.isInteger(httpsPort)||httpsPort<1||httpsPort>65535||httpsPort===Number(status.port))){if(message)message.textContent='Choose a secondary HTTPS port different from the HTTP port.';return;}
+    const target=httpsTransitionTarget(status,transport,httpsPort);
     button.disabled=true;
     if(message)message.innerHTML='<span class="spinner-border spinner-border-sm me-2" aria-hidden="true"></span>Reload requested. Waiting for the HTTPS endpoint to come back up…';
     try {
-      await request('/admin/certificates/reload',{method:'POST',form:{}});
+      await request('/admin/certificates/reload',{method:'POST',form:{transport,https_port:httpsPort}});
     } catch(error) {
-      button.disabled=false;
-      if(message)message.textContent=error.message;
-      return;
+      // This one POST intentionally replaces the web listener. Some Lighttpd
+      // transitions close the originating socket after the change has already
+      // been accepted. Do not replay the write; continue with readiness polling.
+      if(message)message.innerHTML='<span class="spinner-border spinner-border-sm me-2" aria-hidden="true"></span>The web listener disconnected during reload. Waiting for the selected HTTPS endpoint…';
     }
 
     let attempts=0,finished=false;
@@ -2087,18 +2092,24 @@ ${commandLine(ci)} < user-data`;
   }
 
   async function loadAdmin() {
-    const status=await request('/admin');
+    const [status,peers]=await Promise.all([request('/admin'),request('/cluster/peers').catch(()=>[])]);
     const svc=state.activeService||state.service||{};
     const tls=status.tls_enabled===true;
     const mode=status.mode||'none';
     const reloadRequired=status.reload_required===true;
     const browserTransport=location.protocol==='https:'?'HTTPS':'HTTP';
+    const peerCount=Array.isArray(peers)?peers.length:0;
+    const preferredTransport=(peerCount>0&&location.protocol==='http:'&&status.tls_transport==='replace')?'dual':(status.tls_transport||'replace');
+    const httpsPort=Number(status.https_port||5187);
     const certbotButton='<button id="configureCertBtn" class="btn btn-primary">Let’s Encrypt</button><button id="selfSignedCertBtn" class="btn btn-outline-primary">Self-signed</button>';
     const actions=`<div class="action-row justify-content-start">${certbotButton}<button id="generateCsrBtn" class="btn btn-outline-primary">Generate CSR</button><button id="importPairBtn" class="btn btn-outline-primary">Import certificate + key</button>${status.csr_available?'<button id="importSignedBtn" class="btn btn-outline-primary">Import signed CSR certificate</button>':''}${tls&&mode==='certbot'?'<button id="renewCertBtn" class="btn btn-outline-primary">Renew Let’s Encrypt</button>':''}${tls?'<button id="disableTlsBtn" class="btn btn-outline-danger">Disable HTTPS</button>':''}</div>`;
-    const reloadNotice=reloadRequired&&tls?`<div id="tlsReloadNotice" class="alert alert-warning mb-3"><div class="fw-semibold mb-1">Certificate is ready. HTTPS has not been activated yet.</div><div id="tlsReloadMessage" class="small mb-2">Click below when you are ready to reload the web endpoint and transition this console to HTTPS.</div><div class="d-flex gap-2 flex-wrap align-items-center"><button id="tlsReloadBtn" class="btn btn-primary btn-sm">Click here to reload and switch to HTTPS</button><a id="tlsManualHttps" class="btn btn-outline-primary btn-sm d-none" target="_self">Open HTTPS endpoint</a></div><div class="small text-secondary mt-2">The page will poll the HTTPS endpoint and redirect automatically when the browser can validate the certificate. With a LiteVMM self-signed CA, the browser or operating system must trust that CA first.</div></div>`:'';
+    const reloadNotice=reloadRequired&&tls?`<div id="tlsReloadNotice" class="alert alert-warning mb-3"><div class="fw-semibold mb-1">Certificate is ready. Choose how HTTP should behave.</div><div id="tlsReloadMessage" class="small mb-3">The certificate is staged. Nothing changes until you explicitly reload the endpoint.</div>${peerCount?`<div class="alert alert-info py-2 small">This node has ${peerCount} paired peer${peerCount===1?'':'s'}. Keeping both HTTP and HTTPS preserves existing peer URLs.</div>`:''}<div class="row g-2 align-items-end mb-3"><div class="col-lg-8"><label class="form-label small">HTTPS activation behavior</label><select id="tlsTransportMode" class="form-select form-select-sm"><option value="dual" ${preferredTransport==='dual'?'selected':''}>Keep HTTP + HTTPS${peerCount?' — recommended for paired nodes':''}</option><option value="redirect" ${preferredTransport==='redirect'?'selected':''}>Redirect HTTP to HTTPS</option><option value="replace" ${preferredTransport==='replace'?'selected':''}>Replace HTTP with HTTPS</option></select></div><div class="col-lg-4" id="tlsHttpsPortWrap"><label class="form-label small">HTTPS port</label><input id="tlsHttpsPort" type="number" min="1" max="65535" class="form-control form-control-sm mono" value="${httpsPort}"></div></div><div id="tlsTransportHelp" class="small text-secondary mb-3"></div><div class="d-flex gap-2 flex-wrap align-items-center"><button id="tlsReloadBtn" class="btn btn-primary btn-sm">Click here to reload and switch to HTTPS</button><a id="tlsManualHttps" class="btn btn-outline-primary btn-sm d-none" target="_self">Open HTTPS endpoint</a></div><div class="small text-secondary mt-2">The page polls the HTTPS endpoint and redirects when the browser can validate the certificate. With a LiteVMM self-signed CA, the browser or operating system must trust that CA first.</div></div>`:'';
     const pending=status.csr_available?systemDl([['CSR domain',status.csr_domain||''],['CSR subject',status.csr_subject||''],['CSR file',status.csr||'',true]]):'<div class="small text-secondary">No pending CSR.</div>';
-    $('#view').innerHTML=`<div class="row g-3 mb-3"><div class="col-xl-6">${card('Installation',systemDl([['Profile',svc.profile||status.profile],['API version',svc.version],['Management port',svc.port||status.port],['Transport',reloadRequired?`${browserTransport} (certificate reload pending)`:browserTransport],['Capabilities',(svc.capabilities||[]).join(', ')]]))}</div><div class="col-xl-6">${card('TLS certificate',systemDl([['Enabled',tls?'Yes':'No'],['Management',mode],['Domain',status.domain||''],['Valid from',status.not_before||''],['Expires',status.expires||''],['Subject',status.subject||''],['Issuer',status.issuer||''],['SANs',status.sans||''],['SHA-256 fingerprint',status.fingerprint_sha256||'',true],['Certificate',status.certificate||'',true]]))}</div></div><div class="row g-3"><div class="col-xl-7">${card('Certificate management',`${reloadNotice}<div class="small text-secondary mb-3">Use Let’s Encrypt, a LiteVMM local CA, a CSR for an external CA, or import an existing PEM certificate/private-key pair. Certificate changes are staged first; HTTPS is activated only after you explicitly reload the endpoint.</div>${actions}`)}</div><div class="col-xl-5">${card('Pending CSR',pending)}</div></div>`;
+    $('#view').innerHTML=`<div class="row g-3 mb-3"><div class="col-xl-6">${card('Installation',systemDl([['Profile',svc.profile||status.profile],['API version',svc.version],['Management port',svc.port||status.port],['Transport',reloadRequired?`${browserTransport} (certificate reload pending)`:browserTransport],['HTTPS policy',status.tls_transport||'replace'],['HTTPS port',(status.tls_transport||'replace')==='replace'?(status.port||''):(status.https_port||'')],['Capabilities',(svc.capabilities||[]).join(', ')]]))}</div><div class="col-xl-6">${card('TLS certificate',systemDl([['Enabled',tls?'Yes':'No'],['Management',mode],['Domain',status.domain||''],['Valid from',status.not_before||''],['Expires',status.expires||''],['Subject',status.subject||''],['Issuer',status.issuer||''],['SANs',status.sans||''],['SHA-256 fingerprint',status.fingerprint_sha256||'',true],['Certificate',status.certificate||'',true]]))}</div></div><div class="row g-3"><div class="col-xl-7">${card('Certificate management',`${reloadNotice}<div class="small text-secondary mb-3">Use Let’s Encrypt, a LiteVMM local CA, a CSR for an external CA, or import an existing PEM certificate/private-key pair. Certificate changes are staged first; HTTPS is activated only after you explicitly reload the endpoint.</div>${actions}`)}</div><div class="col-xl-5">${card('Pending CSR',pending)}</div></div>`;
 
+    const tlsTransport=$('#tlsTransportMode'),tlsPortWrap=$('#tlsHttpsPortWrap'),tlsHelp=$('#tlsTransportHelp');
+    const syncTlsTransport=()=>{if(!tlsTransport)return;const kind=tlsTransport.value;if(tlsPortWrap)tlsPortWrap.classList.toggle('d-none',kind==='replace');if(tlsHelp)tlsHelp.textContent=kind==='dual'?`HTTP stays on port ${status.port||5186}; HTTPS listens on the secondary port. Existing HTTP peer endpoints continue working. On Docker/TrueNAS, publish the HTTPS port too.`:kind==='redirect'?`HTTP stays on port ${status.port||5186} and redirects to the secondary HTTPS port. Existing clients must follow the redirect; WebSocket peers may need their endpoint updated.`:`HTTPS takes over port ${status.port||5186}. Any peer still configured with an http:// endpoint on that port will stop connecting until its endpoint is changed.`;};
+    tlsTransport?.addEventListener('change',syncTlsTransport);syncTlsTransport();
     $('#tlsReloadBtn')?.addEventListener('click',()=>beginHttpsTransition(status));
 
     $('#configureCertBtn')?.addEventListener('click',()=>modal({eyebrow:'HTTPS',title:'Issue Let’s Encrypt certificate',submitText:'Issue certificate',body:`<form id="certForm"><label class="form-label">DNS name</label><input name="domain" class="form-control mono mb-3" value="${esc(status.domain||'')}" placeholder="litevmm.example.com" required><label class="form-label">ACME email</label><input name="email" type="email" class="form-control" required><div class="form-text mt-3">Certbot uses the standalone HTTP-01 challenge on TCP port 80. DNS must resolve to this host and port 80 must be reachable during issuance.</div></form>`,onSubmit:async(el,m)=>{const fd=new FormData($('#certForm',el));await request('/admin/certificates/letsencrypt',{method:'POST',form:{domain:fd.get('domain'),email:fd.get('email')}});m.hide();toast('Let’s Encrypt certificate is ready. Reload to activate HTTPS.');await loadAdmin();}}));

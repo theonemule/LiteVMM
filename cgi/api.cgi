@@ -576,7 +576,7 @@ case "${P[0]-}" in
             raw_json_reply '200 OK' cert_cmd renew;;
           reload)
             [[ $method == POST ]] || error_reply '405 Method Not Allowed' 'Use POST'
-            raw_json_reply '200 OK' cert_cmd reload;;
+            raw_json_reply '200 OK' cert_cmd reload "$(param transport replace)" "$(param https_port 5187)";;
           csr)
             case "$method" in
               GET) text_reply '200 OK' cert_cmd csr-show;;

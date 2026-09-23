@@ -5,8 +5,10 @@ VMAPI_CONFIG=${VMAPI_CONFIG:-/etc/vmapi/vmapi.conf}
 [[ -r "$VMAPI_CONFIG" ]] && source "$VMAPI_CONFIG"
 
 VMAPI_HTTP_PORT=${VMAPI_HTTP_PORT:-5186}
+VMAPI_HTTPS_PORT=${VMAPI_HTTPS_PORT:-5187}
 VMAPI_TLS_ENABLED=${VMAPI_TLS_ENABLED:-false}
 VMAPI_TLS_RELOAD_REQUIRED=${VMAPI_TLS_RELOAD_REQUIRED:-false}
+VMAPI_TLS_TRANSPORT=${VMAPI_TLS_TRANSPORT:-replace}
 VMAPI_TLS_MODE=${VMAPI_TLS_MODE:-none}
 VMAPI_TLS_DOMAIN=${VMAPI_TLS_DOMAIN:-}
 VMAPI_TLS_CERT_FILE=${VMAPI_TLS_CERT_FILE:-}
@@ -49,6 +51,8 @@ valid_key_type(){ [[ ${1:-} =~ ^(rsa2048|rsa4096|ec256)$ ]] || die 'key_type mus
 safe_dn(){ [[ ${#1} -le 128 && $1 != *$'\n'* && $1 != *$'\r'* ]] || die 'CSR subject field is invalid'; }
 require_root(){ [[ $EUID -eq 0 ]] || die 'Certificate changes require root privileges'; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Required command is missing: $1"; }
+valid_port(){ [[ ${1:-} =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+valid_transport(){ [[ ${1:-} =~ ^(replace|dual|redirect)$ ]] || die 'TLS transport must be replace, dual, or redirect'; }
 
 set_config(){
   local key=$1 value=${2-} tmp target=$VMAPI_CONFIG
@@ -102,39 +106,86 @@ validate_pair(){
 }
 
 rewrite_nginx(){
-  local file="$NGINX_SITE" tmp ssl=''
+  local file="$NGINX_SITE" tls_include=${VMAPI_NGINX_TLS_CONF:-${NGINX_SITE%/*}/vmapi-tls.conf} ssl='' authority
   [[ -f $file ]] || die 'LiteVMM Nginx configuration is missing'
-  [[ $VMAPI_TLS_ENABLED == true ]] && ssl=' ssl'
-  sed -i -E "s|listen 127\\.0\\.0\\.1:[0-9]+( ssl)?;|listen 127.0.0.1:${VMAPI_HTTP_PORT}${ssl};|" "$file"
-  tmp=$(mktemp)
-  awk -v enabled="$VMAPI_TLS_ENABLED" -v cert="$VMAPI_TLS_CERT_FILE" -v key="$VMAPI_TLS_KEY_FILE" '
-    /# VMAPI TLS BEGIN/ {skip=1; next}
-    /# VMAPI TLS END/ {skip=0; next}
-    skip {next}
-    {print}
-    /server_name _;/ && enabled=="true" {
-      print "    # VMAPI TLS BEGIN"
-      print "    ssl_certificate " cert ";"
-      print "    ssl_certificate_key " key ";"
-      print "    ssl_protocols TLSv1.2 TLSv1.3;"
-      print "    ssl_session_cache shared:VMAPITLS:10m;"
-      print "    # VMAPI TLS END"
-    }
-  ' "$file" > "$tmp"
-  cat "$tmp" > "$file"; rm -f "$tmp"
+  valid_transport "$VMAPI_TLS_TRANSPORT"
+  valid_port "$VMAPI_HTTP_PORT" || die 'Invalid HTTP port'
+  valid_port "$VMAPI_HTTPS_PORT" || die 'Invalid HTTPS port'
+  if [[ $VMAPI_TLS_TRANSPORT != replace ]]; then
+    [[ $VMAPI_HTTPS_PORT != "$VMAPI_HTTP_PORT" ]] || die 'HTTPS port must differ from HTTP port when keeping the HTTP listener'
+  fi
+
+  # Keep one stable HTTP server block and place the TLS listener/directives in
+  # a generated server-context include. This lets one Nginx server serve both
+  # HTTP and HTTPS without duplicating all LiteVMM locations.
+  grep -Fq "include $tls_include;" "$file" || sed -i "/server_name _;/a\\    include $tls_include;" "$file"
+  [[ $VMAPI_TLS_ENABLED == true && $VMAPI_TLS_TRANSPORT == replace ]] && ssl=' ssl'
+  sed -i -E "0,/listen 127\\.0\\.0\\.1:[0-9]+( ssl)?;/s//listen 127.0.0.1:${VMAPI_HTTP_PORT}${ssl};/" "$file"
+  : > "$tls_include"
+  if [[ $VMAPI_TLS_ENABLED == true ]]; then
+    [[ -r $VMAPI_TLS_CERT_FILE && -r $VMAPI_TLS_KEY_FILE ]] || die 'Certificate files are missing'
+    if [[ $VMAPI_TLS_TRANSPORT != replace ]]; then
+      printf 'listen 127.0.0.1:%s ssl;\n' "$VMAPI_HTTPS_PORT" >> "$tls_include"
+    fi
+    printf 'ssl_certificate %s;\nssl_certificate_key %s;\nssl_protocols TLSv1.2 TLSv1.3;\nssl_session_cache shared:VMAPITLS:10m;\n' "$VMAPI_TLS_CERT_FILE" "$VMAPI_TLS_KEY_FILE" >> "$tls_include"
+    if [[ $VMAPI_TLS_TRANSPORT == redirect ]]; then
+      [[ -n $VMAPI_TLS_DOMAIN ]] || die 'Redirect mode requires a certificate DNS name or IPv4 address'
+      authority=$VMAPI_TLS_DOMAIN; [[ $VMAPI_HTTPS_PORT == 443 ]] || authority+=":$VMAPI_HTTPS_PORT"
+      printf 'if ($server_port = %s) { return 308 https://%s$request_uri; }\n' "$VMAPI_HTTP_PORT" "$authority" >> "$tls_include"
+    fi
+  fi
   nginx -t >/dev/null
 }
 
 rewrite_lighttpd(){
-  local conf="$LIGHTTPD_TLS_CONF" pem="$LIGHTTPD_PEM"
+  local conf="$LIGHTTPD_TLS_CONF" pem="$LIGHTTPD_PEM" authority
+  valid_transport "$VMAPI_TLS_TRANSPORT"
+  valid_port "$VMAPI_HTTP_PORT" || die 'Invalid HTTP port'
+  valid_port "$VMAPI_HTTPS_PORT" || die 'Invalid HTTPS port'
+  if [[ $VMAPI_TLS_TRANSPORT != replace ]]; then
+    [[ $VMAPI_HTTPS_PORT != "$VMAPI_HTTP_PORT" ]] || die 'HTTPS port must differ from HTTP port when keeping the HTTP listener'
+  fi
   if [[ $VMAPI_TLS_ENABLED == true ]]; then
     [[ -r $VMAPI_TLS_CERT_FILE && -r $VMAPI_TLS_KEY_FILE ]] || die 'Certificate files are missing'
-    cat "$VMAPI_TLS_KEY_FILE" "$VMAPI_TLS_CERT_FILE" > "$pem"; chmod 0600 "$pem"
-    cat > "$conf" <<CFG
+    cat "$VMAPI_TLS_KEY_FILE" "$VMAPI_TLS_CERT_FILE" > "$pem"; chown root:lighttpd "$pem" 2>/dev/null || true; chmod 0640 "$pem"
+    case "$VMAPI_TLS_TRANSPORT" in
+      replace)
+        cat > "$conf" <<CFG
 server.modules += ( "mod_openssl" )
 ssl.engine = "enable"
 ssl.pemfile = "$pem"
 CFG
+        ;;
+      dual|redirect)
+        cat > "$conf" <<CFG
+server.modules += ( "mod_openssl" )
+\$SERVER["socket"] == ":$VMAPI_HTTPS_PORT" {
+  ssl.engine = "enable"
+  ssl.pemfile = "$pem"
+}
+CFG
+        if [[ $VMAPI_TLS_TRANSPORT == redirect ]]; then
+          [[ -n $VMAPI_TLS_DOMAIN ]] || die 'Redirect mode requires a certificate DNS name or IPv4 address'
+          authority=$VMAPI_TLS_DOMAIN; [[ $VMAPI_HTTPS_PORT == 443 ]] || authority+=":$VMAPI_HTTPS_PORT"
+          cat >> "$conf" <<CFG
+server.modules += ( "mod_redirect" )
+\$SERVER["socket"] == ":$VMAPI_HTTP_PORT" {
+  # Redirect-only HTTP listener: do not challenge for Basic auth before the
+  # browser can reach the authenticated HTTPS endpoint.
+  auth.require = ()
+  url.redirect-code = 308
+  # mod_rewrite has already mapped public API paths to CGI aliases by the time
+  # mod_redirect evaluates them. Map those aliases back to public URLs.
+  url.redirect = (
+    "^/api[.]cgi/(.*)\$" => "https://$authority/api/\$1",
+    "^/peer-api[.]cgi/(.*)\$" => "https://$authority/peer-api/\$1",
+    "^/(.*)\$" => "https://$authority/\$1"
+  )
+}
+CFG
+        fi
+        ;;
+    esac
   else
     rm -f "$conf" "$pem"
   fi
@@ -152,6 +203,13 @@ apply_web_tls(){
 
 reload_web_tls(){
   require_root
+  local transport=${1:-$VMAPI_TLS_TRANSPORT} https_port=${2:-$VMAPI_HTTPS_PORT}
+  valid_transport "$transport"; valid_port "$https_port" || die 'Invalid HTTPS port'
+  [[ $transport == replace || $https_port != "$VMAPI_HTTP_PORT" ]] || die 'HTTPS port must differ from HTTP port when keeping HTTP enabled'
+  [[ $transport != redirect || -n $VMAPI_TLS_DOMAIN ]] || die 'Redirect mode requires a certificate DNS name or IPv4 address'
+  set_config VMAPI_TLS_TRANSPORT "$transport"
+  set_config VMAPI_HTTPS_PORT "$https_port"
+  VMAPI_TLS_TRANSPORT=$transport VMAPI_HTTPS_PORT=$https_port
   apply_web_tls
   case $(detect_platform) in
     debian)
@@ -313,8 +371,8 @@ status(){
   command -v certbot >/dev/null 2>&1 && available=true
   [[ -n $VMAPI_TLS_CSR_FILE && -r $VMAPI_TLS_CSR_FILE ]] && { csr_available=true; csr_subject=$(openssl req -in "$VMAPI_TLS_CSR_FILE" -noout -subject 2>/dev/null | sed 's/^subject=//' || true); }
   platform=$(detect_platform)
-  printf '{"profile":"%s","port":%s,"certbot_available":%s,"tls_enabled":%s,"reload_required":%s,"mode":"%s","domain":"%s","certificate":"%s","private_key":"%s","csr":"%s","csr_key":"%s","csr_domain":"%s","csr_available":%s,"csr_subject":"%s","platform":"%s",' \
-    "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$available" "$VMAPI_TLS_ENABLED" "$VMAPI_TLS_RELOAD_REQUIRED" "$(json_escape "$VMAPI_TLS_MODE")" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_FILE")" "$(json_escape "$VMAPI_TLS_CSR_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_DOMAIN")" "$csr_available" "$(json_escape "$csr_subject")" "$platform"
+  printf '{"profile":"%s","port":%s,"https_port":%s,"certbot_available":%s,"tls_enabled":%s,"reload_required":%s,"tls_transport":"%s","mode":"%s","domain":"%s","certificate":"%s","private_key":"%s","csr":"%s","csr_key":"%s","csr_domain":"%s","csr_available":%s,"csr_subject":"%s","platform":"%s",' \
+    "$(json_escape "${VMAPI_PROFILE:-unknown}")" "$VMAPI_HTTP_PORT" "$VMAPI_HTTPS_PORT" "$available" "$VMAPI_TLS_ENABLED" "$VMAPI_TLS_RELOAD_REQUIRED" "$(json_escape "$VMAPI_TLS_TRANSPORT")" "$(json_escape "$VMAPI_TLS_MODE")" "$(json_escape "$VMAPI_TLS_DOMAIN")" "$(json_escape "$VMAPI_TLS_CERT_FILE")" "$(json_escape "$VMAPI_TLS_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_FILE")" "$(json_escape "$VMAPI_TLS_CSR_KEY_FILE")" "$(json_escape "$VMAPI_TLS_CSR_DOMAIN")" "$csr_available" "$(json_escape "$csr_subject")" "$platform"
   cert_metadata
   printf ','
   local_ca_metadata
@@ -473,7 +531,7 @@ disable(){
 case ${1:-status} in
   status) status;;
   apply) require_root; apply_web_tls; status;;
-  reload) reload_web_tls;;
+  reload) shift; reload_web_tls "$@";;
   issue) shift; issue "$@";;
   renew) renew;;
   csr-generate) shift; generate_csr "$@";;
@@ -483,5 +541,5 @@ case ${1:-status} in
   self-sign) shift; self_sign "$@";;
   ca-show) show_ca;;
   disable) disable;;
-  *) die 'Usage: certctl status | apply | reload | issue DOMAIN EMAIL | renew | self-sign HOST [SANS] [DAYS] | ca-show | csr-generate DOMAIN [SANS] [ORG] [OU] [COUNTRY] [STATE] [LOCALITY] [rsa2048|rsa4096|ec256] | csr-show | import-signed CERT_FILE | import-pair CERT_FILE KEY_FILE [DOMAIN] | disable';;
+  *) die 'Usage: certctl status | apply | reload [replace|dual|redirect] [HTTPS_PORT] | issue DOMAIN EMAIL | renew | self-sign HOST [SANS] [DAYS] | ca-show | csr-generate DOMAIN [SANS] [ORG] [OU] [COUNTRY] [STATE] [LOCALITY] [rsa2048|rsa4096|ec256] | csr-show | import-signed CERT_FILE | import-pair CERT_FILE KEY_FILE [DOMAIN] | disable';;
 esac

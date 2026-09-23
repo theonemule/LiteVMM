@@ -46,6 +46,13 @@ touch /var/log/vmapi/lighttpd-error.log
 chown lighttpd:lighttpd /var/log/vmapi/lighttpd-error.log
 
 sed -i -E "s/^VMAPI_HTTP_PORT=.*/VMAPI_HTTP_PORT=$port/" "$persistent_config"
+# Migrate older persistent container configs that pointed the derived combined
+# Lighttpd PEM into the root-only persistent TLS directory.
+if grep -q '^VMAPI_LIGHTTPD_PEM=' "$persistent_config"; then
+  sed -i -E 's#^VMAPI_LIGHTTPD_PEM=.*#VMAPI_LIGHTTPD_PEM=/run/vmapi/lighttpd.pem#' "$persistent_config"
+else
+  printf '%s\n' 'VMAPI_LIGHTTPD_PEM=/run/vmapi/lighttpd.pem' >> "$persistent_config"
+fi
 hash=$(printf '%s\n' "$password" | openssl passwd -apr1 -stdin)
 printf '%s:%s\n' "$user" "$hash" > /etc/lighttpd/vmapi.htpasswd
 chmod 0640 /etc/lighttpd/vmapi.htpasswd
@@ -60,7 +67,7 @@ vmapi ALL=(root) NOPASSWD: /usr/local/bin/backplanectl server-status
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/hostexecctl start, /usr/local/bin/hostexecctl stop
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/filectl *
 vmapi ALL=(root) NOPASSWD: /usr/local/bin/logctl *
-vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl reload, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl self-sign *, /usr/local/bin/certctl ca-show, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable
+vmapi ALL=(root) NOPASSWD: /usr/local/bin/certctl status, /usr/local/bin/certctl reload *, /usr/local/bin/certctl issue *, /usr/local/bin/certctl renew, /usr/local/bin/certctl self-sign *, /usr/local/bin/certctl ca-show, /usr/local/bin/certctl csr-generate *, /usr/local/bin/certctl csr-show, /usr/local/bin/certctl import-signed *, /usr/local/bin/certctl import-pair *, /usr/local/bin/certctl disable
 SUDOERS
 chmod 0440 /etc/sudoers.d/vmapi
 

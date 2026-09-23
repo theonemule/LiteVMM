@@ -103,7 +103,7 @@ grep -Fqx 'VMAPI_TLS_CSR_FILE=' "$T/vmapi.conf"
 grep -Fqx 'VMAPI_TLS_CSR_KEY_FILE=' "$T/vmapi.conf"
 grep -Fqx 'VMAPI_TLS_CSR_DOMAIN=' "$T/vmapi.conf"
 grep -Fq ' ssl;' "$T/nginx/vmapi"
-grep -Fq 'ssl_certificate ' "$T/nginx/vmapi"
+grep -Fq 'ssl_certificate ' "$T/nginx/vmapi-tls.conf"
 active_cert=$(awk -F= '$1=="VMAPI_TLS_CERT_FILE"{print $2}' "$T/vmapi.conf")
 active_key=$(awk -F= '$1=="VMAPI_TLS_KEY_FILE"{print $2}' "$T/vmapi.conf")
 [[ $active_cert == "$T/tls/demo.example.com.crt" ]]
@@ -120,6 +120,13 @@ out=$(run_certctl import-pair "$T/direct.crt" "$T/direct.key" direct.example.com
 [[ $out == *'"mode":"imported"'* && $out == *'"domain":"direct.example.com"'* && $out == *'"reload_required":true'* ]]
 grep -Fq 'VMAPI_TLS_CSR_FILE=' "$T/vmapi.conf"
 
+out=$(run_certctl reload dual 5443)
+[[ $out == *'"tls_transport":"dual"'* && $out == *'"https_port":5443'* && $out == *'"reload_required":false'* ]]
+grep -Fq 'listen 127.0.0.1:5186;' "$T/nginx/vmapi"
+! grep -Fq 'listen 127.0.0.1:5186 ssl;' "$T/nginx/vmapi"
+grep -Fq 'listen 127.0.0.1:5443 ssl;' "$T/nginx/vmapi-tls.conf"
+! grep -Fq 'return 308 ' "$T/nginx/vmapi-tls.conf"
+
 openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=wrong.example.com' \
   -keyout "$T/wrong.key" -out "$T/wrong.crt" >/dev/null 2>&1
 if run_certctl import-pair "$T/direct.crt" "$T/wrong.key" wrong.example.com >/dev/null 2>&1; then
@@ -130,6 +137,10 @@ fi
 out=$(run_certctl issue le.example.com admin@example.com)
 [[ $out == *'"mode":"certbot"'* && $out == *'"domain":"le.example.com"'* && $out == *'"reload_required":true'* ]]
 [[ -f "$T/certbot/live/le.example.com/fullchain.pem" && -f "$T/certbot/live/le.example.com/privkey.pem" ]]
+out=$(run_certctl reload redirect 5444)
+[[ $out == *'"tls_transport":"redirect"'* && $out == *'"https_port":5444'* ]]
+grep -Fq 'listen 127.0.0.1:5444 ssl;' "$T/nginx/vmapi-tls.conf"
+grep -Fq 'return 308 https://le.example.com:5444$request_uri;' "$T/nginx/vmapi-tls.conf"
 run_certctl renew >/dev/null
 
 status=$(run_certctl status)
@@ -139,14 +150,18 @@ x=json.loads(sys.argv[1])
 assert x["tls_enabled"] is True
 assert x["reload_required"] is True
 assert x["mode"] == "certbot"
+assert x["tls_transport"] == "redirect"
+assert x["https_port"] == 5444
 assert x["domain"] == "le.example.com"
 assert x["certbot_available"] is True
 assert x["fingerprint_sha256"]
 assert x["expires"]
 PY
 
-out=$(run_certctl reload)
-[[ $out == *'"reload_required":false'* ]]
+out=$(run_certctl reload replace 5444)
+[[ $out == *'"reload_required":false'* && $out == *'"tls_transport":"replace"'* ]]
+grep -Fq 'listen 127.0.0.1:5186 ssl;' "$T/nginx/vmapi"
+! grep -Fq 'listen 127.0.0.1:5444 ssl;' "$T/nginx/vmapi-tls.conf"
 
 out=$(run_certctl disable)
 [[ $out == *'"tls_enabled":false'* ]]
