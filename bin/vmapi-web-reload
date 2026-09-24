@@ -72,6 +72,14 @@ lighttpd_pid() {
 
 reload_now() {
   local pid
+  # Serialize replacements: one API request can schedule several deferred
+  # reloads that fire together, and concurrent OpenRC graceful/start calls race
+  # on the pid file and leave Lighttpd running untracked.
+  local lock=${VMAPI_WEB_RELOAD_LOCK:-/run/vmapi-web-reload.lock}
+  [[ -w ${lock%/*} ]] || lock="${TMPDIR:-/tmp}/vmapi-web-reload.$(id -u).lock"
+  if command -v flock >/dev/null 2>&1 && exec 7>"$lock"; then
+    flock -w 60 7 || die 'Timed out waiting for another Lighttpd reload'
+  fi
   lighttpd -tt -f "$CONF" >/dev/null 2>&1 || die "Lighttpd rejected $CONF; the running server was left unchanged"
 
   # A native LiteVMM install is owned by the host service manager. Lighttpd's

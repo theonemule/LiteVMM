@@ -6,7 +6,7 @@ LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 source "$LIB"
 
 VMCTL=${VMCTL:-/usr/local/bin/vmctl}
-WEBSOCAT=${VMAPI_WEBSOCAT:-$(command -v websocat 2>/dev/null || printf '%s' /usr/local/bin/websocat)}
+WEBSOCAT=${VMAPI_WEBSOCAT:-$([[ -x /usr/local/bin/websocat ]] && printf %s /usr/local/bin/websocat || command -v websocat 2>/dev/null || printf %s /usr/local/bin/websocat)}
 STATE_DIR=${VMAPI_CONSOLE_STATE_DIR:-/run/vmapi/consoles}
 WEB_ROOT=${VMAPI_LIGHTTPD_ROOT:-/etc/lighttpd}
 WEB_RELOAD=${VMAPI_CONSOLE_WEB_RELOAD:-/usr/local/bin/vmapi-web-reload}

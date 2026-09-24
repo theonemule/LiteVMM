@@ -192,7 +192,9 @@ cmd_logs() {
     *) die "Unknown option: $1";;
   esac; done
   args+=(--tail "$tail"); [[ -n $since ]] && args+=(--since "$since"); $timestamps && args+=(--timestamps); $follow && args+=(--follow)
-  args+=("$name"); "$DOCKER_BIN" "${args[@]}"
+  # docker logs replays the container stdout and stderr streams on its own
+  # stdout/stderr. The API returns only stdout, so merge them here.
+  args+=("$name"); "$DOCKER_BIN" "${args[@]}" 2>&1
 }
 cmd_commit() {
   local name=${1:?} image=${2:?}; shift 2; require_docker; require_container "$name"; validate_image_ref "$image"

@@ -130,7 +130,7 @@ install_websocat() {
   asset="websocat.${arch}-unknown-linux-musl"
   work=$(mktemp -d); trap 'rm -rf -- "$work"' RETURN
   binary="$work/$asset"
-  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors --connect-timeout 20 --max-time 300 \
     -o "$binary" "https://github.com/vi/websocat/releases/download/v${WEBSOCAT_VERSION}/$asset"
   printf '%s  %s\n' "$sha" "$binary" | sha256sum -c -
   install -m 0755 "$binary" /usr/local/bin/websocat
@@ -151,7 +151,7 @@ install_wsvpn() {
   asset="wsvpn-linux-$arch"
   work=$(mktemp -d); trap 'rm -rf -- "$work"' RETURN
   binary="$work/$asset"
-  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors --connect-timeout 20 --max-time 300 \
     -o "$binary" "https://github.com/Doridian/wsvpn/releases/download/v${WSVPN_VERSION}/$asset"
   printf '%s  %s\n' "$sha" "$binary" | sha256sum -c -
   install -m 0755 "$binary" /usr/local/bin/wsvpn

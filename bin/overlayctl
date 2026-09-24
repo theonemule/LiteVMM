@@ -138,7 +138,9 @@ tunnel:
     fragmentation: true
 interface:
   name: "$(tap_name "$NAME")"
-  persist: false
+  # Keep the same TAP (and its bridge membership) across WebSocket reconnects.
+  # stop_one deletes it explicitly.
+  persist: true
 client:
   server: "$scheme://$PEER_HOST:$PEER_PORT/overlay/$NAME"
   auth-file: "$auth"
@@ -238,6 +240,12 @@ start_one() {
   stop_one "$NAME"
   local mode=$ROLE
   [[ $mode == hub ]] && mode=server || mode=client
+  # A WSVPN client only creates its TAP after reaching the hub. Pre-create the
+  # persistent TAP so a spoke starts (and bridges) locally even while the hub
+  # route is not live yet, e.g. during a coordinated create inside an API request.
+  if [[ $mode == client ]] && ! tap_is_tap "$NAME"; then
+    ip tuntap add dev "$(tap_name "$NAME")" mode tap
+  fi
   "$WSVPN" --mode "$mode" --config "$RUN/$NAME.yaml" </dev/null &
   local pid=$!; CHILDREN+=("$pid"); STARTED+=("$NAME")
   printf '%s\n' "$pid" > "$RUN/$NAME.pid"

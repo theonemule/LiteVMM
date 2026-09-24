@@ -6,7 +6,7 @@ LIB=${VMAPI_LIB:-/usr/local/lib/vmapi/common.sh}
 source "$LIB"
 
 PEERCTL=${VMAPI_PEERCTL:-/usr/local/bin/peerctl}
-WEBSOCAT=${VMAPI_WEBSOCAT:-$(command -v websocat 2>/dev/null || printf %s /usr/local/bin/websocat)}
+WEBSOCAT=${VMAPI_WEBSOCAT:-$([[ -x /usr/local/bin/websocat ]] && printf %s /usr/local/bin/websocat || command -v websocat 2>/dev/null || printf %s /usr/local/bin/websocat)}
 MOUNT_BIN=${VMAPI_MOUNT_BIN:-/bin/mount}
 UMOUNT_BIN=${VMAPI_UMOUNT_BIN:-/bin/umount}
 EXPORTFS=${VMAPI_EXPORTFS:-$(command -v exportfs 2>/dev/null || printf %s /usr/sbin/exportfs)}
@@ -144,19 +144,22 @@ wait_port(){ local p=$1; for _ in {1..100}; do port_in_use "$p" && return 0; sle
 is_mounted(){ local mp=$1; awk -v p="$mp" '$2==p && $3 ~ /^nfs/ {found=1} END{exit !found}' /proc/mounts; }
 
 start_tunnel(){
-  local peer=$1 port=$2 profile endpoint user pass ca_file header scheme host remote_port pf lf legacy_pf url
+  local peer=$1 port=$2 profile endpoint user pass ca_file auth_file scheme host remote_port pf lf legacy_pf url
   local -a args env_args
   need_cmd "$WEBSOCAT"; need_cmd "$SS"
   profile=$(peer_profile "$peer"); endpoint=$(json_field "$profile" endpoint); user=$(json_field "$profile" username); pass=$(json_field "$profile" password); ca_file=$(json_field "$profile" ca_file)
   [[ -n $user && -n $pass ]] || die 'Peer backplane credentials are unavailable'
   [[ $endpoint =~ ^(wss?)://([A-Za-z0-9.-]+)(:([0-9]{1,5}))?(/.*)?$ ]] || die 'Peer has no WebSocket-capable endpoint'
   scheme=${BASH_REMATCH[1]}; host=${BASH_REMATCH[2]}; remote_port=${BASH_REMATCH[4]}; [[ -n $remote_port ]] || { [[ $scheme == wss ]] && remote_port=443 || remote_port=80; }
-  header=$(printf '%s:%s' "$user" "$pass"|base64|tr -d '\n')
   pf=$(pid_file "$peer"); legacy_pf=$(legacy_pid_file "$peer"); lf=$(log_file "$peer")
   kill_pidfile "$pf"; kill_pidfile "$legacy_pf"; rm -f -- "$RUN_ROOT/${peer,,}.gost.yaml"
   port_in_use "$port" && die "Backplane loopback port is already in use: $port"
   url="$scheme://$host:$remote_port/backplane/storage"
-  args=(--binary --exit-on-eof --ping-interval 20 --basic-auth "$header")
+  # websocat base64-encodes --basic-auth-file content itself. Keep the paired
+  # credential in a root-only file, never on the world-readable command line.
+  auth_file="$RUN_ROOT/${peer,,}.auth"
+  ( umask 077; printf '%s:%s' "$user" "$pass" > "$auth_file" )
+  args=(--binary --exit-on-eof --ping-interval 20 --basic-auth-file "$auth_file")
   env_args=()
   if [[ $scheme == wss ]]; then
     args+=(--tls-domain "$host")
@@ -236,7 +239,7 @@ disconnect_peer(){
   if is_mounted "$mp"; then "$UMOUNT_BIN" "$mp" || "$UMOUNT_BIN" -l "$mp" || true; fi
   kill_pidfile "$(pid_file "$peer")"
   kill_pidfile "$(legacy_pid_file "$peer")"
-  $forget && rm -f -- "$(state_file "$peer")" "$(log_file "$peer")" "$RUN_ROOT/${peer,,}.gost.log" "$RUN_ROOT/${peer,,}.gost.yaml"
+  $forget && rm -f -- "$(state_file "$peer")" "$(log_file "$peer")" "$RUN_ROOT/${peer,,}.auth" "$RUN_ROOT/${peer,,}.gost.log" "$RUN_ROOT/${peer,,}.gost.yaml"
   rmdir "$mp" 2>/dev/null || true
 }
 
