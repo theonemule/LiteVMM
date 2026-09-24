@@ -65,7 +65,7 @@ wait_mirror
 rc=0; backup live_disk_copy demo "$T/out" 2>"$T/busy.err" || rc=$?
 [[ $rc -ne 0 ]]
 grep -Fq "Node 'drive0' is busy: block device is in use by block job: mirror" "$T/busy.err"
-! grep -Fq virtio0 "$T/busy.err"
+! grep -Fq virtio0 "$T/busy.err" || { echo "negative assertion failed: tests/vmbackupctl-live-test.sh:68" >&2; exit 1; }
 
 # 2. The cmd_create sequence: pause replication, copy, resume. Checks run inside
 #    the holder process while the pause is in effect.
@@ -89,9 +89,9 @@ wait_mirror
 # 3. A pause whose holder died without unpausing is stale: the daemon resumes.
 sleep 300 & SLEEPER=$!
 repl pause demo "$SLEEPER" >/dev/null
-! mirror_running
+! mirror_running || { echo "negative assertion failed: tests/vmbackupctl-live-test.sh:92" >&2; exit 1; }
 repl resume demo >/dev/null
-! mirror_running
+! mirror_running || { echo "negative assertion failed: tests/vmbackupctl-live-test.sh:94" >&2; exit 1; }
 kill "$SLEEPER"; wait "$SLEEPER" 2>/dev/null || true; SLEEPER=''
 repl resume demo >/dev/null
 [[ ! -e $VMAPI_REPLICATION_JOB_ROOT/demo/paused ]]

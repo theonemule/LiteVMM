@@ -32,7 +32,7 @@ grep -Fq 'image tag alpine:latest 127.0.0.1:5000/team/local:latest' "$T/state/do
 grep -Fq 'image push 127.0.0.1:5000/team/local:latest' "$T/state/docker.log"
 
 # The registry is optional distribution infrastructure, not LiteVMM federation.
-! grep -Eq 'peer-(pull|push|fetch)|shared-list|image save|image load|docker-images' "$ROOT/bin/registryctl"
+! grep -Eq 'peer-(pull|push|fetch)|shared-list|image save|image load|docker-images' "$ROOT/bin/registryctl" || { echo "negative assertion failed: tests/registryctl-test.sh:35" >&2; exit 1; }
 
 out=$(env "${common[@]}" bash "$ROOT/bin/registryctl" disable)
 [[ $out == *'"enabled":false'* ]]
@@ -53,7 +53,7 @@ lt=(VMAPI_CONFIG=/dev/null VMAPI_LIB="$ROOT/lib/common.sh" DOCKER_BIN="$T/bin/do
 out=$(env "${lt[@]}" bash "$ROOT/bin/registryctl" enable testregistry)
 [[ $out == *'"enabled":true'* ]]
 grep -Fq 'proxy.server' "$T/lighttpd/conf.d/zz-vmapi-registry.conf"
-! grep -Fq 'proxy.header' "$T/lighttpd/conf.d/zz-vmapi-registry.conf"
+! grep -Fq 'proxy.header' "$T/lighttpd/conf.d/zz-vmapi-registry.conf" || { echo "negative assertion failed: tests/registryctl-test.sh:56" >&2; exit 1; }
 env "${lt[@]}" bash "$ROOT/bin/registryctl" disable >/dev/null
 [[ ! -s "$T/lighttpd/conf.d/zz-vmapi-registry.conf" ]]
 if env "${lt[@]}" FAKE_LIGHTTPD_FAIL=1 bash "$ROOT/bin/registryctl" enable testregistry >/dev/null 2>&1; then echo 'expected enable to fail'; exit 1; fi

@@ -142,7 +142,7 @@ grep -Fq '"restored":true' "$T/restore.out"
 grep -Fq '"source":"continuous-replica"' "$T/restore.out"
 grep -qx 'replica-restored' "$T/vm/disk0.qcow2"
 grep -qx 'replica-restored' "$REMOTE/disk0.qcow2"
-! find "$T/vm" -maxdepth 1 \( -name '*.replica-restore.*' -o -name '*.pre-replica-restore.*' \) | grep -q .
+! find "$T/vm" -maxdepth 1 \( -name '*.replica-restore.*' -o -name '*.pre-replica-restore.*' \) | grep -q . || { echo "negative assertion failed: tests/replicationctl-test.sh:145" >&2; exit 1; }
 
 # State written by the buggy parser (file length recorded as the size) heals
 # on resume: state, peer metadata and the replica are all corrected.

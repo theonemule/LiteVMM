@@ -98,7 +98,7 @@ out=$(printf '%s' "$remote_body" | \
   bash "$ROOT/cgi/api.cgi")
 printf '%s\n' "$out" | grep -Fq 'Status: 201 Created'
 grep -Fq "create mesh2 --bridge brmesh2 --role spoke --peer $caller --mtu 1400" "$T/state/overlay.log"
-! grep -Fq 'cccccccccccccccccccccccccccccccc' "$T/state/overlay.log"
+! grep -Fq 'cccccccccccccccccccccccccccccccc' "$T/state/overlay.log" || { echo "negative assertion failed: tests/overlay-broker-test.sh:101" >&2; exit 1; }
 
 : > "$T/state/proxy.log"
 out=$(cgi DELETE /api/overlays/mesh1 '')

@@ -93,7 +93,7 @@ response=$(node hub "$ROOT/bin/peerctl" accept "$request" hub https://192.0.2.1:
 node spoke "$ROOT/bin/peerctl" complete "$response" >/dev/null
 hid=$(cat "$T/hub/node-id"); sid=$(cat "$T/spoke/node-id")
 mkdir -p "$T/hub/lighttpd/conf.d" "$T/hub/www"
-sed -e "s|@NOVNC_ROOT@|$T/hub/www|g" -e "s|/etc/vmapi-peer.htpasswd|$T/hub/passwd|g" "$ROOT/lighttpd/vmapi.conf" > "$T/hub/lighttpd/conf.d/vmapi.conf"
+sed -e "s|@NOVNC_ROOT@|$T/hub/www|g" -e "s|/etc/vmapi-peer.htpasswd|$T/hub/passwd|g" -e "s|/run/fcgiwrap-vmapi.sock|$T/hub/fcgi.sock|g" "$ROOT/lighttpd/vmapi.conf" > "$T/hub/lighttpd/conf.d/vmapi.conf"
 cat > "$T/hub/lighttpd/lighttpd.conf" <<CONF
 server.document-root = "$T/hub/www"
 server.bind = "192.0.2.1"
@@ -106,7 +106,7 @@ CONF
 node hub "$ROOT/bin/overlayctl" create demo --bridge br-demo --role hub --peer "$sid" --staged > "$T/hub-created.json"
 node spoke "$ROOT/bin/overlayctl" create demo --bridge br-demo --role spoke --peer "$hid" --staged > "$T/spoke-created.json"
 [[ ! -e $T/spoke/lighttpd ]]
-! grep -q lighttpd "$T/spoke/service.log"
+! grep -q lighttpd "$T/spoke/service.log" || { echo "negative assertion failed: tests/overlay-netns-test.sh:109" >&2; exit 1; }
 python3 - "$T" <<'PY'
 import json,sys,yaml
 from pathlib import Path
@@ -141,7 +141,7 @@ sleep 2
 node spoke "$ROOT/bin/overlayctl" validate demo
 # WSVPN must expose only its loopback listener; Lighttpd is the only underlay-facing endpoint.
 ip netns exec "$H" ss -lntu > "$T/listeners"
-! grep -E '0.0.0.0:(18[0-9]{3}|[23][0-9]{4}|[34][0-9]{4})' "$T/listeners"
+! grep -E '0.0.0.0:(18[0-9]{3}|[23][0-9]{4}|[34][0-9]{4})' "$T/listeners" || { echo "negative assertion failed: tests/overlay-netns-test.sh:144" >&2; exit 1; }
 grep -Eq '127.0.0.1:(18[0-9]{3}|2[0-9]{4})' "$T/listeners"
 node hub "$ROOT/bin/overlayctl" activate demo >/dev/null
 node spoke "$ROOT/bin/overlayctl" activate demo >/dev/null
@@ -154,6 +154,15 @@ ip netns exec "$S" ping -c 3 -W 2 198.18.0.1
 # and a smaller overlay silently dropped their full-size (e.g. routed TCP) packets.
 [[ $(ip netns exec "$H" cat /sys/class/net/br-demo/mtu) == 1500 && $(ip netns exec "$S" cat /sys/class/net/br-demo/mtu) == 1500 ]]
 ip netns exec "$S" ping -c 2 -s 1472 -M do -W 3 198.18.0.1
+# A hub Lighttpd restart (e.g. any route change or certificate reload) forces a
+# WSVPN reconnect. The spoke must keep the same bridged TAP and recover by itself.
+spoke_ifindex=$(ip netns exec "$S" cat /sys/class/net/vmo-demo/ifindex)
+node hub "$T/service" lighttpd restart
+recovered=false
+for _ in {1..40}; do ip netns exec "$S" ping -c 1 -W 1 198.18.0.1 >/dev/null 2>&1 && { recovered=true; break; }; sleep .5; done
+[[ $recovered == true ]] || { echo 'overlay did not recover after a hub Lighttpd restart' >&2; exit 1; }
+[[ $(ip netns exec "$S" cat /sys/class/net/vmo-demo/ifindex) == "$spoke_ifindex" ]] || { echo 'spoke TAP was recreated on reconnect' >&2; exit 1; }
+[[ $(basename "$(ip netns exec "$S" readlink /sys/class/net/vmo-demo/master)") == br-demo ]] || { echo 'spoke TAP lost its bridge on reconnect' >&2; exit 1; }
 # set-mtu changes an existing overlay on each member host, bridge ports included.
 node hub "$ROOT/bin/overlayctl" set-mtu demo 1400 >/dev/null; node spoke "$ROOT/bin/overlayctl" set-mtu demo 1400 >/dev/null
 for _ in {1..30}; do ip netns exec "$S" ping -c 1 -W 1 198.18.0.1 >/dev/null 2>&1 && break; sleep .5; done
@@ -202,5 +211,5 @@ node hub "$ROOT/bin/peerctl" revoke "$sid"
 # for it to bind, so give the restart triggered by revocation a moment.
 code=000; for _ in {1..50}; do code=$(curl_spoke --user "$RELAY_USER:$RELAY_PASSWORD" -o /dev/null -w '%{http_code}' https://192.0.2.1:8443/peer-api 2>/dev/null || true); [[ $code == 000 ]] || break; sleep .1; done
 [[ $code == 401 ]]
-! ip -n "$H" link show vmo-demo >/dev/null 2>&1
+! ip -n "$H" link show vmo-demo >/dev/null 2>&1 || { echo "negative assertion failed: tests/overlay-netns-test.sh:205" >&2; exit 1; }
 echo 'overlay netns: PASS (Lighttpd HTTPS/WSS TLS-offload/auth boundary, WSVPN TAP ARP/ICMP/raw EtherType 0x8137, 1500-byte frames, set-mtu, activation, child cleanup, revocation, no spoke Lighttpd)'

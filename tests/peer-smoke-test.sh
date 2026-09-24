@@ -3,6 +3,8 @@
 # Scope: creates isolated fixtures or uses the supplied HTTP endpoint; it does not modify repository files.
 # Run directly with Bash; a non-zero exit status identifies the failed assertion.
 set -Eeuo pipefail
+# Never read the host's real /etc/vmapi/vmapi.conf; it overrides the test's TLS settings.
+export VMAPI_CONFIG=/dev/null
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d)
 trap 'rm -rf -- "$T"' EXIT

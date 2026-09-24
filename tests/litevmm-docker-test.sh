@@ -50,7 +50,7 @@ grep -Fq 'fed images' "$LOG"
 : >"$LOG"
 out=$(bash "$ROOT/bin/litevmm-docker" pull remote/app:2)
 grep -Fq 'docker pull remote/app:2' "$LOG"
-! grep -Fq 'rootfs prepare' "$LOG"
+! grep -Fq 'rootfs prepare' "$LOG" || { echo "negative assertion failed: tests/litevmm-docker-test.sh:53" >&2; exit 1; }
 
 # Remote run is rewritten to the metadata stub plus LiteVMM remote-rootfs runtime.
 : >"$LOG"
@@ -65,18 +65,18 @@ grep -Fq -- 'litevmm-remote/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:stub echo hi' "$LOG
 : >"$LOG"
 out=$(bash "$ROOT/bin/litevmm-docker" run --rm local/app:1 echo hi)
 grep -Fq 'docker run --rm local/app:1 echo hi' "$LOG"
-! grep -Fq 'rootfs prepare' "$LOG"
+! grep -Fq 'rootfs prepare' "$LOG" || { echo "negative assertion failed: tests/litevmm-docker-test.sh:68" >&2; exit 1; }
 
 # Explicit pull/platform/runtime semantics are never silently overridden.
 : >"$LOG"
 out=$(bash "$ROOT/bin/litevmm-docker" run --pull=never remote/app:2 echo hi)
 grep -Fq 'docker run --pull=never remote/app:2 echo hi' "$LOG"
-! grep -Fq 'rootfs prepare' "$LOG"
+! grep -Fq 'rootfs prepare' "$LOG" || { echo "negative assertion failed: tests/litevmm-docker-test.sh:74" >&2; exit 1; }
 
 : >"$LOG"
 out=$(bash "$ROOT/bin/litevmm-docker" run --platform linux/arm64 remote/app:2 echo hi)
 grep -Fq 'docker run --platform linux/arm64 remote/app:2 echo hi' "$LOG"
-! grep -Fq 'rootfs prepare' "$LOG"
+! grep -Fq 'rootfs prepare' "$LOG" || { echo "negative assertion failed: tests/litevmm-docker-test.sh:79" >&2; exit 1; }
 
 : >"$LOG"
 out=$(bash "$ROOT/bin/litevmm-docker" ps)

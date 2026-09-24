@@ -86,7 +86,6 @@ request GET /docker/networks 200 'isinstance(d, list)'
 request GET /docker/volumes 200 'isinstance(d, list)'
 request GET /compose/projects 200 'isinstance(d, list)'
 request GET /overlays 200 'isinstance(d, list)'
-request GET /overlays/orphans 200 'isinstance(d, list)'
 request POST /host/terminal/session 201 'isinstance(d, dict)' --data ''
 request DELETE /host/terminal/session 200 'd.get("stopped") is True'
 

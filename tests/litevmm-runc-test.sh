@@ -61,7 +61,7 @@ grep -Fq "umount $T/bundle/rootfs" "$T/log"
 : >"$T/log"
 bash "$ROOT/bin/litevmm-runc" create --bundle "$T/local-bundle" local
 grep -Fq 'runc create' "$T/log"
-! grep -Fq 'mount ' "$T/log"
-! grep -Fq 'rootfsctl ' "$T/log"
+! grep -Fq 'mount ' "$T/log" || { echo "negative assertion failed: tests/litevmm-runc-test.sh:64" >&2; exit 1; }
+! grep -Fq 'rootfsctl ' "$T/log" || { echo "negative assertion failed: tests/litevmm-runc-test.sh:65" >&2; exit 1; }
 
 echo 'LiteVMM remote OCI runtime: PASS'

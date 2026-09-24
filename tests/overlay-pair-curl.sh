@@ -49,11 +49,12 @@ hcurl -f -X POST "$hub/docker/containers/$hub_box/start" --data '' >/dev/null
 # this bridge.  Fail early only if the DHCP server did not remain running.
 hub_state=$(hcurl -f "$hub/docker/containers/$hub_box" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["State"]["Status"])')
 [[ $hub_state == running ]] || { echo "Hub DHCP endpoint is not running (state=$hub_state)"; hcurl "$hub/docker/containers/$hub_box/logs?tail=50" || true; exit 1; }
-scmd="udhcpc -n -q -s /bin/true -i eth0 -t 2 -T 2; ping -c 3 $hub_ip"
+scmd="udhcpc -B -n -q -s /bin/true -i eth0 -t 2 -T 2; ping -c 3 $hub_ip"
 scurl -f -X POST "$spoke/docker/containers" --data-urlencode "name=$spoke_box" --data-urlencode 'image=alpine:3.20' --data-urlencode "network=$spoke_net" --data-urlencode "ip=$spoke_ip" --data 'cmd_0=sh' --data 'cmd_1=-ec' --data-urlencode "cmd_2=$scmd" >/dev/null
 scurl -f -X POST "$spoke/docker/containers/$spoke_box/start" --data '' >/dev/null
 sleep 8
 scurl -f "$spoke/docker/containers/$spoke_box/logs?tail=50" > "$tmp/ping.log"
 grep -Eq '0% packet loss|3 packets received|3 received' "$tmp/ping.log" || { echo "Overlay ping failed ($spoke -> $hub_ip)"; cat "$tmp/ping.log"; echo 'Hub overlay log:'; hcurl "$hub/logs?source=overlay&limit=80" || true; echo 'Spoke overlay log:'; scurl "$spoke/logs?source=overlay&limit=80" || true; exit 1; }
-grep -Eq "lease of $lease_start obtained|lease of $lease_start" "$tmp/ping.log" || { echo "Overlay DHCP broadcast failed (expected a lease of $lease_start)"; cat "$tmp/ping.log"; echo 'Hub DHCP log:'; hcurl "$hub/docker/containers/$hub_box/logs?tail=50" || true; exit 1; }
+# dnsmasq picks the address from a hash of the client MAC, so accept any address in the pool.
+grep -Eq "lease of 10\.251\.$octet\.1(0[0-9]|10) obtained" "$tmp/ping.log" || { echo "Overlay DHCP broadcast failed (expected a lease in $lease_start-$lease_end)"; cat "$tmp/ping.log"; echo 'Hub DHCP log:'; hcurl "$hub/docker/containers/$hub_box/logs?tail=50" || true; exit 1; }
 echo "PASS: authenticated hub/spoke TAP carried DHCP broadcast, ARP resolution, and ICMP from $spoke_ip to distinct peer endpoint $hub_ip"

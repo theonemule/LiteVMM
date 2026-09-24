@@ -6,7 +6,8 @@ trap 'sudo -n rm -rf "$T" >/dev/null 2>&1 || rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/nginx" "$T/le"
 cat > "$T/vmapi.conf" <<CFG
 VMAPI_PROFILE=virtualization
-VMAPI_HTTP_PORT=5186
+VMAPI_HTTP_PORT=45186
+VMAPI_HTTPS_PORT=45187
 VMAPI_TLS_ENABLED=false
 VMAPI_TLS_RELOAD_REQUIRED=false
 VMAPI_TLS_MODE=none
@@ -23,7 +24,7 @@ VMAPI_CERTBOT_LOGS_DIR=$T/certbot-logs
 CFG
 cat > "$T/nginx/vmapi" <<'NGINX'
 server {
-    listen 127.0.0.1:5186;
+    listen 127.0.0.1:45186;
     server_name _;
 }
 NGINX
@@ -122,10 +123,10 @@ grep -Fq 'VMAPI_TLS_CSR_FILE=' "$T/vmapi.conf"
 
 out=$(run_certctl reload dual 5443)
 [[ $out == *'"tls_transport":"dual"'* && $out == *'"https_port":5443'* && $out == *'"reload_required":false'* ]]
-grep -Fq 'listen 127.0.0.1:5186;' "$T/nginx/vmapi"
-! grep -Fq 'listen 127.0.0.1:5186 ssl;' "$T/nginx/vmapi"
+grep -Fq 'listen 127.0.0.1:45186;' "$T/nginx/vmapi"
+! grep -Fq 'listen 127.0.0.1:45186 ssl;' "$T/nginx/vmapi" || { echo "negative assertion failed: tests/certctl-test.sh:127" >&2; exit 1; }
 grep -Fq 'listen 127.0.0.1:5443 ssl;' "$T/nginx/vmapi-tls.conf"
-! grep -Fq 'return 308 ' "$T/nginx/vmapi-tls.conf"
+! grep -Fq 'return 308 ' "$T/nginx/vmapi-tls.conf" || { echo "negative assertion failed: tests/certctl-test.sh:129" >&2; exit 1; }
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=wrong.example.com' \
   -keyout "$T/wrong.key" -out "$T/wrong.crt" >/dev/null 2>&1
@@ -160,12 +161,12 @@ PY
 
 out=$(run_certctl reload replace 5444)
 [[ $out == *'"reload_required":false'* && $out == *'"tls_transport":"replace"'* ]]
-grep -Fq 'listen 127.0.0.1:5186 ssl;' "$T/nginx/vmapi"
-! grep -Fq 'listen 127.0.0.1:5444 ssl;' "$T/nginx/vmapi-tls.conf"
+grep -Fq 'listen 127.0.0.1:45186 ssl;' "$T/nginx/vmapi"
+! grep -Fq 'listen 127.0.0.1:5444 ssl;' "$T/nginx/vmapi-tls.conf" || { echo "negative assertion failed: tests/certctl-test.sh:165" >&2; exit 1; }
 
 out=$(run_certctl disable)
 [[ $out == *'"tls_enabled":false'* && $out == *'"tls_disabled_explicitly":true'* ]]
-! grep -Fq 'listen 127.0.0.1:5186 ssl;' "$T/nginx/vmapi"
+! grep -Fq 'listen 127.0.0.1:45186 ssl;' "$T/nginx/vmapi" || { echo "negative assertion failed: tests/certctl-test.sh:169" >&2; exit 1; }
 grep -Fqx 'VMAPI_TLS_DISABLED_EXPLICITLY=true' "$T/vmapi.conf"
 [[ -s "$T/certbot/live/le.example.com/fullchain.pem" ]]
 
@@ -181,7 +182,7 @@ MOCK
 chmod +x "$T/lightbin/"*
 : > "$T/light/lighttpd.conf"
 run_light_certctl(){
-  sudo -n env     PATH="$T/lightbin:/usr/local/bin:/usr/bin:/bin"     VMAPI_CONFIG="$T/vmapi.conf"     VMAPI_TLS_ROOT="$T/tls"     VMAPI_LIGHTTPD_TLS_CONF="$T/light/10-tls.conf"     VMAPI_LIGHTTPD_PEM="$T/light/server.pem"     VMAPI_LIGHTTPD_MAIN_CONF="$T/light/lighttpd.conf"     bash "$ROOT/bin/certctl" "$@"
+  sudo -n env     VMAPI_WEB_RELOAD="$T/no-installed-web-reload"     PATH="$T/lightbin:/usr/local/bin:/usr/bin:/bin"     VMAPI_CONFIG="$T/vmapi.conf"     VMAPI_TLS_ROOT="$T/tls"     VMAPI_LIGHTTPD_TLS_CONF="$T/light/10-tls.conf"     VMAPI_LIGHTTPD_PEM="$T/light/server.pem"     VMAPI_LIGHTTPD_MAIN_CONF="$T/light/lighttpd.conf"     bash "$ROOT/bin/certctl" "$@"
 }
 out=$(run_light_certctl import-pair "$T/direct.crt" "$T/direct.key" direct.example.com)
 [[ $out == *'"platform":"alpine"'* && $out == *'"tls_enabled":true'* && $out == *'"reload_required":true'* ]]

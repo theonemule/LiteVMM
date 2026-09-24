@@ -22,7 +22,7 @@ grep -Fq 'set_host_config VMAPI_BACKPLANE_NFS_PORT 2049' "$ROOT/install.sh"
 # NFS implementation is selected by deployment form, not workload profile.
 # The native installer must force kernel NFS independently of PROFILE.
 grep -Fq 'Workload profile selection must never change the NFS' "$ROOT/install.sh"
-! grep -Eq 'PROFILE.*VMAPI_BACKPLANE_NFS_BACKEND|VMAPI_BACKPLANE_NFS_BACKEND.*PROFILE' "$ROOT/install.sh"
+! grep -Eq 'PROFILE.*VMAPI_BACKPLANE_NFS_BACKEND|VMAPI_BACKPLANE_NFS_BACKEND.*PROFILE' "$ROOT/install.sh" || { echo "negative assertion failed: tests/syntax-test.sh:25" >&2; exit 1; }
 grep -Fq 'FROM alpine:3.24' "$ROOT/Dockerfile"
 grep -Fq 'EXPOSE 5186 5187' "$ROOT/Dockerfile"
 grep -Fq 'VMAPI_HTTPS_PORT=5187' "$ROOT/docker/storage/vmapi.conf"
@@ -68,7 +68,7 @@ grep -Fq 'docker-rootfsctl' "$ROOT/install.sh"
 grep -Fq 'litevmm-runc' "$ROOT/install.sh"
 grep -Fq 'VMAPI_DOCKER_REMOTE_RUNTIME=litevmm-remote' "$ROOT/etc/vmapi.conf"
 grep -Fq 'docker-rootfs' "$ROOT/bin/backplanectl"
-! grep -Fq 'docker-images' "$ROOT/bin/backplanectl"
+! grep -Fq 'docker-images' "$ROOT/bin/backplanectl" || { echo "negative assertion failed: tests/syntax-test.sh:71" >&2; exit 1; }
 grep -Fq 'LiteVMM Docker CLI federation shim' "$ROOT/bin/litevmm-docker"
 grep -Fq 'VMAPI_DOCKER_FEDERATION=true' "$ROOT/etc/vmapi.conf"
 grep -Fq 'type=nfs' "$ROOT/www/app.js"
@@ -79,7 +79,7 @@ grep -Fq 'VMAPI_BACKPLANE_NFS_BIND=127.0.0.1' "$ROOT/etc/vmapi.conf"
 grep -Fq 'install_websocat' "$ROOT/install.sh"
 grep -Fq 'install_wsvpn' "$ROOT/install.sh"
 grep -Fq 'COPY --from=websocat /websocat /usr/local/bin/websocat' "$ROOT/Dockerfile"
-! grep -Fq 'COPY --from=gost' "$ROOT/Dockerfile"
+! grep -Fq 'COPY --from=gost' "$ROOT/Dockerfile" || { echo "negative assertion failed: tests/syntax-test.sh:82" >&2; exit 1; }
 grep -Fq 'allow-unknown-ether-types: true' "$ROOT/bin/overlayctl"
 grep -Fq 'Lighttpd terminates TLS and authenticates before proxying plaintext WebSocket to WSVPN' "$ROOT/bin/overlayctl"
 grep -Fq 'ws-l:$WS_BIND:$WS_PORT' "$ROOT/bin/backplanectl"
@@ -104,9 +104,9 @@ grep -Fq '/admin/certificates/import' "$ROOT/www/app.js"
 grep -Fq "admin: {title:'Certificate management'" "$ROOT/www/app.js"
 grep -Fq 'overviewCertificatesBtn' "$ROOT/www/app.js"
 grep -Fq 'overviewSystemInfoBtn' "$ROOT/www/app.js"
-! grep -Fq '>Admin</a>' "$ROOT/www/index.html"
-! grep -Fq '>System information</a>' "$ROOT/www/index.html"
-! grep -Fq -- '--certbot' "$ROOT/install.sh"
+! grep -Fq '>Admin</a>' "$ROOT/www/index.html" || { echo "negative assertion failed: tests/syntax-test.sh:107" >&2; exit 1; }
+! grep -Fq '>System information</a>' "$ROOT/www/index.html" || { echo "negative assertion failed: tests/syntax-test.sh:108" >&2; exit 1; }
+! grep -Fq -- '--certbot' "$ROOT/install.sh" || { echo "negative assertion failed: tests/syntax-test.sh:109" >&2; exit 1; }
 grep -Fq 'apt-get install -y --no-install-recommends certbot' "$ROOT/install.sh"
 grep -Fq 'apk add --no-cache certbot' "$ROOT/install.sh"
 grep -Fq 'csr-generate' "$ROOT/bin/certctl"

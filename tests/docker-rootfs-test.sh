@@ -114,7 +114,7 @@ out=$(bash "$ROOT/bin/docker-rootfsctl" prepare remote/app:2)
 [[ "$out" == *"\"lowerdir\":\"$T/peer-shared/$EID/rootfs\""* ]]
 [[ -s "$T/state/stub" ]]
 grep -Fq 'image import' "$T/docker.log"
-! grep -Eq 'image (pull|save|load)' "$T/docker.log"
+! grep -Eq 'image (pull|save|load)' "$T/docker.log" || { echo "negative assertion failed: tests/docker-rootfs-test.sh:117" >&2; exit 1; }
 
 # dockerctl uses the same zero-copy preparation path for UI/API container create.
 export VMAPI_DOCKER_ROOTFSCTL="$ROOT/bin/docker-rootfsctl"
@@ -123,7 +123,7 @@ bash "$ROOT/bin/dockerctl" create web remote/app:2 --env MODE=test >/dev/null
 grep -Fq -- '--runtime litevmm-remote' "$T/docker.log"
 grep -Fq -- "--annotation io.litevmm.remote.lowerdir=$T/peer-shared/$EID/rootfs" "$T/docker.log"
 grep -Fq -- 'litevmm-remote/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:stub' "$T/docker.log"
-! grep -Eq 'image (pull|save|load)' "$T/docker.log"
+! grep -Eq 'image (pull|save|load)' "$T/docker.log" || { echo "negative assertion failed: tests/docker-rootfs-test.sh:126" >&2; exit 1; }
 
 # Conflicting tags across peers are never selected silently.
 PEER2=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

@@ -61,7 +61,7 @@ run_args=$(env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=debian ROOT="$ROOT" bash -
 # Alpine/BusyBox cron uses root's user crontab and must not contain a user field.
 env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupctl" schedule demo '23 4 * * 1' --label weekly --destination "$T/backups"
 grep -Eq '^23 4 \* \* 1 .*/vmbackupctl scheduled-run demo weekly >> .*demo-weekly.log 2>&1 # vmapi-backup:demo:weekly$' "$T/crontabs/root"
-! grep -Eq '^23 4 \* \* 1 root ' "$T/crontabs/root"
+! grep -Eq '^23 4 \* \* 1 root ' "$T/crontabs/root" || { echo "negative assertion failed: tests/backup-schedule-test.sh:64" >&2; exit 1; }
 
 # Service state is determined through OpenRC itself, not pgrep. Minimal Alpine
 # installs do not necessarily provide procps/pgrep even though crond is healthy.
@@ -85,7 +85,11 @@ cat > "$T/mockbin/crond" <<'MOCK'
 #!/usr/bin/env bash
 exit 0
 MOCK
-chmod +x "$T/mockbin/rc-service" "$T/mockbin/rc-update" "$T/mockbin/crond"
+# pidof/pgrep must report the mock crond, never the host's real one.
+for probe in pidof pgrep; do
+  printf '#!/usr/bin/env bash\n[[ -f ${VMAPI_CRON_STATE:-/nonexistent} ]]\n' > "$T/mockbin/$probe"
+done
+chmod +x "$T/mockbin/rc-service" "$T/mockbin/rc-update" "$T/mockbin/crond" "$T/mockbin/pidof" "$T/mockbin/pgrep"
 rm -f "$T/crond.state" "$T/rc-update.log"
 runtime_list=$(env "${common[@]}" VMAPI_BACKUP_SKIP_CRON_SERVICE=false VMAPI_BACKUP_CRON_STYLE=alpine \
   VMAPI_CRON_STATE="$T/crond.state" VMAPI_CRON_UPDATE_LOG="$T/rc-update.log" PATH="$T/mockbin:$PATH" \
@@ -100,7 +104,7 @@ env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupctl" s
 grep -q '# vmapi-backup:demo:nightly' "$T/crontabs/root"
 grep -q '# vmapi-backup:demo:weekly' "$T/crontabs/root"
 env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupctl" unschedule demo weekly
-! grep -q '# vmapi-backup:demo:weekly' "$T/crontabs/root"
+! grep -q '# vmapi-backup:demo:weekly' "$T/crontabs/root" || { echo "negative assertion failed: tests/backup-schedule-test.sh:107" >&2; exit 1; }
 [[ ! -e $T/schedules/demo-weekly ]]
 
 # Alpine crontab hygiene (BusyBox crond reloads whenever /etc/crontabs changes).
@@ -112,7 +116,7 @@ alp=(env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=alpine bash "$ROOT/bin/vmbackupc
 grep -qx '\*/15 \* \* \* \* run-parts /etc/periodic/15min' "$T/crontabs/root"   # system entries survive
 [[ $(tail -c 1 "$T/crontabs/root" | od -An -c | tr -d ' ') == '\n' ]]                # every line newline-terminated
 [[ $(grep -c '# vmapi-backup:demo:nightly$' "$T/crontabs/root") == 1 ]]              # exactly one entry per schedule
-! grep -q '/old/vmbackupctl' "$T/crontabs/root"                                       # stale entry replaced
+! grep -q '/old/vmbackupctl' "$T/crontabs/root" || { echo "negative assertion failed: tests/backup-schedule-test.sh:119" >&2; exit 1; }                                       # stale entry replaced
 # Listing again must not rewrite an unchanged crontab (no needless crond reloads).
 inode=$(stat -c %i "$T/crontabs/root"); "${alp[@]}" schedules >/dev/null; "${alp[@]}" schedules >/dev/null
 [[ $(stat -c %i "$T/crontabs/root") == "$inode" ]]
@@ -122,7 +126,7 @@ echo '5 5 * * * /bin/true # other' >> "$T/crontabs/root"
 grep -qx '5 5 \* \* \* /bin/true # other' "$T/crontabs/root"
 # Unschedule removes only its own entry and does not resurrect it.
 "${alp[@]}" unschedule demo extra
-! grep -q '# vmapi-backup:demo:extra' "$T/crontabs/root"
+! grep -q '# vmapi-backup:demo:extra' "$T/crontabs/root" || { echo "negative assertion failed: tests/backup-schedule-test.sh:129" >&2; exit 1; }
 grep -q '# vmapi-backup:demo:nightly$' "$T/crontabs/root"
 # A running crond is never "started" again (OpenRC logs a warning each time).
 : > "$T/crond.state"; : > "$T/rc-actions.log"
@@ -134,7 +138,7 @@ MOCK
 env "${common[@]}" VMAPI_BACKUP_SKIP_CRON_SERVICE=false VMAPI_BACKUP_CRON_STYLE=alpine VMAPI_CRON_STATE="$T/crond.state" \
   VMAPI_CRON_UPDATE_LOG="$T/rc-update.log" VMAPI_RC_ACTIONS="$T/rc-actions.log" PATH="$T/mockbin:$PATH" \
   bash "$ROOT/bin/vmbackupctl" schedules >/dev/null
-! grep -qE '^(start|restart)$' "$T/rc-actions.log"
+! grep -qE '^(start|restart)$' "$T/rc-actions.log" || { echo "negative assertion failed: tests/backup-schedule-test.sh:141" >&2; exit 1; }
 
 # Cron input is data, never shell syntax.
 if env "${common[@]}" VMAPI_BACKUP_CRON_STYLE=debian bash "$ROOT/bin/vmbackupctl" schedule demo '0 2 * * *; touch /tmp/nope' --label bad --destination "$T/backups" >/dev/null 2>&1; then

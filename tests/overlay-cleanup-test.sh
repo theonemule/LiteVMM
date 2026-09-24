@@ -67,7 +67,7 @@ run_delete clean1 >/dev/null
 mkdir -p "$T/sys/br-shared/brif"
 write_conf clean2 br-shared false
 run_delete clean2 >/dev/null
-! grep -Fq 'bridge-delete br-shared' "$T/netctl.log"
+! grep -Fq 'bridge-delete br-shared' "$T/netctl.log" || { echo "negative assertion failed: tests/overlay-cleanup-test.sh:70" >&2; exit 1; }
 
 # Owned bridge with another member is preserved.
 : > "$T/netctl.log"
@@ -75,7 +75,7 @@ mkdir -p "$T/sys/br-busy/brif" "$T/sys/member0"
 ln -s "$T/sys/member0" "$T/sys/br-busy/brif/member0"
 write_conf clean3 br-busy true
 run_delete clean3 >/dev/null
-! grep -Fq 'bridge-delete br-busy' "$T/netctl.log"
+! grep -Fq 'bridge-delete br-busy' "$T/netctl.log" || { echo "negative assertion failed: tests/overlay-cleanup-test.sh:78" >&2; exit 1; }
 
 # Legacy empty overlay bridge is treated as stale overlay residue and removed.
 : > "$T/netctl.log"
