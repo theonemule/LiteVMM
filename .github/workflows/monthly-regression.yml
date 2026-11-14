@@ -6,7 +6,7 @@ on:
     paths:
       - '.github/workflows/monthly-regression.yml'
   schedule:
-    - cron: '23 15 * * 5'
+    - cron: '15 14 * * 5'
   workflow_dispatch:
 
 permissions:
