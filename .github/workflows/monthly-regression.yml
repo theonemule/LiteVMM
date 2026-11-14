@@ -1,0 +1,126 @@
+name: Monthly LiteVMM build and regression
+
+on:
+  schedule:
+    - cron: '23 15 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: litevmm-monthly-verification
+  cancel-in-progress: false
+
+jobs:
+  first-friday:
+    runs-on: ubuntu-24.04
+    outputs:
+      enabled: ${{ steps.guard.outputs.enabled }}
+    steps:
+      - name: Run only on the first Friday (or manual dispatch)
+        id: guard
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != schedule || $(date -u +%d) -le 7 ]]; then
+            echo enabled=true >> "$GITHUB_OUTPUT"
+          else
+            echo enabled=false >> "$GITHUB_OUTPUT"
+            echo "Skipping: this Friday is not the first Friday." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  verify:
+    needs: first-friday
+    if: needs.first-friday.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install CLI and QEMU tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq curl openssl python3 qemu-utils
+
+      - name: Source, VM lifecycle, Docker API and peer regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/syntax-test.sh
+          bash tests/docker-smoke-test.sh
+          bash tests/storage-layout-test.sh
+          bash tests/inventory-capability-test.sh
+          bash tests/peer-syntax-test.sh
+          bash tests/metrics-smoke-test.sh
+          bash tests/websocket-transport-test.sh
+          bash tests/peer-smoke-test.sh
+
+      - name: Build LiteVMM storage Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --tag litevmm-storage:monthly-ci .
+          docker image inspect litevmm-storage:monthly-ci >/dev/null
+
+      - name: Start real backup-storage container and probe authenticated API
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="litevmm-monthly-$GITHUB_RUN_ID"
+          password="$(openssl rand -hex 24)"
+          trap 'docker logs "$name" 2>&1 | tail -80 || true; docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$name" \
+            -e VMAPI_HTTP_USER=admin -e "VMAPI_HTTP_PASSWORD=$password" \
+            -p 127.0.0.1::5186 litevmm-storage:monthly-ci >/dev/null
+          port="$(docker port "$name" 5186/tcp | awk -F: 'NR==1{print $NF}')"
+          [[ "$port" =~ ^[0-9]+$ ]]
+          passed=false
+          for i in $(seq 1 90); do
+            [[ "$(docker inspect -f '{{.State.Status}}' "$name")" == running ]]
+            code="$(curl --max-time 3 -sS -o /dev/null -w '%{http_code}' \
+              -u "admin:$password" "http://127.0.0.1:$port/api/system" || true)"
+            if [[ "$code" == 200 ]]; then passed=true; break; fi
+            sleep 2
+          done
+          [[ "$passed" == true ]] || { echo 'Authenticated storage API did not become ready' >&2; exit 1; }
+          [[ "$(curl -sS -o /dev/null -w '%{http_code}' \
+            "http://127.0.0.1:$port/api/system" || true)" == 401 ]]
+          echo 'PASS: actual LiteVMM backup-storage API and authentication'
+
+      - name: Package Docker image and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker save litevmm-storage:monthly-ci | gzip -1 > dist/litevmm-storage-docker-x86_64.tar.gz
+          (cd dist && sha256sum litevmm-storage-docker-x86_64.tar.gz > SHA256SUMS)
+
+      - name: Upload validated build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: litevmm-monthly-storage-build
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Describe the host-level acceptance gap
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## LiteVMM monthly verification'
+            echo 'CLI VM create/backup/restore, Docker control API, peer and storage'
+            echo 'regressions run in isolated fixtures; the backup-storage Docker image'
+            echo 'is built and exercised over authenticated HTTP.'
+            echo 'Booting a guest VM and managing a real Docker daemon through an'
+            echo 'installed LiteVMM hypervisor still requires a disposable VM/KVM'
+            echo 'runner or an explicitly provisioned dedicated integration host.'
+            echo 'No release or production deployment is performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
