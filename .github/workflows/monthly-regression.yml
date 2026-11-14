@@ -1,6 +1,10 @@
 name: Monthly LiteVMM build and regression
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/monthly-regression.yml'
   schedule:
     - cron: '23 15 * * 5'
   workflow_dispatch:
@@ -44,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq curl openssl python3 qemu-utils
+          sudo apt-get install -y jq curl openssl python3 qemu-utils qemu-system-x86
 
       - name: Source, VM lifecycle, Docker API and peer regression suite
         shell: bash
