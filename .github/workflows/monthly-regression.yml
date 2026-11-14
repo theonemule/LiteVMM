@@ -70,6 +70,11 @@ jobs:
           bash tests/websocket-transport-test.sh
           bash tests/peer-smoke-test.sh
 
+      - name: Real VM creation and KVM lifecycle on the CI163 host
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: bash tests/ci-kvm-lifecycle.sh
+
       - name: Build LiteVMM storage Docker image
         shell: bash
         run: |
